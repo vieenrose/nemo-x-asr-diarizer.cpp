@@ -1,0 +1,10 @@
+# Blessed accuracy reference for this session. Byte-identity of the four gate transcripts is the contract;
+# the WER lines are ceilings for when output legitimately changes (they are NOT targets - never tune to them).
+# Re-bless only after a full paired accuracy validation (gate40 + holdout_en + holdout_zh, discordant tokens).
+hash=d0e8784b08d6168e
+clips=gate_ms_v2,holdout_en,holdout_zh,multispk57(24kHz originals, in-process Lanczos3)
+wer_gate_ms_v2=0.1800
+wer_holdout_en=0.2400
+wer_holdout_zh=0.0810
+info_attribution_gate_ms_v2=0.0779 of 77
+info_der_bilingual57=23.26%

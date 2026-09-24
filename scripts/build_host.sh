@@ -57,7 +57,7 @@ mkdir -p "$ROOT/build"
 # Always compile from scratch. Three files, ~10 s: a stale object linked against a changed struct layout
 # (Config grew fields) does not fail to link, it corrupts memory at run time and segfaults somewhere that
 # points at nothing relevant. That cost a debugging detour once; the cheapest fix is to never have it.
-rm -f "$BUILD"/*.o "$BUILD"/nemo-x-asr-diarizer
+rm -f "$ROOT/build"/*.o "$ROOT/build"/nemo-x-asr-diarizer
 INC="-I$ROOT/src -I$C/src -I$A/include"
 # Compile-time availability only; the choice between exact and inferred timing happens at run time.
 if nm --defined-only "$C/build-host/src/libxasr.a" 2>/dev/null | grep -q xasr_stream_token_times; then

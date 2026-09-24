@@ -5,3 +5,5 @@ build-*/
 models/*.gguf
 deps/
 __pycache__/
+.auto/hash_last
+/tmp/ar_*
