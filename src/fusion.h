@@ -55,6 +55,11 @@ public:
     // estimated inside such a gap is not evidence of an anonymous third speaker: snap it to the
     // nearer turn when the gap is smaller than this, and only report "unattributed" beyond it.
     void set_gap_snap_ms(double ms) { gap_snap_s_ = ms / 1000.0; }
+    // Which turn wins audio that no turn covers. NEAREST picks the closer boundary; PREVIOUS keeps the
+    // speaker who was talking, which is the right guess when the hole is a MISSED region inside one
+    // person's stretch - and on this material 41% of speech frames are missed, so that is the common case.
+    enum class GapFill { NEAREST, PREVIOUS };
+    void set_gap_fill(GapFill g) { gap_fill_ = g; }
     double char_dur_ms() const { return char_dur_s_ * 1000.0; }
     double gap_snap_ms() const { return gap_snap_s_ * 1000.0; }
 
@@ -73,8 +78,20 @@ public:
     // and attribution runs over the WHOLE timeline, so a word that arrives split across two deltas is
     // still attributed as one word.
     void push_delta(const std::string& delta, int64_t span_start, int64_t span_end);
+
+    // Exact-timing path: the model told us this token starts at `at` and the next token starts at `end`.
+    // No inference, no char-duration guess, no right-alignment - this is the path that makes
+    // --char-dur-ms and --asr-latency-ms irrelevant, which is how we verify they were the only guesses
+    // in the attribution chain.
+    void push_token(const std::string& text, int64_t at, int64_t end);
+
+    // Keep the turn timeline, drop the text and its spans. Needed because token times are queried as a
+    // whole-timeline snapshot, so each attribution pass rebuilds the character timeline from tokens.
+    void clear_text() { text_.clear(); spans_.clear(); }
     std::vector<TaggedPiece> attribute_all() const;
     size_t chars() const { return spans_.size(); }
+    const std::string& text() const { return text_; }
+    const std::vector<CharSpan>& spans() const { return spans_; }
 
     const std::vector<Turn>& turns() const { return turns_; }
 
@@ -83,12 +100,15 @@ public:
     const Turn* covering(int64_t t, int64_t dur, bool* snapped = nullptr) const;
 
 private:
+    void append_placed(const std::string& text, int64_t span_start, int64_t span_end, bool exact);
+
     int rate_;
     double latency_s_;
     std::string text_;
     std::vector<CharSpan> spans_;
     double char_dur_s_ = 0.09;     // ~11 chars/s, between Mandarin (~5/s) and English (~15/s) speech rates
-    double gap_snap_s_ = 0.40;     // turn gaps in the bilingual gate set run 0.05-0.30 s
+    double gap_snap_s_ = 0.40;
+    GapFill gap_fill_ = GapFill::NEAREST;     // turn gaps in the bilingual gate set run 0.05-0.30 s
     std::vector<Turn> turns_;
 };
 

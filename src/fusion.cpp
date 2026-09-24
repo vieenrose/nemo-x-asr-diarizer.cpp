@@ -128,6 +128,17 @@ const Turn* Fusion::covering(int64_t t, int64_t dur, bool* snapped) const {
     // No overlap: inside a between-turns gap. Snap to the nearer end of the closest turn rather than
     // inventing an unattributed island, but only for gaps short enough that a word really could not
     // have been spoken there.
+    if (gap_fill_ == GapFill::PREVIOUS) {
+        // The last turn that had ended by now; if the audio precedes every turn, the first one after it.
+        const Turn* prev = nullptr;
+        for (const Turn& e : turns_) {
+            if (e.end <= t + dur && (!prev || e.end > prev->end)) prev = &e;
+        }
+        if (prev) { if (snapped) *snapped = true; return prev; }
+        for (const Turn& e : turns_) if (!prev || e.start < prev->start) prev = &e;
+        if (prev) { if (snapped) *snapped = true; return prev; }
+        return nullptr;
+    }
     const bool infinite = gap_snap_s_ <= 0.0;      // 0 = always nearest, never leave text untagged
     const int64_t snap = infinite ? (int64_t)1e18 : (int64_t)(gap_snap_s_ * rate_);
     int64_t best_d = snap + 1;
@@ -144,17 +155,27 @@ const Turn* Fusion::covering(int64_t t, int64_t dur, bool* snapped) const {
 // spreading characters across the whole span would put the first characters of every turn in that
 // silence, which is the single easiest way to mis-tag a speaker change.
 void Fusion::push_delta(const std::string& delta, int64_t span_start, int64_t span_end) {
-    const auto cps = codepoints(delta);
+    append_placed(delta, span_start, span_end, false);
+}
+
+void Fusion::push_token(const std::string& text, int64_t at, int64_t end) {
+    append_placed(text, at, end, true);
+}
+
+void Fusion::append_placed(const std::string& text, int64_t span_start, int64_t span_end, bool exact) {
+    const auto cps = codepoints(text);
     if (cps.empty()) return;
     if (span_end <= span_start) span_end = span_start + 1;
-    const int64_t est = std::min<int64_t>(span_end - span_start,
-                                          (int64_t)(cps.size() * char_dur_s_ * rate_));
+    // exact: the token fills its interval. inferred: right-align `n * char_dur` inside the interval.
+    const int64_t est = exact ? (span_end - span_start)
+                              : std::min<int64_t>(span_end - span_start,
+                                                  (int64_t)(cps.size() * char_dur_s_ * rate_));
     const int64_t base = span_end - est;
     const double step = double(est) / double(cps.size());
     for (size_t i = 0; i < cps.size(); i++) {
         const int64_t at = base + (int64_t)std::llround(i * step);
         const int64_t dur = std::max<int64_t>(1, (int64_t)std::llround(step));
-        text_.append(delta, cps[i].first, cps[i].second);
+        text_.append(text, cps[i].first, cps[i].second);
         spans_.push_back(CharSpan{at, at + dur});
     }
 }

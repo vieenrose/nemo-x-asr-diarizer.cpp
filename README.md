@@ -100,6 +100,37 @@ audio, delayed by the encoder's own window. So:
 Tunables: `--asr-latency-ms` (default = `--chunk-ms`), `--char-dur-ms` (90), `--gap-snap-ms` (400; 0 =
 always nearest-speaker).
 
+## Token timestamps (added, and what they turned out to be worth)
+
+x-asr never returned times, so the engine used to *infer* where each character was spoken. It can now use
+the model's own timeline: `patches/crispasr-token-times.patch` adds a frame counter to the greedy loop
+(CrispASR consumes one encoder frame per greedy step and emits at most one symbol, so a token's timestamp
+is a loop counter - 40 ms grid, no alignment model, no extra compute). Verify the claim yourself with
+`tools/validate_timestamps.py`, which checks timestamps against reference **silence** - a score can be
+moved by the attributor or by luck, silence cannot.
+
+Three measurements, in order of how much they surprised me:
+
+1. **A transducer's frame index is a decision time, not a sound time.** Raw frame timestamps run ~0.3 s late:
+   measured against an independent timeline they are +0.295 s median (p10 +0.08, p90 +0.48), and against
+   ground-truth silence the shift that puts **0 of 119** tokens in silence is +300 ms (3 at 0 ms, 2 at
+   450 ms). So `--token-offset-ms 300` is the default, derived from the audio and never from a score. This
+   one generalises: anyone wiring up transducer timestamps will hit it.
+2. **The timestamps are real.** 114 tokens over 44.98 s, monotonic, last one at 44.92 s - which also proves
+   the 40 ms mapping rather than a fitted 39.0 ms (a 2.5 % scale error would have put the tail at 46.2 s).
+   The exact path is used only if it reproduces the streamed transcript byte for byte; otherwise the engine
+   falls back and says so (`[timing] inferred-placement`).
+3. **Attribution did not get better, and the honest reading is that it could not have.** Attribution error
+   moved between 0.0132 and 0.0658 across timing/offset/gap-fill combinations - that is **1 to 5 wrong tokens
+   out of 76**, i.e. noise on a single clip. Meanwhile the 10x placement sweep above showed a flat 0.0132.
+   Both point the same way: with a diarizer that misses 41 % of speech frames, *recall* is the binding
+   constraint on speaker attribution, not clocks. Timestamps bought exact word alignment (subtitles, forced
+   alignment, A/V sync, boundary reporting), not a better who.
+
+So `--timing auto` prefers model timestamps, `inferred` reproduces the previous behaviour, and neither is
+allowed to claim an accuracy win on this evidence. What is solid: a 40 ms token timeline that verifies
+against silence, and a documented 300 ms decision lag.
+
 ## Known limits
 
 * **The diarizer commits turns late.** It computes in chunks with caches - genuinely streaming - but the

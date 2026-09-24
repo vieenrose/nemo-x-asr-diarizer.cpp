@@ -35,6 +35,18 @@ if nm -D --defined-only "$LIB_DIAG" | grep -qE " T ggml_| T gguf_"; then
 fi
 
 echo "== CrispASR x-asr (static, own ggml)"
+# Token timestamps need four lines in their greedy loop (one frame counter, one push_back). Shipped as a
+# patch rather than a fork: it is model-agnostic, it cannot change any decoding decision, and if it fails
+# to apply the build still works - it just falls back to inferred placement and says so at run time.
+if [ -f "$ROOT/patches/crispasr-token-times.patch" ]; then
+  if git -C "$C" apply -R --check "$ROOT/patches/crispasr-token-times.patch" 2>/dev/null; then
+    echo "   token-times patch already applied"
+  elif git -C "$C" apply --check "$ROOT/patches/crispasr-token-times.patch" 2>/dev/null; then
+    git -C "$C" apply "$ROOT/patches/crispasr-token-times.patch" && echo "   applied token-times patch"
+  else
+    echo "   NOTE: token-times patch does not apply to this CrispASR revision - attribution will infer timing"
+  fi
+fi
 cmake -S "$C" -B "$C/build-host" -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON >/dev/null
 for t in xasr crispasr-core ggml ggml-base ggml-cpu; do
   cmake --build "$C/build-host" --target "$t" -j"$THREADS" >/dev/null
@@ -43,6 +55,12 @@ done
 echo "== composite"
 mkdir -p "$ROOT/build"
 INC="-I$ROOT/src -I$C/src -I$A/include"
+# Compile-time availability only; the choice between exact and inferred timing happens at run time.
+if nm --defined-only "$C/build-host/src/libxasr.a" 2>/dev/null | grep -q xasr_stream_token_times; then
+  INC="$INC -DNEMO_HAVE_TOKEN_TIMES"; echo "   exact token timestamps: available"
+else
+  echo "   exact token timestamps: NOT available (inferred placement will be used)"
+fi
 g++ -O2 -std=c++17 $INC -c "$ROOT/src/engine.cpp" -o "$ROOT/build/engine.o"
 g++ -O2 -std=c++17 $INC -c "$ROOT/src/fusion.cpp" -o "$ROOT/build/fusion.o"
 g++ -O2 -std=c++17 $INC -c "$ROOT/src/main.cpp"  -o "$ROOT/build/main.o"

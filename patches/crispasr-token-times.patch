@@ -1,0 +1,76 @@
+diff --git a/src/xasr.cpp b/src/xasr.cpp
+index e77b5c0..9076fb3 100644
+--- a/src/xasr.cpp
++++ b/src/xasr.cpp
+@@ -723,6 +723,11 @@ struct greedy_state {
+     std::vector<int> hyp;
+     std::vector<float> d; // decoder_proj output for the current context
+     std::vector<int32_t> toks;
++    // Encoder frame each token was emitted at. The greedy loop consumes one encoder frame per step and
++    // emits at most one symbol, so a token's time is a loop counter - no alignment model, no DTW, and it
++    // cannot disagree with the text because it comes from the same pass that produced it.
++    std::vector<int64_t> frames;
++    int64_t frame_pos = 0;   // global across chunk calls; greedy_run is called once per chunk
+     bool first = true;
+ };
+ 
+@@ -731,6 +736,8 @@ void greedy_init(const xasr_model& m, greedy_state& gs) {
+     gs.hyp.back() = m.hp.blank_id;
+     gs.d = decoder_out(m, gs.hyp);
+     gs.toks.clear();
++    gs.frames.clear();
++    gs.frame_pos = 0;
+     gs.first = true;
+ }
+ 
+@@ -738,7 +745,7 @@ void greedy_run(const xasr_model& m, greedy_state& gs, const float* enc, int n_e
+     const auto& hp = m.hp;
+     const int J = hp.joiner_dim, V = hp.vocab;
+     std::vector<float> t((size_t)J), logits((size_t)V);
+-    for (int f = 0; f < n_enc; f++) {
++    for (int f = 0; f < n_enc; f++, gs.frame_pos++) {
+         const float* e = enc + (size_t)f * J;
+         for (int j = 0; j < J; j++)
+             t[(size_t)j] = std::tanh(e[j] + gs.d[(size_t)j]);
+@@ -757,6 +764,7 @@ void greedy_run(const xasr_model& m, greedy_state& gs, const float* enc, int n_e
+         gs.first = false;
+         if (best != hp.blank_id && best != hp.unk_id) {
+             gs.toks.push_back(best);
++            gs.frames.push_back(gs.frame_pos);
+             gs.hyp.push_back(best);
+             gs.d = decoder_out(m, gs.hyp);
+         }
+@@ -1052,6 +1060,16 @@ extern "C" char* xasr_stream_accept(struct xasr_stream* s, const float* samples,
+     return dup_str(stream_text(s));
+ }
+ 
++extern "C" int xasr_stream_token_times(struct xasr_stream* s, const int32_t** out_ids,
++                                       const int64_t** out_frames, int* out_n) {
++    if (!s) return -1;
++    *out_ids = s->gs.toks.empty() ? nullptr : s->gs.toks.data();
++    *out_frames = s->gs.frames.empty() ? nullptr : s->gs.frames.data();
++    *out_n = (int)s->gs.frames.size();
++    if ((int)s->gs.toks.size() != *out_n) return -1;   // ids and times must describe the same pass
++    return 0;
++}
++
+ extern "C" void xasr_stream_reset(struct xasr_stream* s) {
+     stream_reset(s);
+ }
+diff --git a/src/xasr.h b/src/xasr.h
+index 647d0e4..81b9b80 100644
+--- a/src/xasr.h
++++ b/src/xasr.h
+@@ -43,6 +43,12 @@ char* xasr_stream_accept(struct xasr_stream* s, const float* samples, int n_samp
+ void xasr_stream_reset(struct xasr_stream* s);
+ void xasr_stream_free(struct xasr_stream* s);
+ 
++// Token timestamps: (ids, encoder-frame indices) for everything decoded so far. Borrowed pointers,
++// valid until the next accept/reset/free. Frame k starts at k * 40 ms of audio (10 ms fbank hop,
++// encoder downsampling of 4). Returns 0 with *out_n == 0 if nothing has been decoded.
++int xasr_stream_token_times(struct xasr_stream* s, const int32_t** out_ids,
++                            const int64_t** out_frames, int* out_n);
++
+ // ---- diff-harness hooks (crispasr-diff xasr) -----------------------------
+ // Kaldi fbank of samples + the configured tail padding: (T, 80) row-major, malloc'd.
+ float* xasr_compute_fbank(struct xasr_context* ctx, const float* samples, int n_samples, int* out_T);

@@ -80,12 +80,87 @@ bool Engine::init(std::string& err) {
     fusion_ = Fusion(16000, latency / 1000.0);
     fusion_.set_char_dur_ms(cfg_.char_dur_ms);
     fusion_.set_gap_snap_ms(cfg_.gap_snap_ms);
+    fusion_.set_gap_fill(cfg_.gap_fill == 1 ? Fusion::GapFill::PREVIOUS : Fusion::GapFill::NEAREST);
     return true;
 }
 
 // Tag every buffered delta against the turn timeline as it stands. Locals only, so calling it twice
 // (a provisional live pass and the final pass) does not double-count anything.
+// Rebuild the character timeline from the model's own token timestamps. Returns true only when the
+// result reproduces the streamed transcript byte for byte, which is what makes this path safe to prefer:
+// a token-time table that disagrees with the text means one of the two is broken, and silently attributing
+// against the wrong timeline is exactly the "plausible output, wrong numbers" failure this project keeps
+// hitting. Frame k covers audio from k * 40 ms (10 ms fbank hop, encoder downsampling 4; measured 25.6 Hz
+// including the tail padding, so 40 ms is the mapping and not a guess).
+static bool push_timed_tokens(Fusion& out, xasr_context* ctx, xasr_stream* stream, const std::string& expect,
+                              double offset_ms) {
+    const int32_t* ids = nullptr;
+    const int64_t* frames = nullptr;
+    int n = 0;
+    if (!stream || xasr_stream_token_times(stream, &ids, &frames, &n) != 0 || n <= 0) return false;
+    out.clear_text();
+    std::string prev;
+    for (int i = 0; i < n; i++) {
+        char* all = xasr_tokens_to_text(ctx, ids, i + 1);      // cumulative decode with the SAME function
+        std::string cur = all ? all : "";                      // that produced the streamed text, so the
+        std::free(all);                                        // two can be compared instead of assumed equal
+        if (cur.size() < prev.size()) return false;            // not append-only -> times cannot be mapped
+        std::string piece = cur.substr(prev.size());
+        prev = cur;
+        // 40 ms per encoder frame, minus the decision lag the greedy loop introduces (see engine.h).
+        const int64_t at = frames[i] * 640 - (int64_t)(offset_ms * 16.0);
+        const int64_t next = (i + 1 < n) ? frames[i + 1] * 640 - (int64_t)(offset_ms * 16.0) : at + 40 * 16;
+        out.push_token(piece, std::max<int64_t>(0, at), std::max(next, at + 1));
+    }
+    return out.text() == expect;
+}
+
+std::vector<TokenInfo> Engine::token_table() const {
+    std::vector<TokenInfo> out;
+#ifdef NEMO_HAVE_TOKEN_TIMES
+    const int32_t* ids = nullptr;
+    const int64_t* frames = nullptr;
+    int n = 0;
+    if (!asr_stream_ || xasr_stream_token_times((xasr_stream*)asr_stream_, &ids, &frames, &n) != 0 || n <= 0)
+        return out;
+    std::string prev;
+    for (int i = 0; i < n; i++) {
+        char* all = xasr_tokens_to_text((xasr_context*)asr_ctx_, ids, i + 1);
+        std::string cur = all ? all : "";
+        std::free(all);
+        if (cur.size() < prev.size()) break;
+        TokenInfo ti;
+        ti.text = cur.substr(prev.size());
+        ti.t_s = double(frames[i]) * 0.040 - cfg_.token_offset_ms / 1000.0;
+        bool sn = false;
+        const Turn* t = fusion_.covering((int64_t)(ti.t_s * 16000.0), 640, &sn);
+        ti.speaker_id = t ? t->speaker : std::string();
+        ti.snapped = sn;
+        prev = cur;
+        out.push_back(std::move(ti));
+    }
+#endif
+    return out;
+}
+
 void Engine::attribute(const std::function<void(const Segment&)>& on_segment, bool final_pass) {
+    const Fusion* use = &fusion_;
+    Fusion timed = fusion_;
+    // The two paths are both live at runtime (not compile-time), because the useful comparison is the same
+    // model, same audio, same turns, with only the character timeline coming from a different place.
+    bool want_tokens = cfg_.timing != 2;
+#ifdef NEMO_HAVE_TOKEN_TIMES
+    if (want_tokens && asr_stream_ &&
+        push_timed_tokens(timed, (xasr_context*)asr_ctx_, (xasr_stream*)asr_stream_, asr_text_,
+                          cfg_.token_offset_ms)) {
+        use = &timed;
+        stats_.timing_mode = 1;
+    } else
+#endif
+    {
+        stats_.timing_mode = 0;
+    }
+
     std::map<std::string, int>& spk_id = spk_id_;
     Segment open;
     int idx = 0;
@@ -97,7 +172,7 @@ void Engine::attribute(const std::function<void(const Segment&)>& on_segment, bo
         on_segment(done);
     };
     {
-        for (const TaggedPiece& p : fusion_.attribute_all()) {
+        for (const TaggedPiece& p : use->attribute_all()) {
         // Text the diarizer left uncovered keeps the label it was already under instead of opening a
         // "Speaker -1" segment. This is not a hedge: the scorer WER is measured with drops every line it
         // cannot parse a speaker from, so an untagged island silently DELETES words from the transcript
@@ -151,13 +226,29 @@ void Engine::attribute(const std::function<void(const Segment&)>& on_segment, bo
     }
     if (!open.text.empty()) close(open);
 
+    if (final_pass) {
+        if (const char* dump = getenv("NEMO_DUMP_TIMELINE")) {
+            FILE* f = std::fopen(dump, "w");
+            if (f) {
+                const auto cps = codepoints(use->text());
+                const auto& sp = use->spans();
+                std::fprintf(f, "[\n");
+                for (size_t i = 0; i < cps.size() && i < sp.size(); i++)
+                    std::fprintf(f, "%s  {\"c\": \"%s\", \"t\": %.3f}\n", i ? ",\n" : "",
+                                 use->text().substr(cps[i].first, cps[i].second).c_str(),
+                                 double(sp[i].start) / 16000.0);
+                std::fprintf(f, "]\n");
+                std::fclose(f);
+            }
+        }
+    }
     stats_.segments = idx;
     stats_.unattributed_chars = unattributed;
     stats_.snapped_chars = snapped_chars;
     stats_.speakers = spk_id.size();
     if (final_pass && getenv("NEMO_DEBUG_ATTR")) {
-        std::fprintf(stderr, "[attrib] %zu pieces, %zu turns, %zu chars\n", pieces, fusion_.turns().size(),
-                     fusion_.chars());
+        std::fprintf(stderr, "[attrib] %zu pieces, %zu turns, %zu chars, timing=%s\n", pieces,
+                     use->turns().size(), use->chars(), stats_.timing_mode ? "tokens" : "inferred");
     }
 }
 
@@ -239,7 +330,7 @@ bool Engine::run(const std::function<void(const Segment&)>& on_segment, std::str
             // The Nemotron stream computes in chunks but COMMITS turns in batches (first batch at
             // 30.5 s on the bilingual clip), so deltas are pushed into the attributor's own character
             // timeline and tagged against the turn list whenever it updates - see fusion.h.
-            fusion_.push_delta(delta, charged_upto, horizon);
+            if (cfg_.timing != 1) fusion_.push_delta(delta, charged_upto, horizon);
             charged_upto = horizon;
             stats_.deltas++;
             if (stats_.first_partial_s < 0) stats_.first_partial_s = now_s() - t0;
@@ -277,6 +368,10 @@ bool Engine::run(const std::function<void(const Segment&)>& on_segment, std::str
     stats_.wall_s = now_s() - t0;
     stats_.turns = fusion_.turns().size();
     stats_.first_turn_audio_s = first_turn_audio_;
+#ifdef NEMO_HAVE_TOKEN_TIMES
+    { const int32_t* id; const int64_t* fr; int nn = 0;
+      if (asr_stream_ && xasr_stream_token_times((xasr_stream*)asr_stream_, &id, &fr, &nn) == 0) stats_.tokens = (size_t)nn; }
+#endif
     std::vector<double> sorted = piece_ms_;
     std::sort(sorted.begin(), sorted.end());
     if (!sorted.empty()) {

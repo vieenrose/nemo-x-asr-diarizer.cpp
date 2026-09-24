@@ -41,8 +41,8 @@ static void usage(const char* p) {
 
 int main(int argc, char** argv) {
     Config cfg;
-    bool json = false, live = false, turns_out = false;
-    std::string turns_path, out_path;
+    bool json = false, live = false, turns_out = false, tokens_out = false;
+    std::string turns_path, out_path, tokens_path;
     cfg.xasr_model = "models/x-asr-zh-en-q8_0.gguf";
     cfg.diar_model = "models/nemotron-3-diarization-q8_0.gguf";
 
@@ -59,6 +59,18 @@ int main(int argc, char** argv) {
         else if (a == "--piece-ms") cfg.piece_ms = atoi(next("--piece-ms"));
         else if (a == "--chunk-ms") cfg.chunk_ms = atoi(next("--chunk-ms"));
         else if (a == "--asr-latency-ms") cfg.asr_latency_ms = atof(next("--asr-latency-ms"));
+        else if (a == "--gap-fill") {
+            std::string v = next("--gap-fill");
+            if (v == "nearest") cfg.gap_fill = 0; else if (v == "prev") cfg.gap_fill = 1;
+            else { std::fprintf(stderr, "ERROR: --gap-fill takes nearest|prev\n"); return 2; }
+        }
+        else if (a == "--token-offset-ms") cfg.token_offset_ms = atof(next("--token-offset-ms"));
+        else if (a == "--timing") {
+            std::string v = next("--timing");
+            cfg.timing = v == "tokens" ? 1 : v == "inferred" ? 2 : v == "auto" ? 0 : (std::fprintf(stderr, "ERROR: --timing takes auto|tokens|inferred\n"), 9);
+            if (cfg.timing == 9) return 2;
+        }
+        else if (a == "--tokens-out") tokens_path = next("--tokens-out"), tokens_out = true;
         else if (a == "--char-dur-ms") cfg.char_dur_ms = atof(next("--char-dur-ms"));
         else if (a == "--gap-snap-ms") cfg.gap_snap_ms = atof(next("--gap-snap-ms"));
         else if (a == "--paced") cfg.paced = true;
@@ -109,6 +121,20 @@ int main(int argc, char** argv) {
         std::fclose(f);
     }
 
+    if (tokens_out) {
+        FILE* f = std::fopen(tokens_path.c_str(), "w");
+        if (!f) { std::fprintf(stderr, "ERROR: cannot write %s\n", tokens_path.c_str()); return 1; }
+        const auto toks = eng.token_table();
+        std::fprintf(f, "[\n");
+        for (size_t i = 0; i < toks.size(); i++) {
+            std::fprintf(f, "%s  {\"i\": %zu, \"text\": \"%s\", \"t_s\": %.3f, \"speaker\": \"%s\", \"snapped\": %s}",
+                         i ? ",\n" : "\n", i, toks[i].text.c_str(), toks[i].t_s, toks[i].speaker_id.c_str(),
+                         toks[i].snapped ? "true" : "false");
+        }
+        std::fprintf(f, "\n]\n");
+        std::fclose(f);
+    }
+
     const Stats& st = eng.stats();
     if (json) {
         std::printf("{\n");
@@ -122,6 +148,9 @@ int main(int argc, char** argv) {
         std::printf(" \"asr_compute_s\": %.3f, \"diar_compute_s\": %.3f,\n", st.asr_compute_s, st.diar_compute_s);
         std::printf(" \"first_partial_s\": %.3f, \"first_turn_audio_s\": %.2f, \"piece_ms_p95\": %.2f, \"peak_rss_mb\": %.1f,\n",
                     st.first_partial_s, st.first_turn_audio_s, st.piece_p95_ms, st.peak_rss_mb);
+        std::printf(" \"timing\": \"%s\", \"tokens\": %zu, \"token_offset_ms\": %.0f,\n",
+                    st.timing_mode == 1 ? "model-timestamps" : "inferred-placement", st.tokens,
+                    cfg.token_offset_ms);
         std::printf(" \"segments\": %zu, \"turns\": %zu, \"speakers\": %zu, \"unattributed_chars\": %zu,\n",
                     st.segments, st.turns, st.speakers, st.unattributed_chars);
         std::printf(" \"snapped_chars\": %zu,\n", st.snapped_chars);
@@ -131,6 +160,8 @@ int main(int argc, char** argv) {
                     "p95 piece %.1fms  peak RSS %.0fMB\n",
                     st.audio_s, st.wall_s, st.wall_s / st.audio_s, st.asr_compute_s, st.diar_compute_s,
                     st.first_partial_s, st.piece_p95_ms, st.peak_rss_mb);
+        std::printf("[timing]  %s over %zu tokens\n",
+                    st.timing_mode == 1 ? "model token timestamps (40 ms grid)" : "inferred placement", st.tokens);
         std::printf("[diar]    %zu turns, %zu speakers; %zu segments, %zu unattributed, %zu by proximity fill; first turn at "
                     "audio %.2fs (attribution floor)\n",
                     st.turns, st.speakers, st.segments, st.unattributed_chars, st.snapped_chars,
