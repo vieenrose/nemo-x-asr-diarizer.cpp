@@ -26,6 +26,8 @@ REPS=${REPS:-2}
 XM=x-asr-zh-en-q8_0.gguf
 DM=nemotron-3-diarization-q8_0.gguf
 BIN=build-android/nemo-x-asr-diarizer
+DEV_BIN=./nemo-x-asr-diarizer   # what it is called ON THE DEVICE - pushing to $D flattens the path, so the
+                                # local build-android/ prefix must not leak into the remote command
 
 [ -n "$DEV" ] || { echo "no device"; exit 1; }
 
@@ -37,7 +39,7 @@ if [ ! -x "$BIN" ] || [ -n "$(find src patches -newer "$BIN" 2>/dev/null | head 
   echo "built"
 fi
 adb -s "$DEV" push "$BIN" "$D"/ > /dev/null 2>&1 || { echo "push failed"; exit 1; }
-adb -s "$DEV" shell "chmod 777 $D/nemo-x-asr-diarizer" > /dev/null 2>&1
+adb -s "$DEV" shell "chmod 777 $D/nemo-x-asr-diarizer; mkdir -p $D/out" > /dev/null 2>&1
 
 # ---------------------------------------------------------------- device state
 n=$(adb -s "$DEV" shell "ps -A -o NAME" 2>/dev/null | tr -d '\r' | grep -cE 'nemo-x-asr|asr_streaming|xasr_stream_probe|audiocpp_cli' || true)
@@ -78,7 +80,11 @@ tot = dt = 0.0
 for f in sorted(set(a) & set(b)):
     d = b[f] - a[f]
     if d > 0: tot += d * f; dt += d
-print("%.1f %.1f" % (tot / dt if dt else 0.0, (100.0 * sum(b[f] - a[f] for f in set(a) & set(b) if f >= 2400000 and b[f] > a[f]) / dt) if dt else 0.0))
+# time_in_state lists FREQUENCIES IN kHz, so tot/dt is kHz. ARM_MIN is MHz, hence /1000. Getting this wrong
+# is not a cosmetic bug: printed in Hz (2321926) the "mean >= 1950" test passes even for an unarmed device
+# parked at 1.3 GHz (1300000 >= 1950), i.e. the guard silently stops guarding. Verified against both cases:
+# armed -> ~2320 (pass), unarmed -> ~1300 (reject).
+print("%.1f %.1f" % (tot / dt / 1000 if dt else 0.0, (100.0 * sum(b[f] - a[f] for f in set(a) & set(b) if f >= 2400000 and b[f] > a[f]) / dt) if dt else 0.0))
 PY
 }
 
@@ -89,7 +95,7 @@ run_cell() { # run_cell <wav> <reps>  -- accumulates into the totals; per-clip R
   local wav=$1 reps=$2 line
   local ca=0 cw=0 casr=0 cdi=0 fp="" 
   for i in $(seq 1 "$reps"); do
-    line=$(adb -s "$DEV" shell "cd $D && LD_LIBRARY_PATH=. taskset $MASK ./$BIN --audio wav/$wav --threads $THREADS \
+    line=$(adb -s "$DEV" shell "cd $D && LD_LIBRARY_PATH=. taskset $MASK $DEV_BIN --audio wav/$wav --threads $THREADS \
             --windows --xasr-model $XM --diar-model $DM --out out/ar_${wav}_$i.txt 2>&1" | tr -d '\r' | grep '^\[stats\]')
     [ -z "$line" ] && { echo "ERROR: no [stats] from $wav pass $i"; return 1; }
     local a w asr di f p r
@@ -98,7 +104,9 @@ run_cell() { # run_cell <wav> <reps>  -- accumulates into the totals; per-clip R
     asr=$(echo "$line" | grep -oE 'asr [0-9.]+s'           | grep -oE '[0-9.]+')
     di=$(echo "$line"  | grep -oE 'diar [0-9.]+s'          | grep -oE '[0-9.]+')
     f=$(echo "$line"   | grep -oE 'first partial [0-9.]+s' | grep -oE '[0-9.]+')
-    p=$(echo "$line"   | grep -oE 'p95 piece [0-9.]+ms'    | grep -oE '[0-9.]+')
+    # sed -E, not a second grep -oE: the label "p95" contains digits, so grep-over-label returns 95 AND the
+    # value, and max(0, 95\n343.4) is a python SyntaxError that silently became an empty metric.
+    p=$(echo "$line"   | sed -nE 's/.*p95 piece ([0-9.]+).*/\1/p')
     r=$(echo "$line"   | grep -oE 'peak RSS [0-9.]+MB'     | grep -oE '[0-9.]+')
     for v in a w asr di f p r; do [ -z "${!v}" ] && { echo "ERROR: unparsed field in $line"; return 1; }; done
     ca=$(python3 -c "print($ca+$a)"); cw=$(python3 -c "print($cw+$w)")
@@ -132,7 +140,7 @@ for attempt in 1 2 3; do
     echo "METRIC diar_s=$(python3 -c "print(round($DIAR_TOT,2))")"
     echo "METRIC other_s=$OTHER"
     echo "METRIC first_partial_s=${FP:--1}"
-    echo "METRIC p95_piece_ms=$P95"
+    echo "METRIC p95_piece_ms=${P95:-0}"
     echo "METRIC peak_rss_mb=$RSS"
     echo "METRIC witness_mhz=$MHZ"
     echo "METRIC deliv2400_pct=$DELIV"
