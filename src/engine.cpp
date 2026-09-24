@@ -87,6 +87,12 @@ bool Engine::init(std::string& err) {    {
         xasr_context_params p = xasr_context_default_params();
         p.n_threads = cfg_.threads;
         p.verbosity = 0;
+        // xasr_context_default_params() sets use_gpu = TRUE, and xasr_init then calls
+        // crispasr_init_gpu_backend() unconditionally when it is set. On a GPU-less phone that is not a
+        // clean "fall back to cpu": it cost ~3.5x on the ASR leg (rtf 0.748 vs the standalone probe's
+        // 0.389-0.215 on the same model and params), which is exactly the kind of stable, mask-independent
+        // penalty I spent a long time misattributing to thread pools and page faults. Always say cpu.
+        p.use_gpu = false;
         p.chunk_ms = cfg_.chunk_ms;
         asr_ctx_ = xasr_init_from_file(cfg_.xasr_model.c_str(), p);
         if (!asr_ctx_) { err = "x-asr model failed to load: " + cfg_.xasr_model; return false; }

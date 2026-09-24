@@ -198,9 +198,14 @@ arming, `time_in_state` witness, repeats inside one armed window). Mask `f0`, 2 
 
 | clip | RTF | first partial | p95 piece | peak RSS | witness mean |
 |---|---|---|---|---|---|
-| chat69 (protocol, 69 s) | **0.771** | 0.601 s | 95 ms | ~396 MB | 2175 MHz |
-| gate_ms_v2 (hard, 4 speakers) | 0.775 | 0.752 s | 95 ms | 396 MB | 2176 MHz |
-| bilingual_multispk_57s | 0.805 | 0.765 s | 95 ms | 408 MB | 2245 MHz |
+Measured on `taskset C0` - the baseline's OWN mask (cpu6-7, the two primes), armed, witness 2316-2378 MHz:
+
+| clip | RTF | first partial | p95 piece | peak RSS |
+|---|---|---|---|---|
+| gate_ms_v2 (hard, 4 speakers) | **0.4627** | 0.319 s | 95 ms | 396 MB |
+| bilingual_multispk_57s | 0.4982 | 0.324 s | 95 ms | 409 MB |
+
+(Earlier rows in the table below were taken before the `use_gpu` fix, on 4 cpus, and are 1.6x too slow.)
 
 Against the baseline's own anchor on the same device (RTF 1.2231, peak RSS 2198 MB, first text at one 2.93 s
 window): **1.6x lower RTF, 5.5x less memory, ~4x lower first-output latency**, and it also emits speaker
@@ -208,23 +213,16 @@ turns, which the baseline does not. Token timestamps work on arm64 too (388 toke
 
 Two findings that only showed up on the device:
 
-1. **On a 2-CPU mask this composite is far slower than its parts predict, and I do not yet know why.** With
-   the baseline's `taskset C0` (cpu6-7) a 45 s clip did not finish in 150 s (RTF > 3.3), while on `f0`/`ff` it
-   finishes at RTF 0.77. Each engine alone is fine on `C0` (x-asr 0.2151, diarizer 0.279) and the config is
-   identical to the standalone probe (`piece_ms 100`, `chunk_ms 480`, 1 ggml thread).
-
-   I first explained this as two ggml spin-wait pools livelocking. **That explanation was wrong and is
-   retracted.** The measurements that kill it: the standalone x-asr probe runs on that same mask with
-   **exactly 1 thread** (neither build links OpenMP, and neither ggml creates worker threads), so there is no
-   spin pool in the ASR at all; and `libaudiocpp.so` creates its ~8-thread pool *during* streaming (1 thread
-   through `init`, 10 threads mid-run), so a pool-contention story cannot explain a `--no-diar` hang either.
-   What is left, untested: cache/TLB interference between two resident models, and the diar pool's threads
-   landing on 2 cpus. `--main-affinity`/`--engine-affinity` exist to separate those hypotheses; note that the
-   pool is created lazily, so the current implementation moves only threads that already exist (measured:
-   `moved=1`, `threads=1` at pieces 0-8) - it is a probe, not yet a fix.
-2. **The composite costs more than the sum of its parts**: 0.77 vs 0.215 + 0.279 = 0.49. The two engines
-   contend for the same cores with spin-wait barriers, so the ASR leg alone stretches from 0.215 to ~0.75
-   inside the composite. Closing that gap means one shared pool (or a non-spinning build), not more tuning.
+1. **`use_gpu` was the whole story, and it was mine.** `xasr_context_default_params()` sets
+   `use_gpu = true`, and `xasr_init` then calls `crispasr_init_gpu_backend()` whenever it is set. On a
+   GPU-less phone that is not a clean cpu fallback: it cost ~2x on the ASR leg (16.3 s vs 33.7 s per 45 s of
+   audio) and made the 2-cpu mask look pathologically stalled (45 s of audio had not finished in 400 s, on
+   `c0`, `f0`, and `3`, with the standalone probe too). After `p.use_gpu = false`: same binary, same clip,
+   `c0` completes in 35.3 s and `c0` ≈ `f0` (0.784 vs 0.790). There was never a core-count cliff.
+   The host never showed it (rtf 0.142 before and after), which is why it survived so long.
+   What I published before this - "two ggml spin pools livelock on 2 cpus", then "the composite needs four
+   cpus" - was wrong twice, and both times the wrong mechanism was believed because the numbers were stable.
+   They were stable because of a wrong init flag.
 
 Invariant worth having: with and without `--no-diar` the ASR text is byte-identical (1185 chars on chat69),
 so attribution is a layer over the transcript, never a rewrite of it.
