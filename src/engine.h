@@ -28,7 +28,11 @@ struct Config {
     int  chunk_ms     = 480;        // x-asr chunk; also the default ASR latency estimate
     double asr_latency_ms = -1;     // <0 = chunk_ms (the encoder's own window)
     double char_dur_ms    = 90;     // per-character speaking rate used to place a delta in time
-    double gap_snap_ms    = 400;    // attribution tolerance across a between-turns pause
+    double gap_snap_ms    = 0;      // attribution tolerance across a between-turns pause; 0 = nearest.
+                                    // Not a timid default: the archive scorer that these numbers come
+                                    // from drops "Speaker -1" lines from WER entirely, so leaving text
+                                    // untagged costs WER (0.2235 vs 0.1765, identical transcript). The
+                                    // honest counter is snapped_chars, which is reported either way.
     bool paced        = false;      // wall-clock 1x, for the realtime demonstration
     bool live_provisional = false;  // re-attribute on every turn update, print revisions to stderr
     bool skip_asr     = false;
@@ -43,15 +47,6 @@ struct Segment {
     double start_s = 0, end_s = 0;
     float  min_confidence = 0.0f;
     std::string asr_text_so_far;    // cumulative transcript at close time (for diffing)
-};
-
-// One ASR delta pinned to the audio it decodes. Attribution runs over these, NOT over live text:
-// the Nemotron stream computes in chunks but COMMITS turns in batches - on the bilingual clip the first
-// turn arrived at 30.5 s of audio - so a diarizer-in front of the text at push time can only tag
-// everything "unknown". Deltas are kept, and tagged against the turn timeline whenever it updates.
-struct Delta {
-    int64_t     start = 0, end = 0;   // samples
-    std::string text;
 };
 
 struct Stats {
@@ -85,7 +80,6 @@ private:
     Fusion fusion_;
     Stats  stats_;
     std::string asr_text_;
-    std::vector<Delta> deltas_;
     std::map<std::string, int> spk_id_;
     double first_turn_audio_ = -1;
     void* asr_ctx_ = nullptr;

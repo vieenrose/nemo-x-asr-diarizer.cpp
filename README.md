@@ -110,9 +110,10 @@ always nearest-speaker).
   miss ~41 % of speech frames (0 false alarms, 0 speaker-error where it does fire). That is a threshold
   question in the upstream decode config (`speaker_threshold`, `speaker_min_frames`), which this tool does
   not yet expose. Every attribution number above is quoted with that hole in it.
-* **No word timestamps from x-asr.** The transducer API returns text, not tokens-with-times, so character
-  timing is inferred (step 2 above) rather than measured. A token-time path through the encoder would make
-  attribution exact; that is the highest-value change here.
+* **No word timestamps from x-asr - measured, and it costs less than expected.** See the next section:
+  attribution is flat across a 10x range of the placement model, so exact token times would buy almost
+  nothing for *who said it*. What they would buy is *when the speaker changed* - boundaries are placed at
+  word granularity, so a label change carries about one word of timing uncertainty.
 * **Two ggml runtimes in one process, deliberately.** x-asr's runtime is CrispASR's, against its ggml fork;
   Nemotron-3 lives in audio.cpp's C API, which is version-scripted to hide its own ggml. Building the two
   against a single ggml compiles and links - and then asserts in `ggml_backend_sched` because the fork has
@@ -130,3 +131,37 @@ In short: [CrispASR](https://github.com/CrispStrobe/CrispASR) (MIT) for the x-as
 repo carries no license file, so nothing was copied from it and only its documentation informed this one.
 Model weights carry their own licenses (`fetch_models.sh` prints them); this repository's license covers
 the code here only.
+
+## Does the missing timestamp data actually hurt? (measured, `scripts/attribution_sensitivity.sh`)
+
+x-asr returns text, not tokens with times, so `Fusion` places each delta's characters inside the audio it
+decodes. Two knobs control that placement (`--char-dur-ms`, `--asr-latency-ms`) and one controls what happens
+in gaps (`--gap-snap-ms`). The transcript is byte-identical across every cell below - same model, same audio,
+greedy decode - so whatever moves is the placement doing its work. Bilingual gate clip, 18 runs:
+
+| placement sweep | attribution error | coverage | consistency | WER |
+|---|---|---|---|---|
+| per-char duration 30 / 90 / 300 ms (10x range) | 0.0132 | 0.894 | 0.993 | 0.1765 |
+| lag correct (480 ms = `--chunk-ms`) | 0.0132 | 0.894 | 0.994→0.993 | 0.1765 |
+| lag wrong by 3x low (160 ms) | 0.0526 | 0.894 | 0.958 | 0.1765 |
+| lag wrong by 2x high (960 ms) | 0.0526-0.0658 | 0.894 | 0.950-0.971 | 0.1765 |
+
+So:
+
+1. **Per-character precision is nearly free.** A 10x change in the character-time model moves attribution
+   by 0.0000. Real token timestamps would not make "who said this word" meaningfully better on this material.
+2. **The aggregate lag is not free.** Getting it wrong by 3x costs 4-5x the attribution error - and that lag
+   is *known analytically* (the encoder's chunk length), no timestamps needed.
+3. **The damage timestamps did cause was indirect, and it was in the cut, not the choice.** With
+   character-granular cuts, a boundary landing inside a word printed `...subsequently dro` / `f`. The scorer
+   then reads two tokens where the reference has one: the same transcript scored **WER 0.1765 with clean cuts
+   and 0.3176 with cuts through words**, while attribution barely noticed. Attribution is now word-granular
+   where words exist (CJK stays per-character), and WER is invariant across all 18 cells.
+
+Two honest caveats about timing measurement:
+
+* Boundary *time* is still inferred at word granularity, and the diarizer's own turn onsets are median 0.80 s
+  off the reference (p90 1.30 s) on this clip. That is the floor under any boundary claim here.
+* The archive scorer's `turn-onset` diagnostic reports 7.78 s for this output format. Ignore it: it multiplies
+  the segment counter by its 2.93 s window hop, which is only meaningful for a windowed streaming transcript.
+  It is a diagnostic in that tool and is not gated - do not gate it against this format.

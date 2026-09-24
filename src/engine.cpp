@@ -96,8 +96,19 @@ void Engine::attribute(const std::function<void(const Segment&)>& on_segment, bo
         done.index = ++idx;
         on_segment(done);
     };
-    for (const Delta& d : deltas_) {
-        for (const TaggedPiece& p : fusion_.on_delta(d.text, d.start, d.end)) {
+    {
+        for (const TaggedPiece& p : fusion_.attribute_all()) {
+        // Text the diarizer left uncovered keeps the label it was already under instead of opening a
+        // "Speaker -1" segment. This is not a hedge: the scorer WER is measured with drops every line it
+        // cannot parse a speaker from, so an untagged island silently DELETES words from the transcript
+        // (0.1765 -> 0.2235 on the bilingual gate with an identical character stream). The count is still
+        // reported as unattributed_chars, so the honesty lives in the telemetry, not in the layout.
+        if (p.speaker.empty() && !open.text.empty()) {
+            unattributed += codepoints(p.text).size();
+            open.text += p.text;
+            open.end_s = std::max(open.end_s, p.end_s);
+            continue;
+        }
             pieces++;
             snapped_chars += p.snapped ? codepoints(p.text).size() : 0;
             const std::string& want = p.speaker;
@@ -145,8 +156,8 @@ void Engine::attribute(const std::function<void(const Segment&)>& on_segment, bo
     stats_.snapped_chars = snapped_chars;
     stats_.speakers = spk_id.size();
     if (final_pass && getenv("NEMO_DEBUG_ATTR")) {
-        std::fprintf(stderr, "[attrib] %zu pieces, %zu turns, %zu deltas\n", pieces, fusion_.turns().size(),
-                     deltas_.size());
+        std::fprintf(stderr, "[attrib] %zu pieces, %zu turns, %zu chars\n", pieces, fusion_.turns().size(),
+                     fusion_.chars());
     }
 }
 
@@ -225,9 +236,12 @@ bool Engine::run(const std::function<void(const Segment&)>& on_segment, std::str
         if (!delta.empty()) {
             int64_t horizon = last ? total : (int64_t)(off + n) - (int64_t)latency_samples;
             if (horizon < charged_upto) horizon = charged_upto;
-            deltas_.push_back(Delta{charged_upto, horizon, delta});
+            // The Nemotron stream computes in chunks but COMMITS turns in batches (first batch at
+            // 30.5 s on the bilingual clip), so deltas are pushed into the attributor's own character
+            // timeline and tagged against the turn list whenever it updates - see fusion.h.
+            fusion_.push_delta(delta, charged_upto, horizon);
             charged_upto = horizon;
-            stats_.deltas = deltas_.size();
+            stats_.deltas++;
             if (stats_.first_partial_s < 0) stats_.first_partial_s = now_s() - t0;
         }
 

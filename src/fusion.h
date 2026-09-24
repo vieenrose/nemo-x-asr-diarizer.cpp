@@ -38,6 +38,9 @@ struct TaggedPiece {
 
 class Fusion {
 public:
+    // Per-codepoint audio interval, built by push_delta and consumed by attribute_all.
+    struct CharSpan { int64_t start = 0, end = 0; };
+
     // asr_latency_s is the ASR's own lag: the delta returned after feeding audio up to T describes
     // audio up to T - asr_latency_s. Get this wrong in the optimistic direction and every speaker
     // tag shifts early into the previous speaker's turn.
@@ -66,6 +69,13 @@ public:
     // a piece boundary means a speaker change (or entering/leaving uncovered audio).
     std::vector<TaggedPiece> on_delta(const std::string& delta, int64_t span_start, int64_t span_end);
 
+    // The streaming path. Deltas are appended to an internal character timeline with their intervals,
+    // and attribution runs over the WHOLE timeline, so a word that arrives split across two deltas is
+    // still attributed as one word.
+    void push_delta(const std::string& delta, int64_t span_start, int64_t span_end);
+    std::vector<TaggedPiece> attribute_all() const;
+    size_t chars() const { return spans_.size(); }
+
     const std::vector<Turn>& turns() const { return turns_; }
 
     // Speaker label covering [t, t+dur) by maximum overlap; else the nearest turn within the snap
@@ -75,6 +85,8 @@ public:
 private:
     int rate_;
     double latency_s_;
+    std::string text_;
+    std::vector<CharSpan> spans_;
     double char_dur_s_ = 0.09;     // ~11 chars/s, between Mandarin (~5/s) and English (~15/s) speech rates
     double gap_snap_s_ = 0.40;     // turn gaps in the bilingual gate set run 0.05-0.30 s
     std::vector<Turn> turns_;
