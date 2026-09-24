@@ -41,6 +41,19 @@ struct Config {
                                     // from drops "Speaker -1" lines from WER entirely, so leaving text
                                     // untagged costs WER (0.2235 vs 0.1765, identical transcript). The
                                     // honest counter is snapped_chars, which is reported either way.
+    // Passed to the diarizer as REQUEST options - the family reads its decode config from
+    // stream_request_.options, so session options do nothing and a NULL request silently means
+    // threshold=0.5, min_frames=0, pad_frames=0. Use {"speaker_threshold","0.35"} and friends.
+    // Defaults measured, not copied from upstream (curve in README): speaker_pad_frames bridges gaps where
+    // the diarizer fell below threshold mid-turn. DER-lite on the bilingual clips drops 40.9->30.3 (57s)
+    // and 45.8->29.3 (45s, never tuned on) at pad=45, with false alarm <= 1.1. Silence/noise/tone still
+    // produce ZERO turns at these settings. Raising pad further keeps helping on presentation-style audio
+    // and will start merging fast turn-taking, so 45 (~1.7 s) is a middle choice, not the eval optimum.
+    std::vector<std::pair<std::string, std::string>> diar_opts = {
+        {"speaker_threshold", "0.3"}, {"speaker_pad_frames", "45"}
+    };
+    int window_samples = 46900;   // HOP_S of the archive contract: 70400 samples at 24 kHz = 2.933 s
+    bool windowed_out   = false;  // emit [k/N] Speaker s: blocks like the streaming baseline does
     bool paced        = false;      // wall-clock 1x, for the realtime demonstration
     bool live_provisional = false;  // re-attribute on every turn update, print revisions to stderr
     bool skip_asr     = false;
@@ -108,6 +121,7 @@ private:
     void* registry_ = nullptr;
     void* model_ = nullptr;
     void* session_ = nullptr;
+    void* diar_request_ = nullptr;
     std::vector<double> piece_ms_;
 };
 

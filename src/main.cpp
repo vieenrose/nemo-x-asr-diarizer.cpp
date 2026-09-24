@@ -11,6 +11,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -32,8 +34,13 @@ static void usage(const char* p) {
         "  --char-dur-ms N       per-character duration for time placement (default 90)\n"
         "  --gap-snap-ms N       attribution tolerance across between-turns pauses (default 400)\n"
         "  --paced               sleep to 1x wall clock, so reported latency is real-time latency\n"
+        "  --diar-threshold F    diarizer detection threshold (family default 0.5; lower = more speech found)\n"
+        "  --diar-opt K=V        any diarizer request option, e.g. speaker_min_frames=2 (repeatable)\n"
         "  --no-asr / --no-diar  run one half (diar-only still emits turn timeline; asr-only tags nothing)\n"
         "  --live                print segments as they close, to stderr (latency demonstration)\n"
+        "  --windows             emit the baseline's window format: [k/N] blocks every 2.93 s of\n"
+        "                        audio (HOP_S = 70400/24000) instead of one block per speaker change\n"
+        "  --window-ms F         window length, default 2933.333\n"
         "  --json                print telemetry JSON to stdout\n"
         "  --turns-out PATH      dump the diar turn timeline as JSON\n"
         "  --out PATH            write the tagged transcript here\n", p);
@@ -41,7 +48,8 @@ static void usage(const char* p) {
 
 int main(int argc, char** argv) {
     Config cfg;
-    bool json = false, live = false, turns_out = false, tokens_out = false;
+    bool json = false, live = false, turns_out = false, tokens_out = false, windowed = false;
+    double window_s = 70400.0 / 24000.0;   // the archive's HOP_S, in seconds
     std::string turns_path, out_path, tokens_path;
     cfg.xasr_model = "models/x-asr-zh-en-q8_0.gguf";
     cfg.diar_model = "models/nemotron-3-diarization-q8_0.gguf";
@@ -71,9 +79,18 @@ int main(int argc, char** argv) {
             if (cfg.timing == 9) return 2;
         }
         else if (a == "--tokens-out") tokens_path = next("--tokens-out"), tokens_out = true;
+        else if (a == "--windows") windowed = true;
+        else if (a == "--window-ms") window_s = atof(next("--window-ms")) / 1000.0;
         else if (a == "--char-dur-ms") cfg.char_dur_ms = atof(next("--char-dur-ms"));
         else if (a == "--gap-snap-ms") cfg.gap_snap_ms = atof(next("--gap-snap-ms"));
         else if (a == "--paced") cfg.paced = true;
+        else if (a == "--diar-threshold") cfg.diar_opts.emplace_back("speaker_threshold", next("--diar-threshold"));
+        else if (a == "--diar-opt") {
+            std::string kv = next("--diar-opt");
+            const size_t eq = kv.find('=');
+            if (eq == std::string::npos) { std::fprintf(stderr, "ERROR: --diar-opt wants key=value\n"); return 2; }
+            cfg.diar_opts.emplace_back(kv.substr(0, eq), kv.substr(eq + 1));
+        }
         else if (a == "--no-asr") cfg.skip_asr = true;
         else if (a == "--no-diar") cfg.skip_diar = true;
         else if (a == "--live") live = true;
@@ -102,8 +119,48 @@ int main(int argc, char** argv) {
     // to stderr, because a telemetry flag that produces unparsable JSON is worse than no flag.
     FILE* sink = !out_path.empty() ? std::fopen(out_path.c_str(), "w") : (json ? stderr : stdout);
     if (!sink) { std::fprintf(stderr, "ERROR: cannot write %s\n", out_path.c_str()); return 1; }
-    for (const Segment& s : segs) {
-        std::fprintf(sink, "[%d/%zu]\n Speaker %d:%s\n", s.index, segs.size(), s.speaker, s.text.c_str());
+    // Two output shapes over the same attribution. Default = one block per speaker change (what a product
+    // wants). --windows = one block per HOP_S of audio, tagged with the speaker(s) inside it, which is what
+    // the autoresearch harness and score_stream.py consume - so "drop-in" is checkable by running the
+    // archive's own tools against this binary, not by trusting a claim in a README.
+    //
+    // Window boundaries come from the model's token times when they exist. Otherwise text is spread
+    // uniformly across the segment's span, which is coarse (a segment can run tens of seconds) and is
+    // reported as such by the window-onset diagnostic - it does not silently pretend to be exact.
+    if (windowed) {
+        const double hop = window_s > 0 ? window_s : 2.933333;
+        int nwin = 1;
+        for (const Segment& s : segs) nwin = std::max(nwin, (int)(s.end_s / hop) + 1);
+        std::vector<std::vector<std::pair<int, std::string>>> win(nwin);
+        auto add = [&](int w, int label, const std::string& t) {
+            if (w < 0) w = 0; if (w >= nwin) w = nwin - 1;
+            if (!win[w].empty() && win[w].back().first == label) win[w].back().second += t;
+            else if (!t.empty()) win[w].push_back({label, t});
+        };
+        std::map<std::string, int> label;      // diarizer label -> the small int the segments already use
+        for (const Segment& s : segs) label[s.speaker_id] = s.speaker;
+        const auto toks = eng.token_table();
+        if (!toks.empty()) {
+            for (const TokenInfo& t : toks)
+                add((int)(t.t_s / hop), t.speaker_id.empty() ? -1 : label[t.speaker_id], t.text);
+        } else {
+            for (const Segment& s : segs) {
+                const auto cps = codepoints(s.text);
+                const double span = std::max(1e-6, s.end_s - s.start_s);
+                for (size_t i = 0; i < cps.size(); i++)
+                    add((int)((s.start_s + span * (double)i / (double)cps.size()) / hop), s.speaker,
+                        s.text.substr(cps[i].first, cps[i].second));
+            }
+        }
+        for (int w = 0; w < nwin; w++) {
+            if (win[w].empty()) continue;                       // silent window emits nothing
+            std::fprintf(sink, "[%d/%d]\n", w + 1, nwin);
+            for (const auto& r : win[w]) std::fprintf(sink, " Speaker %d:%s\n", r.first, r.second.c_str());
+        }
+    } else {
+        for (const Segment& s : segs) {
+            std::fprintf(sink, "[%d/%zu]\n Speaker %d:%s\n", s.index, segs.size(), s.speaker, s.text.c_str());
+        }
     }
     if (!out_path.empty()) std::fclose(sink); else std::fflush(sink);
 

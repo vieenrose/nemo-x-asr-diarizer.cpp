@@ -131,6 +131,45 @@ So `--timing auto` prefers model timestamps, `inferred` reproduces the previous 
 allowed to claim an accuracy win on this evidence. What is solid: a 40 ms token timeline that verifies
 against silence, and a documented 300 ms decision lag.
 
+## Drop-in output contract
+
+`--windows` re-emits the same attribution in the shape the VibeASR autoresearch harness consumes: one
+`[k/N]` block per `HOP_S = 70400/24000 = 2.933 s` of audio, text inside tagged with the speaker(s) that
+spoke it, silent windows emitting nothing. Window cuts use the model's token times when available, and
+otherwise spread each segment's text uniformly over its span (coarse, and the window-onset diagnostic says
+so rather than pretending). Both shapes score identically through the archive's `score_stream.py` - WER
+0.1765 and attribution 0.0658 either way on the bilingual gate - which is the point: "drop-in" is checkable
+by running the archive's own tools against this binary.
+
+## Diarization detection knobs
+
+The diarizer's decode config is read from the REQUEST (`nemotron_3_diar/session.cpp` reads
+`stream_request_.options`), so session options do nothing and a NULL request silently means
+`threshold=0.5, min_frames=0, pad_frames=0`. Measured DER-lite (12-14 ground-truth turns per clip):
+
+| speaker_pad_frames | 57 s clip (tuned on) | 45 s v2 clip (never tuned on) |
+|---|---|---|
+| 0 (upstream) | 37.8 | 45.8 |
+| 20 | 30.3 | 37.5 |
+| 45 (**default**) | 30.3 -> 27.6 miss | 29.3 (FA 1.1, spk 1.9) |
+| 90 | ~20 | 22.3 (FA 3.7) |
+
+`speaker_threshold` barely matters between 0.25-0.35; **pad_frames dominates**, because most of the miss
+was the diarizer dropping below threshold in the middle of a turn rather than never detecting it. Defaults
+are `threshold=0.3, pad_frames=45`, chosen in the middle of the curve rather than at its best point on the
+eval clips: past that, `pad` starts merging genuine turn-taking, and both clips here are presentation-style
+audio with few rapid exchanges. At these settings silence, pink-ish noise and a 440 Hz tone all produce
+**zero** turns and zero text, which is the contract that matters for a streaming product.
+
+Attribution on the 85-token gate moved between 0.0263 and 0.0658 across these settings - 2 to 5 wrong tokens
+out of 76 - so no attribution claim is made from it; DER-lite above, on ~50 s of ground-truth turns per clip,
+is the metric that actually resolves this change.
+
+## Build note
+
+`scripts/build_host.sh` deletes objects before compiling. A stale object linked against a changed struct
+layout does not fail to link - it corrupts memory at run time and segfaults somewhere unhelpful.
+
 ## Known limits
 
 * **The diarizer commits turns late.** It computes in chunks with caches - genuinely streaming - but the

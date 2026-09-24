@@ -37,6 +37,7 @@ double rss_mb() {
 Engine::~Engine() {
     if (asr_stream_) xasr_stream_free((xasr_stream*)asr_stream_);
     if (asr_ctx_) xasr_free((xasr_context*)asr_ctx_);
+    if (diar_request_) audiocpp_request_free((audiocpp_request*)diar_request_);
     if (session_) audiocpp_session_free((audiocpp_session*)session_);
     if (model_) audiocpp_model_free((audiocpp_model*)model_);
     if (registry_) audiocpp_registry_free((audiocpp_registry*)registry_);
@@ -71,7 +72,26 @@ bool Engine::init(std::string& err) {
         st = audiocpp_session_create((audiocpp_model*)model_, "diar", "streaming", &bc, nullptr,
                                      (audiocpp_session**)&session_);
         if (st != AUDIOCPP_OK) { err = std::string("diar session (streaming): ") + audiocpp_last_error(); return false; }
-        st = audiocpp_stream_start((audiocpp_session*)session_, nullptr);
+        // The decode knobs live on the REQUEST (session.cpp reads decode_config(stream_request_.options)),
+        // so build one instead of passing NULL. It stays alive for the run: freeing it after stream_start
+        // would leave the family reading a dangling map, or quietly fall back to the defaults, and a
+        // threshold sweep that silently used 0.5 everywhere is the kind of result I do not want to report.
+        if (!cfg_.diar_opts.empty()) {
+            audiocpp_request* req = audiocpp_request_create();
+            if (!req) { err = "audiocpp_request_create failed"; return false; }
+            for (const auto& kv : cfg_.diar_opts) {
+                audiocpp_status os = audiocpp_request_set_option(req, kv.first.c_str(), kv.second.c_str());
+                if (os != AUDIOCPP_OK) {
+                    err = "diar option " + kv.first + "=" + kv.second + ": " + audiocpp_last_error();
+                    audiocpp_request_free(req);
+                    return false;
+                }
+            }
+            diar_request_ = req;
+            st = audiocpp_stream_start((audiocpp_session*)session_, req);
+        } else {
+            st = audiocpp_stream_start((audiocpp_session*)session_, nullptr);
+        }
         if (st != AUDIOCPP_OK) { err = std::string("diar stream_start: ") + audiocpp_last_error(); return false; }
     }
     stats_.load_s = now_s() - t0;
