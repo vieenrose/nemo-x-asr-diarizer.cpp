@@ -100,6 +100,26 @@ audio, delayed by the encoder's own window. So:
 Tunables: `--asr-latency-ms` (default = `--chunk-ms`), `--char-dur-ms` (90), `--gap-snap-ms` (400; 0 =
 always nearest-speaker).
 
+## The window format has to be scored, not eyeballed
+
+Two bugs of the same shape showed up while building `--windows`, and both were invisible to the obvious
+check ("is the text the same?"):
+
+1. Cutting text at window boundaries split English words (`"that end"` | `"s well"`, 27 of 55 lines on the
+   English holdout). Concatenated text was identical to segment output; scored, WER went 0.2455 -> 0.3136,
+   because the scorer tokenises per line, so one reference word became a substitution plus an insertion.
+2. "Fixing" the grouping by flushing on spaces dropped the separators. Words merged (`the cat` -> `thecat`),
+   WER 0.9455. Still identical when concatenated.
+
+Now text is grouped into words first - a word goes whole into the window its first character falls in, CJK
+stays character-granular, punctuation and spaces attach to the word they follow - and the two output shapes
+are equivalent where it counts: on host and on the phone, gate_ms_v2 scores WER 0.1765 / attribution 0.0658
+of 76 either way, and holdout_en scores 0.2455 / 0.6124 of 209 either way. Consistency differs slightly
+(0.963 vs 0.957) only because boundaries split speaker runs differently.
+
+The transferable rule: **a formatter is verified by scoring its output, never by comparing its characters.**
+Character equality was true in both broken cases.
+
 ## Token timestamps (added, and what they turned out to be worth)
 
 x-asr never returned times, so the engine used to *infer* where each character was spoken. It can now use

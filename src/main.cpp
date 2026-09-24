@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <cctype>
 #include <map>
 #include <string>
 #include <vector>
@@ -128,30 +129,74 @@ int main(int argc, char** argv) {
     // uniformly across the segment's span, which is coarse (a segment can run tens of seconds) and is
     // reported as such by the window-onset diagnostic - it does not silently pretend to be exact.
     if (windowed) {
+        std::map<std::string, int> spk_label;   // diarizer label -> the small int the segments already use
+        for (const Segment& sg : segs) spk_label[sg.speaker_id] = sg.speaker;
+        auto label_of = [&](const std::string& id) -> int {
+            const auto it = spk_label.find(id);
+            return it == spk_label.end() ? -1 : it->second;
+        };
         const double hop = window_s > 0 ? window_s : 2.933333;
         int nwin = 1;
         for (const Segment& s : segs) nwin = std::max(nwin, (int)(s.end_s / hop) + 1);
         std::vector<std::vector<std::pair<int, std::string>>> win(nwin);
-        auto add = [&](int w, int label, const std::string& t) {
+        auto add = [&](int w, int lbl, const std::string& t) {
             if (w < 0) w = 0; if (w >= nwin) w = nwin - 1;
-            if (!win[w].empty() && win[w].back().first == label) win[w].back().second += t;
-            else if (!t.empty()) win[w].push_back({label, t});
+            if (!win[w].empty() && win[w].back().first == lbl) win[w].back().second += t;
+            else if (!t.empty()) win[w].push_back({lbl, t});
         };
-        std::map<std::string, int> label;      // diarizer label -> the small int the segments already use
-        for (const Segment& s : segs) label[s.speaker_id] = s.speaker;
+
+        // NEVER CUT A WORD AT A WINDOW BOUNDARY. This cost 7 points of WER before it was fixed: with the
+        // same characters and the same manifest, segment output scored 0.2455 and window output 0.3136 on
+        // the English holdout, because 27 of 55 window lines began mid-word ("that end" | "s well") and
+        // the scorer tokenises per line, so one reference word became a substitution plus an insertion.
+        // Concatenated text is IDENTICAL either way, which is exactly why a text-equality check cannot see
+        // this - the check has to be the score, or an explicit mid-word test.
+        //
+        // So characters are grouped into words first, and a word goes to the window its FIRST character
+        // falls in, whole. Non-ASCII (CJK) codepoints are their own unit - Chinese has no spaces to split
+        // on. Punctuation and spaces attach to the word they follow.
+        struct Chr { std::string c; double t; int label; };
+        std::vector<Chr> chars;
         const auto toks = eng.token_table();
         if (!toks.empty()) {
-            for (const TokenInfo& t : toks)
-                add((int)(t.t_s / hop), t.speaker_id.empty() ? -1 : label[t.speaker_id], t.text);
-        } else {
-            for (const Segment& s : segs) {
-                const auto cps = codepoints(s.text);
-                const double span = std::max(1e-6, s.end_s - s.start_s);
+            for (const TokenInfo& ti : toks) {
+                const int lab = ti.speaker_id.empty() ? -1 : label_of(ti.speaker_id);
+                const auto cps = codepoints(ti.text);
+                const double dt = cps.empty() ? 0.0 : 0.040 / (double)cps.size();   // token spans <= 40 ms
                 for (size_t i = 0; i < cps.size(); i++)
-                    add((int)((s.start_s + span * (double)i / (double)cps.size()) / hop), s.speaker,
-                        s.text.substr(cps[i].first, cps[i].second));
+                    chars.push_back({ti.text.substr(cps[i].first, cps[i].second), ti.t_s + dt * (double)i, lab});
+            }
+        } else {
+            // No model times: spread each segment's text over its span. Coarse, but it must still produce
+            // TEXT - an output shape that silently emits nothing when timings are missing is the worst kind
+            // of bug, because it looks like a working run.
+            for (const Segment& sg : segs) {
+                const auto cps = codepoints(sg.text);
+                const double span = std::max(1e-6, sg.end_s - sg.start_s);
+                for (size_t i = 0; i < cps.size(); i++)
+                    chars.push_back({sg.text.substr(cps[i].first, cps[i].second),
+                                     sg.start_s + span * (double)i / (double)std::max<size_t>(1, cps.size()),
+                                     sg.speaker});
             }
         }
+
+        auto is_word_char = [](unsigned char c) { return std::isalnum(c) || c == '\'' || c == '-'; };
+        std::string buf;
+        double buf_at = 0;
+        int buf_label = -1;
+        auto flush = [&]() { if (!buf.empty()) { add((int)(buf_at / hop), buf_label, buf); buf.clear(); } };
+        for (const Chr& ch : chars) {
+            const unsigned char u0 = (unsigned char)(ch.c.empty() ? 0 : ch.c[0]);
+            if (u0 >= 0x80) { flush(); add((int)(ch.t / hop), ch.label, ch.c); continue; }   // CJK: own unit
+            if (buf.empty()) { buf = ch.c; buf_at = ch.t; buf_label = ch.label; if (u0 != ' ' && !is_word_char(u0)) flush(); }
+            // The separator belongs to the word it follows. Dropping it here merged every pair of words
+            // into one token ("the cat" -> "thecat") and took WER from 0.25 to 0.95, which is a good reminder
+            // that a formatter has to be scored, not eyeballed.
+            else if (u0 == ' ') { buf += " "; flush(); }
+            else if (is_word_char(u0) || is_word_char((unsigned char)buf[buf.size() - 1])) { buf += ch.c; if (!is_word_char(u0)) flush(); }
+            else { flush(); buf = ch.c; buf_at = ch.t; buf_label = ch.label; }
+        }
+        flush();
         for (int w = 0; w < nwin; w++) {
             if (win[w].empty()) continue;                       // silent window emits nothing
             std::fprintf(sink, "[%d/%d]\n", w + 1, nwin);
