@@ -85,6 +85,8 @@ int main(int argc, char** argv) {
         else if (a == "--main-affinity") cfg.main_affinity = std::strtol(next("--main-affinity"), nullptr, 16);
         else if (a == "--engine-affinity") cfg.engine_affinity = std::strtol(next("--engine-affinity"), nullptr, 16);
         else if (a == "--windows") windowed = true;
+        else if (a == "--diar-no-finish") cfg.diar_no_finish = true;
+        else if (a == "--diar-tail-ms") cfg.diar_tail_ms = atoi(next("--diar-tail-ms"));
         else if (a == "--window-ms") window_s = atof(next("--window-ms")) / 1000.0;
         else if (a == "--char-dur-ms") cfg.char_dur_ms = atof(next("--char-dur-ms"));
         else if (a == "--gap-snap-ms") cfg.gap_snap_ms = atof(next("--gap-snap-ms"));

@@ -20,6 +20,16 @@
 namespace nemo {
 
 struct Config {
+    // Push this much SILENCE to the diarizer only, just before stream_finish. The final flush costs a fixed
+    // ~5-8.6 s regardless of clip length (45 s clip: 8.74 s, 69 s clip: 8.55 s) - that says graph build for a
+    // window size the steady state never produced, not arithmetic over leftover audio. A full silence chunk
+    // first should let the flush reuse an already-built graph. 0 = today's behaviour.
+    int diar_tail_ms = 0;
+
+    // Skip audiocpp_stream_finish and keep only the turns the stream already committed as events. The finish
+    // call costs ~7-9 s per stream REGARDLESS of clip length (3 s clip 7.27, 15 s 8.59, 45 s 8.74, 69 s 8.55)
+    // - a fixed prepare/flush, not work proportional to audio. Whether those turns were needed is the test.
+    bool diar_no_finish = false;
     std::string xasr_model;         // x-asr-zh-en-q8_0.gguf
     std::string diar_model;         // nemotron-3-diarization-q8_0.gguf
     std::string audio;              // 16 kHz mono PCM16 wav
@@ -100,6 +110,9 @@ struct Stats {
                                       // This is the attribution floor: no word can be tagged before it.
     size_t turns = 0, segments = 0, speakers = 0, deltas = 0, unattributed_chars = 0, snapped_chars = 0;
     std::vector<double> pass_rtf;
+    // Where the uncharged time goes. wall - asr - diar was ~19% of wall and nobody knew why; these split it
+    // into the pieces of the loop that are neither engine call. Zero cost unless NEMO_PROF=1.
+    double prof_pushdelta_s = 0, prof_tokenbuild_s = 0, prof_attrfinal_s = 0, prof_drain_s = 0;
 };
 
 class Engine {

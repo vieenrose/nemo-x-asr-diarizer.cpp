@@ -71,7 +71,20 @@ static int apply_affinity(long main_mask, long engine_mask) {
     return moved;
 }
 
-bool Engine::init(std::string& err) {    {
+// Turns carried by a diar result, in the shape fusion_ wants. Shared by the per-piece drain and the tail push.
+void harvest_turns(const audiocpp_result* r, std::vector<Turn>& out) {
+    if (!r) return;
+    const size_t k = audiocpp_result_speaker_turn_count(r);
+    for (size_t i = 0; i < k; i++) {
+        int64_t s0 = 0, s1 = 0; float conf = 0; const char* sid = nullptr; const char* txt = nullptr;
+        if (audiocpp_result_speaker_turn(r, i, &s0, &s1, &sid, &conf, &txt) == AUDIOCPP_OK) {
+            out.push_back(Turn{s0, s1, sid ? sid : "", conf});
+        }
+    }
+}
+
+bool Engine::init(std::string& err) {
+    {                                    // thread-count probe, its own scope on purpose
         DIR* d0 = opendir("/proc/self/task");
         int n0 = 0; if (d0) { while (readdir(d0)) n0++; closedir(d0); }
         if (getenv("NEMO_DEBUG_THREADS"))
@@ -81,6 +94,7 @@ bool Engine::init(std::string& err) {    {
     auto nthr = []{ DIR* d = opendir("/proc/self/task"); int n = 0; if (d) { while (readdir(d)) n++; closedir(d); } return n - 2; };
     const bool dbg_thr = getenv("NEMO_DEBUG_THREADS") != nullptr;
 
+    const bool prof_on = getenv("NEMO_PROF") != nullptr;   // timers stay off unless asked for
     const double t0 = now_s();
     if (!cfg_.skip_asr) {
         if (cfg_.xasr_model.empty()) { err = "--xasr-model required (or --no-asr)"; return false; }
@@ -341,6 +355,7 @@ bool Engine::run(const std::function<void(const Segment&)>& on_segment, std::str
     const int64_t total = (int64_t)wav.pcm.size();
     const double latency_samples = fusion_.latency_s() * rate;
 
+    const bool prof_on = getenv("NEMO_PROF") != nullptr;   // timers stay off unless asked for
     const double t0 = now_s();
     int64_t charged_upto = 0;          // samples of audio already claimed by buffered deltas
     size_t turns_seen = 0;
@@ -364,16 +379,7 @@ bool Engine::run(const std::function<void(const Segment&)>& on_segment, std::str
                                                       rate, 1, (int64_t)off, &ev);
             if (st != AUDIOCPP_OK) { err = std::string("diar stream_push: ") + audiocpp_last_error(); return false; }
             std::vector<Turn> snapshot;
-            auto harvest = [&](const audiocpp_result* r) {
-                if (!r) return;
-                const size_t k = audiocpp_result_speaker_turn_count(r);
-                for (size_t i = 0; i < k; i++) {
-                    int64_t s0 = 0, s1 = 0; float conf = 0; const char* sid = nullptr; const char* txt = nullptr;
-                    if (audiocpp_result_speaker_turn(r, i, &s0, &s1, &sid, &conf, &txt) == AUDIOCPP_OK) {
-                        snapshot.push_back(Turn{s0, s1, sid ? sid : "", conf});
-                    }
-                }
-            };
+            auto harvest = [&](const audiocpp_result* r) { harvest_turns(r, snapshot); };
             harvest(ev ? audiocpp_event_as_result(ev) : nullptr);
             if (ev) audiocpp_event_free(ev);
             for (;;) {                                   // a family may queue several events per push
@@ -410,12 +416,14 @@ bool Engine::run(const std::function<void(const Segment&)>& on_segment, std::str
         // 3. pin the delta to the audio it decodes. The delta describes audio up to (fed - latency);
         // tagging happens in attribute(), against whatever turn timeline exists at that moment.
         if (!delta.empty()) {
+            const double pd0 = prof_on ? now_s() : 0.0;
             int64_t horizon = last ? total : (int64_t)(off + n) - (int64_t)latency_samples;
             if (horizon < charged_upto) horizon = charged_upto;
             // The Nemotron stream computes in chunks but COMMITS turns in batches (first batch at
             // 30.5 s on the bilingual clip), so deltas are pushed into the attributor's own character
             // timeline and tagged against the turn list whenever it updates - see fusion.h.
             if (cfg_.timing != 1) fusion_.push_delta(delta, charged_upto, horizon);
+            if (prof_on) stats_.prof_pushdelta_s += now_s() - pd0;
             charged_upto = horizon;
             stats_.deltas++;
             if (stats_.first_partial_s < 0) stats_.first_partial_s = now_s() - t0;
@@ -430,24 +438,52 @@ bool Engine::run(const std::function<void(const Segment&)>& on_segment, std::str
         }
     }
 
+    // Diarizer-only tail: the ASR never sees it, so text cannot shift from this side. Whether the DIAR side
+    // stays identical (turn padding near the end) is exactly what the byte-identity gate decides.
+    if (cfg_.diar_tail_ms > 0 && !cfg_.skip_diar) {
+        std::vector<float> zeros(size_t(cfg_.diar_tail_ms) * rate / 1000, 0.0f);
+        const double d0 = now_s();
+        audiocpp_event* ev = nullptr;
+        audiocpp_status st = audiocpp_stream_push((audiocpp_session*)session_, zeros.data(), (int)zeros.size(),
+                                                 rate, 1, (int64_t)total, &ev);
+        if (st != AUDIOCPP_OK) { err = std::string("diar tail push: ") + audiocpp_last_error(); return false; }
+        std::vector<Turn> snapshot;
+        harvest_turns(ev ? audiocpp_event_as_result(ev) : nullptr, snapshot);
+        if (ev) audiocpp_event_free(ev);
+        for (;;) {
+            audiocpp_event* more = nullptr;
+            if (audiocpp_stream_next_event((audiocpp_session*)session_, &more) != AUDIOCPP_OK || !more) break;
+            harvest_turns(audiocpp_event_as_result(more), snapshot);
+            audiocpp_event_free(more);
+        }
+        if (!snapshot.empty()) fusion_.update_turns(snapshot);   // turns are real; keep them
+        stats_.diar_compute_s += now_s() - d0;
+    }
+
+    const double drain0 = prof_on ? now_s() : 0.0;
     // Drain the diarizer's final turns, then attribute the whole timeline against them.
     if (!cfg_.skip_diar) {
         audiocpp_result* res = nullptr;
-        if (audiocpp_stream_finish((audiocpp_session*)session_, &res) == AUDIOCPP_OK && res) {
+        // The final decode also closes the turn that is still open at end-of-audio, so skipping it is a
+        // diarisation change, not a pure speedup - the accuracy gate decides, not the clock.
+        const bool do_finish = !cfg_.diar_no_finish;
+        if (do_finish && audiocpp_stream_finish((audiocpp_session*)session_, &res) == AUDIOCPP_OK && res) {
             std::vector<Turn> snapshot;
-            const size_t k = audiocpp_result_speaker_turn_count(res);
-            for (size_t i = 0; i < k; i++) {
-                int64_t s0 = 0, s1 = 0; float conf = 0; const char* sid = nullptr; const char* txt = nullptr;
-                if (audiocpp_result_speaker_turn(res, i, &s0, &s1, &sid, &conf, &txt) == AUDIOCPP_OK) {
-                    snapshot.push_back(Turn{s0, s1, sid ? sid : "", conf});
-                }
-            }
+            harvest_turns(res, snapshot);
             if (!snapshot.empty()) fusion_.update_turns(snapshot);
             audiocpp_result_free(res);
         }
     }
 
+    if (prof_on) stats_.prof_drain_s = now_s() - drain0;
+    const double attr0 = prof_on ? now_s() : 0.0;
     attribute(on_segment, true);
+    if (prof_on) {
+        stats_.prof_attrfinal_s = now_s() - attr0;
+        std::fprintf(stderr, "[prof] push_delta %.2f  final_drain %.2f  final_attribute %.2f  (wall %.2f,"
+                     " asr %.2f, diar %.2f) s\n", stats_.prof_pushdelta_s, stats_.prof_drain_s,
+                     stats_.prof_attrfinal_s, stats_.wall_s, stats_.asr_compute_s, stats_.diar_compute_s);
+    }
 
     stats_.audio_s = double(total) / rate;
     stats_.wall_s = now_s() - t0;

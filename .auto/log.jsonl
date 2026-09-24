@@ -1,0 +1,1 @@
+{"type":"config","name":"Composite streaming ASR+diar RTF on phone CPU (taskset C0, armed), accuracy byte-identical","metricName":"phone_rtf","metricUnit":"","bestDirection":"lower"}
