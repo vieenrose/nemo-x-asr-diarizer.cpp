@@ -71,7 +71,13 @@ static int apply_affinity(long main_mask, long engine_mask) {
     return moved;
 }
 
-bool Engine::init(std::string& err) {
+bool Engine::init(std::string& err) {    {
+        DIR* d0 = opendir("/proc/self/task");
+        int n0 = 0; if (d0) { while (readdir(d0)) n0++; closedir(d0); }
+        if (getenv("NEMO_DEBUG_THREADS"))
+            std::fprintf(stderr, "[threads] at Engine::init entry: %d\n", n0 - 2);
+    }
+
     auto nthr = []{ DIR* d = opendir("/proc/self/task"); int n = 0; if (d) { while (readdir(d)) n++; closedir(d); } return n - 2; };
     const bool dbg_thr = getenv("NEMO_DEBUG_THREADS") != nullptr;
 
