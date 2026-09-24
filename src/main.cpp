@@ -39,6 +39,8 @@ static void usage(const char* p) {
         "  --diar-opt K=V        any diarizer request option, e.g. speaker_min_frames=2 (repeatable)\n"
         "  --no-asr / --no-diar  run one half (diar-only still emits turn timeline; asr-only tags nothing)\n"
         "  --live                print segments as they close, to stderr (latency demonstration)\n"
+        "  --main-affinity HEX     cpu mask for the ASR thread (e.g. c0 = cpu6-7, the A78 primes)\n"
+        "  --engine-affinity HEX   cpu mask for the diarizer's worker pool (e.g. f = cpu0-3, the A55s)\n"
         "  --windows             emit the baseline's window format: [k/N] blocks every 2.93 s of\n"
         "                        audio (HOP_S = 70400/24000) instead of one block per speaker change\n"
         "  --window-ms F         window length, default 2933.333\n"
@@ -80,6 +82,8 @@ int main(int argc, char** argv) {
             if (cfg.timing == 9) return 2;
         }
         else if (a == "--tokens-out") tokens_path = next("--tokens-out"), tokens_out = true;
+        else if (a == "--main-affinity") cfg.main_affinity = std::strtol(next("--main-affinity"), nullptr, 16);
+        else if (a == "--engine-affinity") cfg.engine_affinity = std::strtol(next("--engine-affinity"), nullptr, 16);
         else if (a == "--windows") windowed = true;
         else if (a == "--window-ms") window_s = atof(next("--window-ms")) / 1000.0;
         else if (a == "--char-dur-ms") cfg.char_dur_ms = atof(next("--char-dur-ms"));

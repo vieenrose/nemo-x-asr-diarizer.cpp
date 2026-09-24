@@ -5,6 +5,12 @@
 
 #include <algorithm>
 #include <cstdio>
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <sched.h>
+#include <unistd.h>
+#include <dirent.h>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -43,7 +49,32 @@ Engine::~Engine() {
     if (registry_) audiocpp_registry_free((audiocpp_registry*)registry_);
 }
 
+// Apply cpu affinity per thread. Affinity is per-thread on Linux, so taskset on the process applies to
+// every thread and cannot separate the two engines - which is exactly the problem here.
+static int apply_affinity(long main_mask, long engine_mask) {
+    const pid_t self = getpid();
+    DIR* d = opendir("/proc/self/task");
+    if (!d) return -1;
+    int moved = 0, kept = 0;
+    struct dirent* e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        const pid_t tid = (pid_t)std::atoi(e->d_name);
+        const long m = (tid == self) ? main_mask : engine_mask;
+        if (m < 0) { kept++; continue; }
+        cpu_set_t cs;
+        CPU_ZERO(&cs);
+        for (int b = 0; b < 64; b++) if (m & (1L << b)) CPU_SET(b, &cs);
+        if (sched_setaffinity(tid, sizeof(cs), &cs) == 0) moved++; else kept++;
+    }
+    closedir(d);
+    return moved;
+}
+
 bool Engine::init(std::string& err) {
+    auto nthr = []{ DIR* d = opendir("/proc/self/task"); int n = 0; if (d) { while (readdir(d)) n++; closedir(d); } return n - 2; };
+    const bool dbg_thr = getenv("NEMO_DEBUG_THREADS") != nullptr;
+
     const double t0 = now_s();
     if (!cfg_.skip_asr) {
         if (cfg_.xasr_model.empty()) { err = "--xasr-model required (or --no-asr)"; return false; }
@@ -59,11 +90,13 @@ bool Engine::init(std::string& err) {
     if (!cfg_.skip_diar) {
         if (cfg_.diar_model.empty()) { err = "--diar-model required (or --no-diar)"; return false; }
         audiocpp_status st = audiocpp_registry_create(nullptr, (audiocpp_registry**)&registry_);
+    if (dbg_thr) std::fprintf(stderr, "[threads] after registry: %d\n", nthr());
         if (st != AUDIOCPP_OK) { err = std::string("diar registry: ") + audiocpp_last_error(); return false; }
         audiocpp_model_config mc{};
         mc.family_hint = "nemotron_3_diar";
         st = audiocpp_model_load((audiocpp_registry*)registry_, cfg_.diar_model.c_str(), &mc, nullptr,
                                  (audiocpp_model**)&model_);
+    if (dbg_thr) std::fprintf(stderr, "[threads] after model_load: %d\n", nthr());
         if (st != AUDIOCPP_OK) { err = std::string("diar model load: ") + audiocpp_last_error(); return false; }
         audiocpp_backend_config bc{};
         bc.backend = "cpu";
@@ -71,6 +104,7 @@ bool Engine::init(std::string& err) {
         bc.threads = cfg_.threads;
         st = audiocpp_session_create((audiocpp_model*)model_, "diar", "streaming", &bc, nullptr,
                                      (audiocpp_session**)&session_);
+    if (dbg_thr) std::fprintf(stderr, "[threads] after session_create: %d\n", nthr());
         if (st != AUDIOCPP_OK) { err = std::string("diar session (streaming): ") + audiocpp_last_error(); return false; }
         // The decode knobs live on the REQUEST (session.cpp reads decode_config(stream_request_.options)),
         // so build one instead of passing NULL. It stays alive for the run: freeing it after stream_start
@@ -89,6 +123,7 @@ bool Engine::init(std::string& err) {
             }
             diar_request_ = req;
             st = audiocpp_stream_start((audiocpp_session*)session_, req);
+    if (dbg_thr) std::fprintf(stderr, "[threads] after stream_start: %d\n", nthr());
         } else {
             st = audiocpp_stream_start((audiocpp_session*)session_, nullptr);
         }
@@ -272,7 +307,13 @@ void Engine::attribute(const std::function<void(const Segment&)>& on_segment, bo
     }
 }
 
-bool Engine::run(const std::function<void(const Segment&)>& on_segment, std::string& err) {
+bool Engine::run(const std::function<void(const Segment&)>& on_segment, std::string& err) {    // Set the calling thread's mask now, and every other thread's mask as they appear: the diarizer creates
+    // its worker pool on FIRST COMPUTE, so a single pre-loop pass would find nothing to move, and threads
+    // created later inherit the creating thread's mask - which is the ASR thread's. Re-applying on a small
+    // period is what makes this stick, and it costs one opendir plus a few syscalls every few pieces.
+    const bool aff_cfg = cfg_.main_affinity >= 0 || cfg_.engine_affinity >= 0;
+    if (aff_cfg) apply_affinity(cfg_.main_affinity, -1);
+
     Wav wav;
     if (!Wav::load(cfg_.audio, wav, err)) return false;
     if (wav.rate != 16000) { err = "need 16 kHz input, got " + std::to_string(wav.rate) + " (resample first)"; return false; }
@@ -287,6 +328,12 @@ bool Engine::run(const std::function<void(const Segment&)>& on_segment, std::str
     size_t turns_seen = 0;
 
     for (size_t off = 0; off < total; off += piece) {
+        if (aff_cfg && (off / piece) % 4 == 0) {
+            const int moved = apply_affinity(cfg_.main_affinity, cfg_.engine_affinity);
+            if (getenv("NEMO_DEBUG_THREADS") && off / piece < 12)
+                std::fprintf(stderr, "[affinity] piece %zu moved=%d threads=%d\n", off / piece, moved,
+                             []{ DIR* d = opendir("/proc/self/task"); int n = 0; if (d) { while (readdir(d)) n++; closedir(d); } return n - 2; }());
+        }
         const size_t n = std::min(piece, total - off);
         const bool last = (off + n >= (size_t)total);
         const double a0 = now_s();

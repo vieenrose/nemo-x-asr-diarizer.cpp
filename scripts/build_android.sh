@@ -82,8 +82,9 @@ ls -la "$OUT" | awk 'NR>1{print "  ", $5, $9}'
 cat <<'EOF'
 
 On the device: put nemo-x-asr-diarizer, libaudiocpp.so and both .gguf files in one directory.
-USE AT LEAST FOUR CPUS. With the baseline's 2-cpu mask (taskset C0 = cpu6-7) this binary HANGS: each engine
-brings a ggml thread pool that spin-waits, and two spin pools on two cpus livelock. Masks f0 and ff run
-fine. This is a property of running two engines, not of x-asr or the diarizer alone - each of those is
-happy on the 2-cpu mask. See README "On the phone".
+Run it on four cpus (taskset f0) for now. On the baseline's 2-cpu mask (C0 = cpu6-7) it is >3x slower per
+audio-second and a 45 s clip may not finish in 150 s; on f0/ff it runs at rtf ~0.77. Each engine alone is
+fine on C0. The spin-pool explanation written here earlier was WRONG - see README "On the phone" for what
+was actually measured. The diarizer does create ~8 threads, but lazily, during streaming, so it cannot
+explain a --no-diar hang.
 EOF

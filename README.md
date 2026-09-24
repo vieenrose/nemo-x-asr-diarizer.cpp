@@ -208,11 +208,20 @@ turns, which the baseline does not. Token timestamps work on arm64 too (388 toke
 
 Two findings that only showed up on the device:
 
-1. **Two ggml thread pools livelock on a 2-CPU mask.** With the baseline's `taskset C0` (cpu6-7) this binary
-   HANGS - and not because of `--threads`: `--threads 1` hangs too, and `--no-diar` hangs too, so the pools
-   exist regardless of what the engines are asked to use. Masks `f0` and `ff` run fine; each engine alone is
-   fine on `C0` (x-asr alone 0.2151, diarizer alone 0.279, both measured on that mask). So the honest rule is
-   *this composite needs four cpus*, and the composite's 2-CPU numbers simply do not exist.
+1. **On a 2-CPU mask this composite is far slower than its parts predict, and I do not yet know why.** With
+   the baseline's `taskset C0` (cpu6-7) a 45 s clip did not finish in 150 s (RTF > 3.3), while on `f0`/`ff` it
+   finishes at RTF 0.77. Each engine alone is fine on `C0` (x-asr 0.2151, diarizer 0.279) and the config is
+   identical to the standalone probe (`piece_ms 100`, `chunk_ms 480`, 1 ggml thread).
+
+   I first explained this as two ggml spin-wait pools livelocking. **That explanation was wrong and is
+   retracted.** The measurements that kill it: the standalone x-asr probe runs on that same mask with
+   **exactly 1 thread** (neither build links OpenMP, and neither ggml creates worker threads), so there is no
+   spin pool in the ASR at all; and `libaudiocpp.so` creates its ~8-thread pool *during* streaming (1 thread
+   through `init`, 10 threads mid-run), so a pool-contention story cannot explain a `--no-diar` hang either.
+   What is left, untested: cache/TLB interference between two resident models, and the diar pool's threads
+   landing on 2 cpus. `--main-affinity`/`--engine-affinity` exist to separate those hypotheses; note that the
+   pool is created lazily, so the current implementation moves only threads that already exist (measured:
+   `moved=1`, `threads=1` at pieces 0-8) - it is a probe, not yet a fix.
 2. **The composite costs more than the sum of its parts**: 0.77 vs 0.215 + 0.279 = 0.49. The two engines
    contend for the same cores with spin-wait barriers, so the ASR leg alone stretches from 0.215 to ~0.75
    inside the composite. Closing that gap means one shared pool (or a non-spinning build), not more tuning.

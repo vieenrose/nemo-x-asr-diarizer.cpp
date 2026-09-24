@@ -52,6 +52,16 @@ struct Config {
     std::vector<std::pair<std::string, std::string>> diar_opts = {
         {"speaker_threshold", "0.3"}, {"speaker_pad_frames", "45"}
     };
+    // Affinity, in hex cpu masks (0xc0 = cpu6-7 = the two A78 primes on the Dimensity 1300).
+    // PROBE, NOT FIX. audio.cpp creates ~8 threads during streaming (measured: 1 thread through init, 10
+    // mid-run) and the count does not follow the configured threads. Separating the two engines across the
+    // big.LITTLE clusters is the right experiment for the 2-cpu slowdown - but the pool is created LAZILY,
+    // so a pass over /proc/self/task finds nothing to move at the start of a run (measured: moved=1,
+    // threads=1 at pieces 0-8), and threads created later inherit the creator's mask. The loop re-applies
+    // every few pieces for that reason. Until that is proven to work, treat these flags as instrumentation
+    // for the open question in README "On the phone", not as the answer to it.
+    long main_affinity   = -1;   // mask for the calling (ASR) thread
+    long engine_affinity = -1;   // mask for every other thread in the process
     int window_samples = 46900;   // HOP_S of the archive contract: 70400 samples at 24 kHz = 2.933 s
     bool windowed_out   = false;  // emit [k/N] Speaker s: blocks like the streaming baseline does
     bool paced        = false;      // wall-clock 1x, for the realtime demonstration
