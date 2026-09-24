@@ -227,6 +227,24 @@ Two findings that only showed up on the device:
 Invariant worth having: with and without `--no-diar` the ASR text is byte-identical (1185 chars on chat69),
 so attribution is a layer over the transcript, never a rewrite of it.
 
+## Input format: 24 kHz goes in, nothing needs converting
+
+The streaming baseline is fed 24 kHz files (its VAE runs at 24 kHz natively). Refusing anything but 16 kHz
+made this a non-drop-in on the baseline's OWN protocol clip, and every measurement here had to be taken on a
+pre-converted copy. `Wav::to_16k()` now resamples in-process (Lanczos3, lowpass before decimate, original
+rate kept and reported as `[input] resampled 24000 Hz -> 16000 Hz`).
+
+Verified by round-tripping clips that already have a native 16 kHz reference, so the comparison is "my
+resampler vs the file's real rate", not "resampling vs nothing":
+
+| clip | fed as 24 kHz | native 16 kHz |
+|---|---|---|
+| bilingual gate (host) | WER 0.1647, attrib 0.0779/77 | 0.1765, 0.0658/76 |
+| holdout_en (host) | WER 0.2455 | 0.2455 |
+| bilingual gate (**on the phone**) | WER 0.1765, attrib 0.0658/76 | 0.1765, 0.0658/76 |
+
+No WER cost. The resampling also costs nothing measurable in time (~40 lines, one pass per file).
+
 ## Known limits
 
 * **The diarizer commits turns late.** It computes in chunks with caches - genuinely streaming - but the

@@ -328,7 +328,13 @@ bool Engine::run(const std::function<void(const Segment&)>& on_segment, std::str
 
     Wav wav;
     if (!Wav::load(cfg_.audio, wav, err)) return false;
-    if (wav.rate != 16000) { err = "need 16 kHz input, got " + std::to_string(wav.rate) + " (resample first)"; return false; }
+    // The baseline is fed 24 kHz files; so must this. Resample instead of refusing.
+    if (wav.rate != 16000) {
+        const int was = wav.rate;
+        wav.to_16k();
+        std::fprintf(stderr, "[input]   resampled %d Hz -> 16000 Hz (Lanczos3) so the baseline's own\n"
+                             "[input]   inputs are accepted without an external conversion step\n", was);
+    }
 
     const int rate = wav.rate;
     const size_t piece = size_t(cfg_.piece_ms) * rate / 1000;

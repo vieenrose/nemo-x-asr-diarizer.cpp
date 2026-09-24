@@ -1,5 +1,6 @@
 // wav.h - minimal PCM reader. Written for this repo; no third-party code.
 #pragma once
+#include <cmath>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -10,6 +11,7 @@ namespace nemo {
 
 struct Wav {
     std::vector<float> pcm;   // mono, converted to [-1, 1]
+    int rate_orig = 0;        // file rate before any resampling to 16 kHz (0 = unchanged)
     int rate = 0;
 
     // Reads a canonical (RIFF/WAVE, PCM16) file. Streaming ASR does not care about the
@@ -82,6 +84,41 @@ struct Wav {
         out.rate = (int)rate;
         (void)byte_rate; (void)block_align;
         return true;
+    }
+
+    // Resample to 16 kHz in place. The streaming baseline consumes 24 kHz natively (its VAE runs at 24 kHz),
+    // so refusing anything but 16 kHz made this a non-drop-in on its own protocol clip - every measurement
+    // here had to be taken on a pre-converted copy. Lanczos3 is good enough for ASR front-ends and is ~40
+    // lines; what matters is that the resampling is INSIDE the process, so no external step is required to
+    // feed it the same files the baseline is fed. The original rate is kept in rate_orig and reported.
+    void to_16k() {
+        if (rate == 16000) return;
+        const int T = 3;                                  // 3 lobes each side
+        const double ratio = 16000.0 / (double)rate;
+        const double cut = ratio < 1.0 ? ratio : 1.0;     // lowpass before decimation
+        std::vector<float> out((size_t)(pcm.size() * ratio) + 1);
+        auto lanczos = [](double u) {
+            if (std::fabs(u) < 1e-9) return 1.0;
+            if (std::fabs(u) >= 3.0) return 0.0;
+            const double pi_u = M_PI * u;
+            return (std::sin(pi_u) / pi_u) * (std::sin(pi_u / 3.0) / (pi_u / 3.0));
+        };
+        for (size_t i = 0; i < out.size(); i++) {
+            const double pos = ((double)i + 0.5) / ratio - 0.5;
+            const int c = (int)std::floor(pos);
+            double acc = 0.0, wsum = 0.0;
+            for (int k = -T * 2; k <= T * 2; k++) {       // 6 taps per input sample band
+                const double x = pos - (double)(c + k);
+                const double w = lanczos(x * cut);
+                const size_t idx = (size_t)std::min<long>(std::max<long>(0, (long)(c + k)), (long)pcm.size() - 1);
+                acc += w * pcm[idx];
+                wsum += w;
+            }
+            out[i] = wsum != 0.0 ? (float)(acc / wsum) : 0.0f;
+        }
+        rate_orig = rate;
+        pcm.swap(out);
+        rate = 16000;
     }
 };
 
