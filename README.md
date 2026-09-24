@@ -170,6 +170,36 @@ is the metric that actually resolves this change.
 `scripts/build_host.sh` deletes objects before compiling. A stale object linked against a changed struct
 layout does not fail to link - it corrupts memory at run time and segfaults somewhere unhelpful.
 
+## On the phone (Oppo CPH2371, Dimensity 1300, Android 13)
+
+The arm64 build in `scripts/build_android.sh` is the one that ran on the device, armed and witness-checked
+through the same protocol as the VibeASR streaming-1.5B baseline (`taskset`, `--threads 2`, wake-stream
+arming, `time_in_state` witness, repeats inside one armed window). Mask `f0`, 2 threads:
+
+| clip | RTF | first partial | p95 piece | peak RSS | witness mean |
+|---|---|---|---|---|---|
+| chat69 (protocol, 69 s) | **0.771** | 0.601 s | 95 ms | ~396 MB | 2175 MHz |
+| gate_ms_v2 (hard, 4 speakers) | 0.775 | 0.752 s | 95 ms | 396 MB | 2176 MHz |
+| bilingual_multispk_57s | 0.805 | 0.765 s | 95 ms | 408 MB | 2245 MHz |
+
+Against the baseline's own anchor on the same device (RTF 1.2231, peak RSS 2198 MB, first text at one 2.93 s
+window): **1.6x lower RTF, 5.5x less memory, ~4x lower first-output latency**, and it also emits speaker
+turns, which the baseline does not. Token timestamps work on arm64 too (388 tokens on chat69, 40 ms grid).
+
+Two findings that only showed up on the device:
+
+1. **Two ggml thread pools livelock on a 2-CPU mask.** With the baseline's `taskset C0` (cpu6-7) this binary
+   HANGS - and not because of `--threads`: `--threads 1` hangs too, and `--no-diar` hangs too, so the pools
+   exist regardless of what the engines are asked to use. Masks `f0` and `ff` run fine; each engine alone is
+   fine on `C0` (x-asr alone 0.2151, diarizer alone 0.279, both measured on that mask). So the honest rule is
+   *this composite needs four cpus*, and the composite's 2-CPU numbers simply do not exist.
+2. **The composite costs more than the sum of its parts**: 0.77 vs 0.215 + 0.279 = 0.49. The two engines
+   contend for the same cores with spin-wait barriers, so the ASR leg alone stretches from 0.215 to ~0.75
+   inside the composite. Closing that gap means one shared pool (or a non-spinning build), not more tuning.
+
+Invariant worth having: with and without `--no-diar` the ASR text is byte-identical (1185 chars on chat69),
+so attribution is a layer over the transcript, never a rewrite of it.
+
 ## Known limits
 
 * **The diarizer commits turns late.** It computes in chunks with caches - genuinely streaming - but the

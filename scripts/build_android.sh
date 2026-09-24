@@ -1,57 +1,89 @@
-#!/usr/bin/env bash
-# build_android.sh - cross-build for arm64-v8a.
+#!/bin/bash
+# build_android.sh - arm64 build of the composite. THIS RECIPE IS THE ONE THAT PRODUCED THE BINARY THAT RAN
+# ON THE OPPO (it ran chat69 at rtf 0.771 with model token timestamps); the earlier version of this file was
+# a guess and was never executed.
 #
-# STATUS: the two upstreams each cross-build for Android on their own (that is how the phone numbers in
-# the README were measured), but this script's LINK of the composite for Android has not been validated
-# end to end yet. Treat it as a recipe that is one verification run away from working, not as a working
-# build. The host path in build_host.sh IS validated. Expect to spend the gap on: PIC flags for the
-# static ggml, -llog for __android_log_write, and keeping OpenMP off on a device with no libomp.so.
-#
-# Known trap, learned the expensive way: threads must not exceed the cores in the pinning mask. The
-# baseline runs `taskset C0` (cpu6-7) with -t 2; running the composite with -t 4 under that same mask
-# measured RTF 66 instead of 0.23 - four spin-waiting workers on two cpus.
+# Design, and the one thing that must not be "simplified": the two engines carry their own ggml.
+#   * x-asr links CrispASR's ggml STATICALLY into this binary.
+#   * Nemotron diarization comes from libaudiocpp.so, which keeps ggml hidden inside itself
+#     (AUDIOCPP_BUILD_C_API=ON -> audiocpp SHARED + hidden visibility + src/capi/audiocpp.map).
+# Forcing one shared ggml was tried and fails after linking (GGML_ASSERT(*cur_backend_id != -1) in
+# ggml-backend.cpp). objcopy --localize-symbols looked cheaper and was worse: archive members with localized
+# definitions silently stopped being pulled in, so part of the binary called the wrong ggml. Verify with
+#   llvm-readelf --dyn-syms libaudiocpp.so | grep -cE ' (ggml|gguf)_'      # must be 0
+# - that is a value-level check on the linkage, not a "it loaded" claim.
 set -euo pipefail
-HERE="$(cd "$(dirname "$0")" && pwd)"
-ROOT="$(cd "$HERE/.." && pwd)"
-DEPS_ROOT=${DEPS_ROOT:?set DEPS_ROOT to a dir containing crispasr/ and audiocpp/}
-NDK=${NDK:-/opt/android-ndk-r26d}
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+NDK=${NDK:-/tmp/ndk/android-ndk-r26d}
 ABI=${ABI:-arm64-v8a}
-API=${API:-android-33}
-CPU=${CPU:--mcpu=cortex-a78}      # Dimensity 1300 / X60 class; A78c on other SoCs, adjust per device
-[ -x "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++" ] || { echo "ERROR: NDK clang++ missing at $NDK (if you unpacked with a tool that drops symlinks, extract with symlink support - a 'clang' that is a 5-byte file is the symptom)" >&2; exit 1; }
-CLANG="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
-TOOL="$CLANG/clang++ --target=aarch64-linux-android$(sed 's/android-//' <<<"$API") -O2 -std=c++17 $CPU"
-A="$DEPS_ROOT/audiocpp"; C="$DEPS_ROOT/crispasr"
+API=${API:-33}
+C=${CRISPASR:-$ROOT/../ref/crispasr}
+A=${AUDIOCPP:-$ROOT/../ref/audiocpp}
+OUT=$ROOT/build-android
+CLANG=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++
+STRIP=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip
+READER=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf
+mkdir -p "$OUT"
 
-echo "== audio.cpp for Android (static, no OpenMP on device)"
-cmake -S "$A" -B "$A/build-android" -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
-      -DANDROID_ABI=$ABI -DANDROID_PLATFORM=$API -DCMAKE_BUILD_TYPE=Release \
-      -DENGINE_ENABLE_NATIVE_CPU=OFF -DGGML_NATIVE=OFF -DENGINE_ENABLE_OPENMP=OFF \
-      -DAUDIOCPP_BUILD_C_API=ON \
-      -DCMAKE_EXE_LINKER_FLAGS="-llog" >/dev/null
-cmake --build "$A/build-android" --target audiocpp engine_runtime ggml ggml-base ggml-cpu -j"$(nproc)" >/dev/null
+echo "== audio.cpp C API for Android (shared, ggml hidden inside)"
+# AUDIOCPP_BUILD_C_API defaults to OFF, so an Android tree configured without it has NO C API at all - just
+# audiocpp_cli. That is how this branch's first audio.cpp Android build looked.
+# -llog: the C-API target calls __android_log_write and does not link liblog, so the link fails with
+# "undefined symbol: __android_log_write" unless CMAKE_SHARED_LINKER_FLAGS carries it.
+cmake -S "$A" -B "$A/build-android" \
+  -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+  -DANDROID_ABI=$ABI -DANDROID_PLATFORM=android-$API -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_SHARED_LIBS=OFF -DAUDIOCPP_BUILD_C_API=ON \
+  -DCMAKE_SHARED_LINKER_FLAGS="-llog" >/dev/null
+cmake --build "$A/build-android" --target audiocpp -j"$(nproc)" >/dev/null
+SO=$A/build-android/bin/libaudiocpp.so
+[ -f "$SO" ] || { echo "no $SO"; exit 1; }
+LEAK=$($READER --dyn-syms "$SO" 2>/dev/null | grep -cE ' (ggml|gguf)_' || true)
+echo "   ggml symbols leaked from libaudiocpp.so: $LEAK (must be 0)"
+[ "$LEAK" = 0 ] || { echo "refusing to build a composite whose two ggmls can collide"; exit 1; }
+# 453 MB unstripped vs 29 MB stripped; the phone does not need DWARF.
+"$STRIP" -g "$SO" -o "$OUT/libaudiocpp.so"
 
-echo "== CrispASR x-asr for Android"
-cmake -S "$C" -B "$C/build-android" -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
-      -DANDROID_ABI=$ABI -DANDROID_PLATFORM=$API -DCMAKE_BUILD_TYPE=Release \
-      -DGGML_ARM_DOTPROD=ON -DGGML_OPENMP=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON >/dev/null
-cmake --build "$C/build-android" --target xasr crispasr-core ggml ggml-base ggml-cpu -j"$(nproc)" >/dev/null
+echo "== CrispASR x-asr for Android (static)"
+# The whole CrispASR tree does NOT build for Android here (piper-tts fails, unrelated). Build the targets the
+# composite needs and check the token-times symbol actually exists in the arm64 archive.
+cmake -S "$C" -B "$C/build-android" \
+  -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+  -DANDROID_ABI=$ABI -DANDROID_PLATFORM=android-$API -DCMAKE_BUILD_TYPE=Release >/dev/null
+if [ -f "$ROOT/patches/crispasr-token-times.patch" ] &&
+   git -C "$C" apply --check "$ROOT/patches/crispasr-token-times.patch" 2>/dev/null; then
+  git -C "$C" apply "$ROOT/patches/crispasr-token-times.patch" && echo "   applied token-times patch"
+fi
+cmake --build "$C/build-android" --target xasr -j"$(nproc)" >/dev/null
+if $NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm --defined-only "$C/build-android/src/libxasr.a" 2>/dev/null \
+     | grep -q xasr_stream_token_times; then
+  TIMES="-DNEMO_HAVE_TOKEN_TIMES"; echo "   exact token timestamps: available"
+else
+  TIMES=""; echo "   exact token timestamps: NOT available (timing will be inferred)"
+fi
 
 echo "== composite"
-mkdir -p "$ROOT/build-android"
-for f in engine fusion main; do
-  $TOOL -I"$ROOT/src" -I"$C/src" -I"$A/include" -c "$ROOT/src/$f.cpp" -o "$ROOT/build-android/$f.o"
-done
-# Static on Android: libaudiocpp.so would need an rpath that Android ignores outside /data, so the C API
-# object is linked in directly and its ggml comes from audio.cpp's archives. This is the part that still
-# needs verification - if it asserts in ggml_backend_sched, the two ggml copies are colliding, and the fix
-# is to keep audio.cpp's side in a .so shipped next to the binary with LD_LIBRARY_PATH=..
-$TOOL "$ROOT/build-android"/*.o -o "$ROOT/build-android/nemo-x-asr-diarizer" \
-  -Wl,--start-group "$A/build-android/libaudiocpp.so" "$A/build-android/libengine_runtime.a" \
-  "$A/build-android/ggml/src/libggml.a" "$A/build-android/ggml/src/libggml-base.a" \
-  "$A/build-android/ggml/src/libggml-cpu.a" \
+# -g0 is not cosmetic: with debug info, ld.lld died with "unable to execute command: Bus error" on this
+# box while linking the same inputs. The binary needs no symbols - it is stripped for the device anyway.
+# $ORIGIN in RUNPATH means libaudiocpp.so sits next to the binary in the device dir, no LD_LIBRARY_PATH
+# needed for the common case (the harnesses still set it because adb does not always honour RUNPATH).
+rm -f "$OUT"/*.o "$OUT"/nemo-x-asr-diarizer
+"$CLANG" --target=aarch64-linux-android$API -O2 -g0 -std=c++17 $TIMES \
+  -I"$ROOT/src" -I"$C/src" -I"$A/include" -w \
+  "$ROOT/src/fusion.cpp" "$ROOT/src/engine.cpp" "$ROOT/src/main.cpp" \
+  -o "$OUT/nemo-x-asr-diarizer" \
+  -L"$A/build-android/bin" -l:libaudiocpp.so \
   "$C/build-android/src/libxasr.a" "$C/build-android/src/libcrispasr-core.a" \
   "$C/build-android/ggml/src/libggml.a" "$C/build-android/ggml/src/libggml-base.a" \
-  "$C/build-android/ggml/src/libggml-cpu.a" -Wl,--end-group \
-  -fopenmp -static-libstdc++ -llog -ldl
-echo "built $ROOT/build-android/nemo-x-asr-diarizer (UNVERIFIED on device - run tests before quoting numbers)"
+  "$C/build-android/ggml/src/libggml-cpu.a" \
+  -static-libstdc++ -Wl,-rpath,'$ORIGIN' -Wl,--build-id=none -ldl -lm -llog
+ls -la "$OUT" | awk 'NR>1{print "  ", $5, $9}'
+cat <<'EOF'
+
+On the device: put nemo-x-asr-diarizer, libaudiocpp.so and both .gguf files in one directory.
+USE AT LEAST FOUR CPUS. With the baseline's 2-cpu mask (taskset C0 = cpu6-7) this binary HANGS: each engine
+brings a ggml thread pool that spin-waits, and two spin pools on two cpus livelock. Masks f0 and ff run
+fine. This is a property of running two engines, not of x-asr or the diarizer alone - each of those is
+happy on the 2-cpu mask. See README "On the phone".
+EOF
