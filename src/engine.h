@@ -112,6 +112,11 @@ struct Stats {
     std::vector<double> pass_rtf;
     // Where the uncharged time goes. wall - asr - diar was ~19% of wall and nobody knew why; these split it
     // into the pieces of the loop that are neither engine call. Zero cost unless NEMO_PROF=1.
+    // CPU-seconds vs wall-seconds over the whole run: "cores used" is the one number that says whether we
+    // are leaving a core idle. The loop is sequential and the ASR leg is reported single-threaded, so the
+    // expected value is well under the 2 cores the mask allows - and it separates "CPU-bound and efficient"
+    // from "CPU-bound but only one core is working".
+    double cpu_s = 0;
     double prof_pushdelta_s = 0, prof_tokenbuild_s = 0, prof_attrfinal_s = 0, prof_drain_s = 0;
 };
 

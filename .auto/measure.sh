@@ -98,7 +98,7 @@ run_cell() { # run_cell <wav> <reps>  -- accumulates into the totals; per-clip R
     line=$(adb -s "$DEV" shell "cd $D && LD_LIBRARY_PATH=. taskset $MASK $DEV_BIN --audio wav/$wav --threads $THREADS \
             --windows --xasr-model $XM --diar-model $DM --out out/ar_${wav}_$i.txt 2>&1" | tr -d '\r' | grep '^\[stats\]')
     [ -z "$line" ] && { echo "ERROR: no [stats] from $wav pass $i"; return 1; }
-    local a w asr di f p r
+    local a w asr di f p r cores
     a=$(echo "$line"   | grep -oE 'audio [0-9.]+s'         | grep -oE '[0-9.]+')
     w=$(echo "$line"   | grep -oE 'wall [0-9.]+s'          | grep -oE '[0-9.]+')
     asr=$(echo "$line" | grep -oE 'asr [0-9.]+s'           | grep -oE '[0-9.]+')
@@ -108,10 +108,12 @@ run_cell() { # run_cell <wav> <reps>  -- accumulates into the totals; per-clip R
     # value, and max(0, 95\n343.4) is a python SyntaxError that silently became an empty metric.
     p=$(echo "$line"   | sed -nE 's/.*p95 piece ([0-9.]+).*/\1/p')
     r=$(echo "$line"   | grep -oE 'peak RSS [0-9.]+MB'     | grep -oE '[0-9.]+')
-    for v in a w asr di f p r; do [ -z "${!v}" ] && { echo "ERROR: unparsed field in $line"; return 1; }; done
+    cores=$(echo "$line" | sed -nE 's/.*\(([0-9.]+) cores\).*/\1/p')
+    for v in a w asr di f p r cores; do [ -z "${!v}" ] && { echo "ERROR: unparsed field in $line"; return 1; }; done
     ca=$(python3 -c "print($ca+$a)"); cw=$(python3 -c "print($cw+$w)")
     casr=$(python3 -c "print($casr+$asr)"); cdi=$(python3 -c "print($cdi+$di)")
     fp=$f; P95=$(python3 -c "print(max($P95,$p))"); RSS=$(python3 -c "print(max($RSS,$r))")
+    CORES=$(python3 -c "print(max($CORES,$cores))")
   done
   AUDIT_TOT=$(python3 -c "print($AUDIT_TOT+$ca)"); WALL_TOT=$(python3 -c "print($WALL_TOT+$cw)")
   ASR_TOT=$(python3 -c "print($ASR_TOT+$casr)");   DIAR_TOT=$(python3 -c "print($DIAR_TOT+$cdi)")
@@ -123,7 +125,7 @@ run_cell() { # run_cell <wav> <reps>  -- accumulates into the totals; per-clip R
 
 # ---------------------------------------------------------------- measure with arm screening
 for attempt in 1 2 3; do
-  AUDIT_TOT=0; WALL_TOT=0; ASR_TOT=0; DIAR_TOT=0; P95=0; RSS=0; FP=""; CLIP_RTF=()
+  AUDIT_TOT=0; WALL_TOT=0; ASR_TOT=0; DIAR_TOT=0; P95=0; RSS=0; CORES=0; FP=""; CLIP_RTF=()
   arm_start; T0=$(tis)
   ok=1
   run_cell chat69.wav "$REPS" || ok=0
@@ -141,6 +143,7 @@ for attempt in 1 2 3; do
     echo "METRIC other_s=$OTHER"
     echo "METRIC first_partial_s=${FP:--1}"
     echo "METRIC p95_piece_ms=${P95:-0}"
+    echo "METRIC cores_used=${CORES}"
     echo "METRIC peak_rss_mb=$RSS"
     echo "METRIC witness_mhz=$MHZ"
     echo "METRIC deliv2400_pct=$DELIV"

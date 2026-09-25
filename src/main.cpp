@@ -265,9 +265,9 @@ int main(int argc, char** argv) {
         std::printf(" \"text\": \"%s\"\n}\n", eng.transcript().c_str());
     } else {
         std::printf("\n[stats] audio %.2fs wall %.2fs rtf %.4f  asr %.2fs + diar %.2fs  first partial %.3fs  "
-                    "p95 piece %.1fms  peak RSS %.0fMB\n",
+                    "p95 piece %.1fms  peak RSS %.0fMB  cpu %.1fs (%.2f cores)\n",
                     st.audio_s, st.wall_s, st.wall_s / st.audio_s, st.asr_compute_s, st.diar_compute_s,
-                    st.first_partial_s, st.piece_p95_ms, st.peak_rss_mb);
+                    st.first_partial_s, st.piece_p95_ms, st.peak_rss_mb, st.cpu_s, st.cpu_s / st.wall_s);
         std::printf("[timing]  %s over %zu tokens\n",
                     st.timing_mode == 1 ? "model token timestamps (40 ms grid)" : "inferred placement", st.tokens);
         std::printf("[diar]    %zu turns, %zu speakers; %zu segments, %zu unattributed, %zu by proximity fill; first turn at "

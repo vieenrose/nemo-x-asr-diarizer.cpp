@@ -11,6 +11,7 @@
 #include <sched.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <sys/resource.h>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -487,6 +488,12 @@ bool Engine::run(const std::function<void(const Segment&)>& on_segment, std::str
 
     stats_.audio_s = double(total) / rate;
     stats_.wall_s = now_s() - t0;
+    {   // getrusage(RUSAGE_SELF) counts every thread, so cores = cpu/wall is honest.
+        struct rusage ru;
+        if (getrusage(RUSAGE_SELF, &ru) == 0)
+            stats_.cpu_s = double(ru.ru_utime.tv_sec) + ru.ru_utime.tv_usec / 1e6
+                         + double(ru.ru_stime.tv_sec) + ru.ru_stime.tv_usec / 1e6;
+    }
     stats_.turns = fusion_.turns().size();
     stats_.first_turn_audio_s = first_turn_audio_;
 #ifdef NEMO_HAVE_TOKEN_TIMES
