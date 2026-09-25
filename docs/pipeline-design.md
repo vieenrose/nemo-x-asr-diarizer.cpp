@@ -207,3 +207,36 @@ genuinely compute-bound in their kernels. The ranked remainder:
 3. **KleidiAI** - the only untried kernel-level lever, blocked on a network fetch for the `arm_llama` kernels.
 4. **ASR cache round-trip** (outputs 0.563 + inputs 0.278 s per clip) - ggml-native double-buffered caches;
    bit-identical in principle, but expect it to be largely hidden under the matmuls like the other host work.
+
+
+## 9. Addendum: the joint was bandwidth-bound after all, and the harness was lying
+
+Two late findings, both about measurement rather than modelling.
+
+**The transducer joint is now f16, and it is the second-largest win of the session.** §8.4 recorded the joint
+as a bounded negative (3.87 s/clip, unattackable by vectorising or by sharing weight passes). That conclusion
+was reached with a *stale binary*: the f16 and NEON variants had both failed to compile, and the build script
+was swallowing the error. With the build fixed and the variant actually running, storing the matrix as f16
+takes the phase from 3.87 s to **1.11 s**, and the whole ASR leg from 47.7 s to 38.6 s per protocol run
+(-19%) - more than the joint's own saving, because the 10.2 MB it was streaming per frame had been starving
+every other phase on the same two cores. p95 piece latency improved 97 -> 79 ms and first partial 0.306 ->
+0.263 s at the same time.
+
+The evidence bar was met without a re-bless: the four gate clips stay byte-identical, and all eleven
+validation clips keep the reference WER exactly. Seven of the eleven raw transcripts move, but only in where
+a segment splits and which speaker tag it carries - after stripping labels and segment joins the Chinese
+clips are character-identical and the English clips differ by one space at a segment boundary. **No
+recognised word changes anywhere.** Worth stating explicitly: an f16 weight change that leaves the gate and
+the whole validation set at the reference WER is a *free* 2.76 s/clip here, which is not the general rule -
+the same class of change (f16 joint weights) on the *encoder* would be a different story.
+
+**The harness bug that made the above invisible.** `scripts/build_android.sh` and `scripts/build_host.sh`
+both ran `cmake --build ... >/dev/null` with no exit-status check. A compile error in a dependency therefore
+did not fail the build: the previous archive was linked, pushed, measured and reported as though it were the
+change. Two experiments in this session produced confident, entirely meaningless numbers that way, and both
+looked like clean negative results. Both scripts now fail loudly and print the compiler's errors.
+
+The generalisable rule, and the one this session kept relearning: **if a change produces exactly no timing
+difference, suspect the build before believing the physics.** A real optimisation on this hardware moved the
+clock by 0% three separate times (#1091 copies, #1092 thread partition, the index-arithmetic fix), and a
+broken build looks identical from the outside.

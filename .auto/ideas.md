@@ -5,7 +5,7 @@ the numbers; this file is the queue.
 
 ## Where the composite stands (2026-09-25, end of session)
 
-`phone_rtf` 0.4651 -> **0.307-0.314**, byte-identical throughout, from four changes:
+`phone_rtf` 0.4651 -> **0.269**, byte-identical on the gate throughout, from five changes:
 
 | change | where | effect | numerics |
 |---|---|---|---|
@@ -13,16 +13,15 @@ the numbers; this file is the queue.
 | stop padding diar encoder windows to capacity | audiocpp | -1.2% | identical |
 | mel filterbank: skip exact zeros, drop `long double` | audiocpp | -16.6% | identical |
 | build the x-asr chunk graph once (fixes a UAF) | crispasr | -1.8% | identical |
+| transducer joint matrix in f16 | crispasr | -12% (and -19% on the ASR leg) | gate + all 11 WERs identical |
 
 Plus one merged GGUF (`--models-bundle`), measured neutral by design.
 
 ## Open, ranked
 
-- **f16 / q8_0 joint weights.** The transducer joint is a [5000x512] matvec per encoder frame in host C++:
-  3.87 s per 69 s clip, 31% of the ASR leg, invisible to the ggml profiler. Streamed at ~4.5 GB/s with one
-  use per element, so bytes are the lever: f16 halves it, q8_0 quarters it. NEON accumulators did NOT help
-  (3.87 -> 3.84 s) and neither did sharing weight passes across frames (6.43 s). Changes logits -> validate.sh
-  + deliberate re-bless. **Largest identified item.**
+- **q8_0 joint weights.** f16 took the joint from 3.87 s to 1.11 s per 69 s clip; the phase is now small
+  enough that a further 2x is worth ~1 s per clip (~2% composite) and would need the validation path again.
+  Low priority.
 - **One-runtime merge** (port the diar encoder into crispasr's ggml so one scheduler, one pool, one arena
   serve both). Ceiling is the 1.6-of-2-cores utilisation. The two-pool form is measured dead (37-47% slower).
   The container merge is already done and committed, which is the prerequisite.
@@ -31,8 +30,12 @@ Plus one merged GGUF (`--models-bundle`), measured neutral by design.
 - **ggml-native streaming caches** on the ASR side: 114 cache tensors per step currently go
   graph -> host vector -> graph (outputs 0.563 s + inputs 0.278 s per 69 s clip). Bit-identical in principle;
   every other host-side phase has been partly hidden under the matmuls, so measure before believing it.
-- **Re-profile the diar encoder** now that its frontend is 18x faster. It is ~6.6 s per 69 s clip and was
-  never phase-split after the filterbank fix - the filterbank find says check before assuming.
+- **Re-profile both encoders** now that the bandwidth pressure is gone: the ASR encoder compute was measured
+  at ~19 s per 69 s clip (profiled) with the joint competing for memory, and the diar encoder at ~6.6 s has
+  never been phase-split since the filterbank fix. Both are already on int8 SDOT (x-asr 298 q5_0 tensors,
+  diar 130 q5_0 = 99.5 MB), so there is no precision lever left - only KleidiAI.
+- **KleidiAI** is the only remaining kernel-level lever and needs a network fetch. Everything else measured
+  out below.
 
 ## Measured out — do not retry without a changed assumption
 
@@ -67,4 +70,11 @@ Plus one merged GGUF (`--models-bundle`), measured neutral by design.
 - The XASR_PROF eval callback is itself distorting (~2x, and it races on a shared map from both worker
   threads) - treat only large, directionally consistent deltas as signal.
 - `long double` on aarch64 is quad precision in software. Grep for it before believing a numeric loop is
-  "just some accumulation".
+  "just some accumulation" - that one line was 19% of the composite.
+- **If a change moves the clock by exactly 0%, suspect the build.** Both build scripts used to swallow cmake
+  exit codes, so a dependency that failed to compile was measured as a stale archive and read as a clean
+  negative result. Both scripts now fail loudly. A build that cannot fail is a measurement that cannot be
+  believed.
+- Look for work *outside* the engine: the ggml op profile cannot see host C++ (the joint was 31% of the ASR
+  leg and invisible), and host phases can matter even when they are not on the critical path, because they
+  consume the same memory bandwidth everything else needs.
