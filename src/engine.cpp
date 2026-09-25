@@ -11,6 +11,10 @@
 #include <sched.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -360,6 +364,89 @@ bool Engine::run(const std::function<void(const Segment&)>& on_segment, std::str
     int64_t charged_upto = 0;          // samples of audio already claimed by buffered deltas
     size_t turns_seen = 0;
 
+    // ---- diar on its own thread -------------------------------------------------------------
+    // The two legs share nothing: different models, different ggml, different heaps. The loop ran them in
+    // sequence - push diar, which blocks ~8.5 s every ~26 s of audio when a 188-frame encoder window fills,
+    // and only then feed the same audio to ASR - so wall was asr + diar = 0.218 + 0.158 RTF. On the two A78s
+    // the diar leg can hide inside the ASR's shadow instead.
+    // Deterministic by construction: speaker tags come from the FINAL attribute pass over the complete turn
+    // list, and the worker is joined before it. Interim attribution (live_provisional) stays sync-only.
+    const bool async = cfg_.diar_async && !cfg_.skip_diar;
+    std::mutex pipe_mu, fusion_mu;
+    std::condition_variable pipe_cv;
+    std::deque<std::pair<size_t, size_t>> pipe;
+    bool feed_done = false;
+    std::string pipe_err;
+    auto diar_push = [&](size_t off_, size_t n_, bool from_main) {
+        const double d0 = now_s();
+        audiocpp_event* ev = nullptr;
+        audiocpp_status st = audiocpp_stream_push((audiocpp_session*)session_, wav.pcm.data() + off_, (int)n_,
+                                                 rate, 1, (int64_t)off_, &ev);
+        if (st != AUDIOCPP_OK) { err = std::string("diar stream_push: ") + audiocpp_last_error(); return; }
+        std::vector<Turn> snapshot;
+        harvest_turns(ev ? audiocpp_event_as_result(ev) : nullptr, snapshot);
+        if (ev) audiocpp_event_free(ev);
+        for (;;) {                                   // a family may queue several events per push
+            audiocpp_event* more = nullptr;
+            if (audiocpp_stream_next_event((audiocpp_session*)session_, &more) != AUDIOCPP_OK || !more) break;
+            harvest_turns(audiocpp_event_as_result(more), snapshot);
+            audiocpp_event_free(more);
+        }
+        std::lock_guard<std::mutex> L(fusion_mu);
+        stats_.diar_compute_s += now_s() - d0;
+        if (snapshot.empty()) return;
+        if (first_turn_audio_ < 0) first_turn_audio_ = double(off_ + n_) / rate;
+        fusion_.update_turns(snapshot);
+        if (from_main && cfg_.live_provisional && fusion_.turns().size() != turns_seen) {
+            turns_seen = fusion_.turns().size();
+            attribute([&](const Segment& s2) {
+                std::fprintf(stderr, "~[%d] Speaker %d %s\n", s2.index, s2.speaker, s2.text.c_str());
+            }, false);
+        }
+    };
+    auto diar_finish = [&]() {
+        if (cfg_.diar_tail_ms > 0) {            // diagnostic; --diar-tail-ms showed no effect
+            std::vector<float> zeros(size_t(cfg_.diar_tail_ms) * rate / 1000, 0.0f);
+            const double d0 = now_s();
+            audiocpp_event* ev = nullptr;
+            audiocpp_status st = audiocpp_stream_push((audiocpp_session*)session_, zeros.data(),
+                                                     (int)zeros.size(), rate, 1, (int64_t)total, &ev);
+            if (st != AUDIOCPP_OK) { pipe_err = std::string("diar tail push: ") + audiocpp_last_error(); return; }
+            std::vector<Turn> snap;
+            harvest_turns(ev ? audiocpp_event_as_result(ev) : nullptr, snap);
+            if (ev) audiocpp_event_free(ev);
+            std::lock_guard<std::mutex> L(fusion_mu);
+            stats_.diar_compute_s += now_s() - d0;
+            if (!snap.empty()) fusion_.update_turns(snap);
+        }
+        if (cfg_.diar_no_finish) return;
+        audiocpp_result* res = nullptr;
+        if (audiocpp_stream_finish((audiocpp_session*)session_, &res) == AUDIOCPP_OK && res) {
+            std::vector<Turn> snap;
+            harvest_turns(res, snap);
+            std::lock_guard<std::mutex> L(fusion_mu);
+            if (!snap.empty()) fusion_.update_turns(snap);
+            audiocpp_result_free(res);
+        }
+    };
+    std::thread diar_worker;
+    if (async) {
+        diar_worker = std::thread([&] {
+            for (;;) {
+                std::pair<size_t, size_t> job;
+                {
+                    std::unique_lock<std::mutex> L(pipe_mu);
+                    pipe_cv.wait(L, [&] { return !pipe.empty() || feed_done; });
+                    if (pipe.empty()) { if (feed_done) break; continue; }
+                    job = pipe.front(); pipe.pop_front();
+                }
+                diar_push(job.first, job.second, false);
+                if (!err.empty()) { pipe_err = err; break; }
+            }
+            if (pipe_err.empty()) diar_finish();
+        });
+    }
+
     for (size_t off = 0; off < total; off += piece) {
         if (aff_cfg && (off / piece) % 4 == 0) {
             const int moved = apply_affinity(cfg_.main_affinity, cfg_.engine_affinity);
@@ -373,32 +460,13 @@ bool Engine::run(const std::function<void(const Segment&)>& on_segment, std::str
 
         // 1. diarizer first: attribution needs the turn that covers this audio
         if (!cfg_.skip_diar) {
-            const double d0 = now_s();
-            audiocpp_event* ev = nullptr;
-            audiocpp_status st = audiocpp_stream_push((audiocpp_session*)session_, wav.pcm.data() + off, n,
-                                                      rate, 1, (int64_t)off, &ev);
-            if (st != AUDIOCPP_OK) { err = std::string("diar stream_push: ") + audiocpp_last_error(); return false; }
-            std::vector<Turn> snapshot;
-            auto harvest = [&](const audiocpp_result* r) { harvest_turns(r, snapshot); };
-            harvest(ev ? audiocpp_event_as_result(ev) : nullptr);
-            if (ev) audiocpp_event_free(ev);
-            for (;;) {                                   // a family may queue several events per push
-                audiocpp_event* more = nullptr;
-                if (audiocpp_stream_next_event((audiocpp_session*)session_, &more) != AUDIOCPP_OK || !more) break;
-                harvest(audiocpp_event_as_result(more));
-                audiocpp_event_free(more);
+            if (async) {
+                { std::lock_guard<std::mutex> L(pipe_mu); pipe.push_back({off, n}); }
+                pipe_cv.notify_one();
+            } else {
+                diar_push(off, n, true);
+                if (!err.empty()) return false;
             }
-            if (!snapshot.empty()) {
-                if (first_turn_audio_ < 0) first_turn_audio_ = double(off + n) / rate;
-                fusion_.update_turns(snapshot);
-                if (cfg_.live_provisional && fusion_.turns().size() != turns_seen) {
-                    turns_seen = fusion_.turns().size();
-                    attribute([&](const Segment& s) {
-                        std::fprintf(stderr, "~[%d] Speaker %d %s\n", s.index, s.speaker, s.text.c_str());
-                    }, false);
-                }
-            }
-            stats_.diar_compute_s += now_s() - d0;
         }
 
         // 2. transcriber
@@ -438,9 +506,16 @@ bool Engine::run(const std::function<void(const Segment&)>& on_segment, std::str
         }
     }
 
+    if (async) {
+        { std::lock_guard<std::mutex> L(pipe_mu); feed_done = true; }
+        pipe_cv.notify_all();
+        diar_worker.join();                    // the tail encoder window lands here, after ASR is done
+        if (!pipe_err.empty()) { err = pipe_err; return false; }
+    }
+
     // Diarizer-only tail: the ASR never sees it, so text cannot shift from this side. Whether the DIAR side
     // stays identical (turn padding near the end) is exactly what the byte-identity gate decides.
-    if (cfg_.diar_tail_ms > 0 && !cfg_.skip_diar) {
+    if (cfg_.diar_tail_ms > 0 && !cfg_.skip_diar && !async) {
         std::vector<float> zeros(size_t(cfg_.diar_tail_ms) * rate / 1000, 0.0f);
         const double d0 = now_s();
         audiocpp_event* ev = nullptr;
@@ -466,7 +541,7 @@ bool Engine::run(const std::function<void(const Segment&)>& on_segment, std::str
         audiocpp_result* res = nullptr;
         // The final decode also closes the turn that is still open at end-of-audio, so skipping it is a
         // diarisation change, not a pure speedup - the accuracy gate decides, not the clock.
-        const bool do_finish = !cfg_.diar_no_finish;
+        const bool do_finish = !cfg_.diar_no_finish && !async;   // async: diar_finish() already did it
         if (do_finish && audiocpp_stream_finish((audiocpp_session*)session_, &res) == AUDIOCPP_OK && res) {
             std::vector<Turn> snapshot;
             harvest_turns(res, snapshot);
