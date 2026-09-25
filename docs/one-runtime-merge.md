@@ -68,7 +68,7 @@ FIFO, compression) is audio.cpp logic that has to move as C++ regardless of whic
 | stage | what | cost | kill criterion |
 |-------|------|------|----------------|
 | **0. Measure the prize** | serial fraction and idle mask | done (§2) | if overlap can only reach <5%, stop — **result: ~10%, continue but with low expectations** |
-| **1. Cross-runtime bit-identity, one layer** | build the diar encoder's layer 0 in CrispASR's ggml; compare its output against audio.cpp's, bit for bit | small | **if the two runtimes do not agree bit-for-bit on one layer, stop** — the entire premise is byte-identity, and this tests it for the price of one layer |
+| **1. Cross-runtime bit-identity** | ~~one layer~~ **done, PASSED** — see below | done | passed |
 | 2. Full encoder graph | all 31 layers + pre-encode + head | large | any divergence → revert; the port is not viable bit-identically |
 | 3. Streaming + AOS | move the scheduler, speaker cache, FIFO, drain | large | if the drain's output changes, the accuracy evidence must be re-run from scratch |
 | 4. One sched, both graphs | engine issues both graphs to one scheduler | moderate | **the real test**: if wall does not improve by ≥5%, the project has spent everything for nothing — say so at this point rather than stage 5 |
@@ -89,3 +89,50 @@ also one weight buffer, one allocator and one place where a memory or numerics b
 
 So the recommendation is: **do stage 1 now** (cheap, decisive), and treat stages 2-5 as justified only if
 stage 1 passes *and* either the overlap prize survives a more careful bound or the kernel work has started.
+
+
+## 7. Stage 1 result: the two runtimes agree bit-for-bit
+
+`tools/ggml_parity.cpp` is one source compiled twice - once against CrispASR's vendored ggml, once against
+audio.cpp's - run on the device, writing every output tensor's raw bytes. (audio.cpp's ggml is hidden inside
+`libaudiocpp.so`, so the two runtimes cannot call each other; linking the same harness against each tree
+compares the *implementations* directly, which is what the port's premise actually rests on.)
+
+**153,773 bytes, byte-identical**, across eleven outputs chosen to cover what the diar encoder uses and what
+the hot path depends on:
+
+| output | why it is in the set |
+|--------|---------------------|
+| `mul_mat` Q8_0 x Q8_0 | the hot path on both legs (both models ship Q8_0) |
+| `mul_mat` Q8_0 x F32 | exercises the **in-kernel F32 -> Q8_0 activation quantisation**, which is where a quantiser difference would show up |
+| `mul_mat` F32 + bias add | `LinearModule` with bias |
+| `norm` | `LayerNormModule` |
+| GELU -> SILU -> sigmoid -> add | the activation chain, including bias-norm's `(x-bias)^2` form |
+| `soft_max` | attention's normalisation |
+| `cont(transpose)`, `transpose`, `concat`, `scale`, `pad` | the layout ops the encoder leans on |
+
+Single-threaded on purpose, so the test compares kernels rather than schedulers. Two harness bugs surfaced
+first - a `ggml_scale`/`ggml_pad` signature mismatch and a bias added with the wrong shape - and both were caught
+loudly by ggml's own asserts, which is the behaviour you want from a harness.
+
+### What this does and does not establish
+
+**Does:** the fundamental blocker is gone. The two implementations are numerically interchangeable for these
+ops, so a port into CrispASR's ggml *can* preserve byte-identical output, and the one-runtime merge is not
+doomed by the runtimes disagreeing.
+
+**Does not:** parity on standalone ops is not parity of a 1,771-node graph. Still unproven, and each is a real
+risk for stage 2:
+
+* **Op sequencing** - the encoder's exact order, including where F32 is quantised and which tensors are
+  written back as graph inputs.
+* **Ops not in the set**: `GroupedQueryAttentionModule` and `SplitRoPEModule` (the two most intricate modules
+  in the file), and the attention mask's exact semantics.
+* **Real activation ranges** - the parity harness feeds synthetic bytes; a quantiser can agree on random data
+  and disagree on the model's actual dynamic range.
+
+The natural next step is cheap and closes those gaps: extend the parity set to the **exact op sequence of one
+real encoder layer**, with that layer's real weights and activations read from the diar model, and compare the
+layer output between the runtimes. If that passes, stage 2 (the full graph) is a mechanical extension of
+something already known to agree, rather than an open bet. It is the same harness and the same comparison, with
+a bigger graph - hours, not the days a full port costs.
