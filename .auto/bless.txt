@@ -1,10 +1,20 @@
 # Blessed accuracy reference for this session. Byte-identity of the four gate transcripts is the contract;
 # the WER lines are ceilings for when output legitimately changes (they are NOT targets - never tune to them).
 # Re-bless only after a full paired accuracy validation (gate40 + holdout_en + holdout_zh, discordant tokens).
-hash=d0e8784b08d6168e
+#
+# 2026-09-25 re-bless: diar spkcache_len 264 -> 128 (diar streaming geometry is now the `custom` profile
+# carrying very_high's numbers). Composite -8..-11% on the phone, armed. Evidence: WER bit-identical to the
+# previous reference on all 11 validation clips (~1720 s, zh+en) - 0.2371/0.2165/0.2062/0.1765/0.0422/0.2364/
+# 0.2500/0.0791/0.0433/0.0662/0.0641; attribution on gate_ms_v2 unchanged at 0.0779 of 77; DER-lite on the
+# bilingual gate 23.26% -> 23.28%; silence/noise/tone still yield zero turns and zero text. The bytes move
+# because a shorter speaker memory commits turn boundaries at slightly different times (speaker tags and
+# where a line splits), not because any word changed: after removing labels and segment joins the text is
+# identical on the 4 Chinese clips, and on the English clips the only difference is one space at a segment
+# boundary. The previous hash was d0e8784b08d6168e; it stays in the log for audit.
+hash=192184ebcd54977e
 clips=gate_ms_v2,holdout_en,holdout_zh,multispk57(24kHz originals, in-process Lanczos3)
 wer_gate_ms_v2=0.1800
 wer_holdout_en=0.2400
 wer_holdout_zh=0.0810
 info_attribution_gate_ms_v2=0.0779 of 77
-info_der_bilingual57=23.26%
+info_der_bilingual57=23.28%

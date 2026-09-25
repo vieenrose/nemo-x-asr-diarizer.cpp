@@ -70,7 +70,24 @@ struct Config {
     // latency_profile, chunk_len, chunk_right_context, fifo_len, spkcache_len, spkcache_update_period,
     // graph_arena_mb, weight_context_mb, weight_type - are SESSION options and the library rejects them on a
     // request with "unknown Nemotron 3 diarization request option".
-    std::vector<std::pair<std::string, std::string>> diar_session_opts;
+    // SHIPPED diar streaming geometry: the `custom` profile carrying very_high's own numbers, except
+    // spkcache_len=128 instead of 264. Armed phone measurement (witness 2255 MHz): diar leg 11.94 -> 9.75 s
+    // on chat69 and 5.99 -> 4.90 s on gate_ms_v2, i.e. composite 0.4701 -> 0.4141 and 0.4618 -> 0.4263.
+    // Two controls make this attributable: (a) `custom` fed very_high's own 264 is byte-identical to the
+    // shipped build and the same speed, so the win is the speaker cache, not the profile name; (b) 64 is
+    // slower than 128 (30.0 s chat69), so this is a minimum, not a monotone "less memory is faster" slope.
+    // Speaker memory shorter than the model's 264 frames moves turn boundaries on multi-window audio
+    // (chat69 transcript hash changes, gate_ms_v2 does not), so this ships as a deliberate re-bless backed
+    // by .auto/validate.sh evidence, not as a byte-identical change. Pass the old value back with
+    // --diar-session-opt nemotron_3_diar.spkcache_len=264 to A/B it.
+    std::vector<std::pair<std::string, std::string>> diar_session_opts = {
+        {"nemotron_3_diar.latency_profile",                 "custom"},
+        {"nemotron_3_diar.chunk_len",                        "340"},
+        {"nemotron_3_diar.chunk_right_context",              "40"},
+        {"nemotron_3_diar.fifo_len",                         "40"},
+        {"nemotron_3_diar.spkcache_update_period",           "300"},
+        {"nemotron_3_diar.spkcache_len",                     "128"},
+    };
 
     std::vector<std::pair<std::string, std::string>> diar_opts = {
         {"speaker_threshold", "0.3"}, {"speaker_pad_frames", "45"}

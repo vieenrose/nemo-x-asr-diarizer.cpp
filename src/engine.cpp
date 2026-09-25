@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <map>
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -151,16 +152,18 @@ bool Engine::init(std::string& err) {
         bc.backend = "cpu";
         bc.device = 0;
         bc.threads = cfg_.threads;
-        audiocpp_options* sopts = nullptr;
-        if (!cfg_.diar_session_opts.empty()) {
-            sopts = audiocpp_options_create();
-            if (!sopts) { err = "audiocpp_options_create failed"; return false; }
-            for (const auto& kv : cfg_.diar_session_opts) {
-                if (audiocpp_options_set(sopts, kv.first.c_str(), kv.second.c_str()) != AUDIOCPP_OK) {
-                    err = "diar session option " + kv.first + "=" + kv.second + ": " + audiocpp_last_error();
-                    audiocpp_options_free(sopts);
-                    return false;
-                }
+        // Defaults first, CLI last, collapsed into a map so an explicit --diar-session-opt always wins.
+        // Appending the CLI pairs to a vector leaves "who wins" up to the library's internals, and an
+        // A/B that silently keeps the default when the flag says otherwise is worse than no flag at all.
+        std::map<std::string, std::string> session_map;
+        for (const auto& kv : cfg_.diar_session_opts) session_map[kv.first] = kv.second;
+        audiocpp_options* sopts = audiocpp_options_create();
+        if (!sopts) { err = "audiocpp_options_create failed"; return false; }
+        for (const auto& kv : session_map) {
+            if (audiocpp_options_set(sopts, kv.first.c_str(), kv.second.c_str()) != AUDIOCPP_OK) {
+                err = "diar session option " + kv.first + "=" + kv.second + ": " + audiocpp_last_error();
+                audiocpp_options_free(sopts);
+                return false;
             }
         }
         st = audiocpp_session_create((audiocpp_model*)model_, "diar", "streaming", &bc, sopts,
