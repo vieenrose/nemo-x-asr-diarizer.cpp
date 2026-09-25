@@ -59,6 +59,13 @@ struct Config {
     // and 45.8->29.3 (45s, never tuned on) at pad=45, with false alarm <= 1.1. Silence/noise/tone still
     // produce ZERO turns at these settings. Raising pad further keeps helping on presentation-style audio
     // and will start merging fast turn-taking, so 45 (~1.7 s) is a middle choice, not the eval optimum.
+    // SESSION-scoped diarizer options (audiocpp_options passed to session_create). The split is load-bearing:
+    // the decode knobs (speaker_*) are read off the REQUEST, while the streaming geometry and memory sizing -
+    // latency_profile, chunk_len, chunk_right_context, fifo_len, spkcache_len, spkcache_update_period,
+    // graph_arena_mb, weight_context_mb, weight_type - are SESSION options and the library rejects them on a
+    // request with "unknown Nemotron 3 diarization request option".
+    std::vector<std::pair<std::string, std::string>> diar_session_opts;
+
     std::vector<std::pair<std::string, std::string>> diar_opts = {
         {"speaker_threshold", "0.3"}, {"speaker_pad_frames", "45"}
     };

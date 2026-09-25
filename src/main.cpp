@@ -91,6 +91,12 @@ int main(int argc, char** argv) {
         else if (a == "--char-dur-ms") cfg.char_dur_ms = atof(next("--char-dur-ms"));
         else if (a == "--gap-snap-ms") cfg.gap_snap_ms = atof(next("--gap-snap-ms"));
         else if (a == "--paced") cfg.paced = true;
+        else if (a == "--diar-session-opt") { const std::string kv = next("--diar-session-opt"); const auto eq = kv.find('=');
+                                              if (eq == std::string::npos) { std::fprintf(stderr, "ERROR: --diar-session-opt wants KEY=VALUE\n"); return 2; }
+                                              cfg.diar_session_opts.emplace_back(kv.substr(0, eq), kv.substr(eq + 1)); }
+        else if (a == "--diar-opt") { const std::string kv = next("--diar-opt"); const auto eq = kv.find('=');
+                                     if (eq == std::string::npos) { std::fprintf(stderr, "ERROR: --diar-opt wants KEY=VALUE\n"); return 2; }
+                                     cfg.diar_opts.emplace_back(kv.substr(0, eq), kv.substr(eq + 1)); }
         else if (a == "--diar-threshold") cfg.diar_opts.emplace_back("speaker_threshold", next("--diar-threshold"));
         else if (a == "--diar-opt") {
             std::string kv = next("--diar-opt");

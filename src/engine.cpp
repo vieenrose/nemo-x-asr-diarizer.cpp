@@ -129,8 +129,21 @@ bool Engine::init(std::string& err) {
         bc.backend = "cpu";
         bc.device = 0;
         bc.threads = cfg_.threads;
-        st = audiocpp_session_create((audiocpp_model*)model_, "diar", "streaming", &bc, nullptr,
+        audiocpp_options* sopts = nullptr;
+        if (!cfg_.diar_session_opts.empty()) {
+            sopts = audiocpp_options_create();
+            if (!sopts) { err = "audiocpp_options_create failed"; return false; }
+            for (const auto& kv : cfg_.diar_session_opts) {
+                if (audiocpp_options_set(sopts, kv.first.c_str(), kv.second.c_str()) != AUDIOCPP_OK) {
+                    err = "diar session option " + kv.first + "=" + kv.second + ": " + audiocpp_last_error();
+                    audiocpp_options_free(sopts);
+                    return false;
+                }
+            }
+        }
+        st = audiocpp_session_create((audiocpp_model*)model_, "diar", "streaming", &bc, sopts,
                                      (audiocpp_session**)&session_);
+        if (sopts) audiocpp_options_free(sopts);   // the API copies the map into the session
     if (dbg_thr) std::fprintf(stderr, "[threads] after session_create: %d\n", nthr());
         if (st != AUDIOCPP_OK) { err = std::string("diar session (streaming): ") + audiocpp_last_error(); return false; }
         // The decode knobs live on the REQUEST (session.cpp reads decode_config(stream_request_.options)),
