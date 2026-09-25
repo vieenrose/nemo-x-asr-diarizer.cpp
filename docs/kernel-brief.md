@@ -115,13 +115,37 @@ Three mechanisms, in descending order of how much they are worth knowing:
    separate 0% results: the ASR leg is matmul-bound and its elementwise work is already overlapped underneath),
    but it stops being separate work once the GEMM itself is fast.
 
-## The ceiling, stated honestly
+## The ceiling, MEASURED (and it is much lower than the first estimate)
 
-If the encoders reached 40-60% of int8 peak - what a tuned kernel achieves on shapes like these - the two
-encoder legs (37.9 s + 15.0 s of a 60.9 s protocol wall) would fall by roughly 2-3x, i.e. **25-35% of the
-composite**. That is an order of magnitude more than anything left in configuration, and it is the only reason
-this brief exists. It is also the number most likely to be wrong: it extrapolates from arithmetic intensity and
-measured efficiency, not from a prototype, and a kernel that only reaches 30% of peak would give half of it.
+`tools/gemm_shape_bench.cpp` runs ggml's own q8_0 x q8_0 path on the device across the shapes the models
+actually use, sweeping k, columns n, and rows m. Two results matter:
+
+1. **Rows do not matter.** m=4096 (eight times the weight bytes) gives the same ~19-20 GMAC/s as m=512, so the
+   kernel is not weight-bandwidth-bound: the weight stream is fully hidden behind arithmetic.
+2. **Small n costs a fixed ~2x.** At n = 3-12 the same kernel delivers ~9-11 GMAC/s regardless of k or m, and
+   the knee is sharp between n=12 and n=24, after which it plateaus at ~20 GMAC/s.
+
+Putting those next to the in-situ measurements is what changes the picture:
+
+* The **diar encoder already runs at the plateau** - ~20 GMAC/s measured in the model, 20.6 GMAC/s in the
+  benchmark at n >= 24. There is no headroom for a better GEMM to collect on that leg unless the kernel can
+  raise the plateau itself.
+* The **x-asr encoder is already at the small-n rate**: ~12.7 GMAC/s in the model against 10.4 GMAC/s in the
+  benchmark at n=3. A small-N-specialised kernel could at most chase the ~1.9x gap to the plateau, and would
+  have to beat a kernel that is already there.
+
+So the first estimate in this brief - 25-35% of the composite from a tuned GEMM - was too high, and it was
+high because it compared the models against a theoretical SDOT peak rather than against what this library
+achieves on any shape. The defensible statement is narrower: **a shape-specialised kernel is worth at most
+about 1.9x on the ASR's skinny GEMMs and roughly nothing on the diar's fat ones**, and whether it can beat
+20 GMAC/s at all is the question a KleidiAI evaluation has to answer first. Measure that before budgeting a
+kernel project.
+
+## The ceiling as first estimated
+
+(Superseded - see the measured ceiling above. Kept because the error is instructive: 40-60% of int8 peak is
+what a tuned kernel reaches on a desktop-class core with a fat GEMM, and this workload has neither. The
+measurement above is the number to plan against.)
 
 ## Before you start: fix the profiler
 
