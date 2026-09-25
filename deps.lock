@@ -15,6 +15,6 @@
 #   audiocpp   428d924  mel filterbank skips its 98.5% zero weights and drops software quad precision
 #                     (frontend 18x, the session's largest win); no padding of streaming encoder windows;
 #                     tensor-name list may prefix the file's tensor list (bundle support); phase timers
-crispasr=193a99b
-crispasr_ggml=e2d5b30
+crispasr=c81fddd
+crispasr_ggml=66fb373
 audiocpp=88549f8
