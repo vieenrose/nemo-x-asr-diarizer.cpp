@@ -79,8 +79,39 @@ static void run_case(ggml_backend_t backend, ggml_context * ctx_alloc, const cha
     ggml_tensor * sc = ggml_scale(ctx, xf, 0.125f);          // scalar overload in this ggml
     ggml_tensor * pd = ggml_pad(ctx, xf, 0, 0, 0, 2);        // pads ne0..ne3
 
+    // --- the parts of a real encoder layer that the first pass did NOT cover, and which are the most
+    // version-sensitive ops in the whole port. Taken from audiocpp's encoder.cpp / module lowerings:
+    //   * GELU ExactErf  -> ggml_gelu_erf, NOT the tanh ggml_gelu tested above
+    //   * attention      -> ggml_flash_attn_ext with k and v passed as VIEWS (view_kv=true in
+    //                       build_flash_grouped) and precision pinned to F32
+    //   * SplitRoPE      -> pure sub/mul/add on the two head halves with cos/sin tables
+    //   * the 3D reshape + transpose that turns the fused QKV projection into heads
+    const int64_t HD = 32, HEADS = 16, SEQ = 6;
+    ggml_tensor * ge = ggml_gelu_erf(ctx, xf);
+    ggml_tensor * q4 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, HD, SEQ, HEADS, 1);
+    ggml_tensor * k4 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, HD, SEQ, HEADS, 1);
+    ggml_tensor * v4 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, HD, SEQ, HEADS, 1);
+    ggml_tensor * msk = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, SEQ, SEQ, 1, 1);
+    ggml_tensor * flash = ggml_flash_attn_ext(ctx, q4, k4, v4, msk, 1.0f / 32.0f, 0.0f, 0.0f);
+    ggml_flash_attn_ext_set_prec(flash, GGML_PREC_F32);
+    // SplitRoPE's arithmetic: out = x1*cos - x2*sin for the first half, x2*cos + x1*sin for the second.
+    ggml_tensor * x2 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, HD / 2, SEQ, HEADS, 1);
+    ggml_tensor * x1 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, HD / 2, SEQ, HEADS, 1);
+    ggml_tensor * cs = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, HD / 2, 1, 1, 1);
+    ggml_tensor * sn = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, HD / 2, 1, 1, 1);
+    ggml_tensor * rope_a = ggml_sub(ctx, ggml_mul(ctx, x1, cs), ggml_mul(ctx, x2, sn));
+    ggml_tensor * rope_b = ggml_add(ctx, ggml_mul(ctx, x2, cs), ggml_mul(ctx, x1, sn));
+    // The QKV -> heads path. TransposeModule({{0,2,1,3},4}) is ggml_permute (a view) followed by the
+    // layout fix-up ensure_backend_addressable_layout inserts - the cont is part of the sequence, not an
+    // optimisation, so both appear here. Shapes are kept self-consistent (a reshape must preserve the
+    // element count or ggml asserts, which is how the first draft of this line was caught).
+    ggml_tensor * qkv4 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, K, 1, HEADS, HD);
+    ggml_tensor * heads = ggml_cont(ctx, ggml_permute(ctx, qkv4, 0, 2, 1, 3));
+    ggml_tensor * resh = ggml_reshape_4d(ctx, ggml_cont(ctx, xf), K, Ncols, 1, 1);   // legal: same count
+
     ggml_cgraph * gf = ggml_new_graph(ctx);
-    for (ggml_tensor * t : {mm, mmf, mm2, nrm, adds, ct, cc, sm, sc, pd, tr}) ggml_build_forward_expand(gf, t);
+    for (ggml_tensor * t : {mm, mmf, mm2, nrm, adds, ct, cc, sm, sc, pd, tr,
+                            ge, flash, rope_a, rope_b, heads, resh}) ggml_build_forward_expand(gf, t);
 
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
     if (!buf) { fprintf(stderr, "%s: alloc failed\n", name); ggml_free(ctx); return; }
@@ -90,6 +121,7 @@ static void run_case(ggml_backend_t backend, ggml_context * ctx_alloc, const cha
 
     struct { ggml_tensor * t; uint32_t seed; } feeds[] = {
         {wq, 1}, {wq2, 2}, {wf, 3}, {xq, 4}, {xf, 5}, {bias, 6},
+        {q4, 7}, {k4, 8}, {v4, 9}, {msk, 10}, {x1, 11}, {x2, 12}, {cs, 13}, {sn, 14}, {qkv4, 15},
     };
     std::vector<uint8_t> tmp;
     for (auto & f : feeds) {
@@ -109,6 +141,9 @@ static void run_case(ggml_backend_t backend, ggml_context * ctx_alloc, const cha
         {"mul_mat_q8xq8", mm}, {"mul_mat_q8xf32", mmf}, {"mul_mat_f32_plus_bias", mm2},
         {"norm", nrm}, {"gelu_silu_sigmoid_add", adds}, {"cont_transpose", ct},
         {"concat", cc}, {"soft_max", sm}, {"scale", sc}, {"pad", pd}, {"transpose", tr},
+        // the encoder layer's version-sensitive ops
+        {"gelu_erf", ge}, {"flash_attn_ext_f32", flash},
+        {"split_rope_a", rope_a}, {"split_rope_b", rope_b}, {"qkv_to_heads", heads}, {"reshape4d", resh},
     };
     uint32_t count = 0;
     for (auto & o : outs) {

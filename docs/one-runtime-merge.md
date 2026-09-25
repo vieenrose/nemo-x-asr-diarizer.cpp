@@ -68,7 +68,7 @@ FIFO, compression) is audio.cpp logic that has to move as C++ regardless of whic
 | stage | what | cost | kill criterion |
 |-------|------|------|----------------|
 | **0. Measure the prize** | serial fraction and idle mask | done (§2) | if overlap can only reach <5%, stop — **result: ~10%, continue but with low expectations** |
-| **1. Cross-runtime bit-identity** | ~~one layer~~ **done, PASSED** — see below | done | passed |
+| **1. Cross-runtime bit-identity** | **done, PASSED** — and extended (1b) to the encoder layer's exact op vocabulary, also **PASSED** | done | passed |
 | 2. Full encoder graph | all 31 layers + pre-encode + head | large | any divergence → revert; the port is not viable bit-identically |
 | 3. Streaming + AOS | move the scheduler, speaker cache, FIFO, drain | large | if the drain's output changes, the accuracy evidence must be re-run from scratch |
 | 4. One sched, both graphs | engine issues both graphs to one scheduler | moderate | **the real test**: if wall does not improve by ≥5%, the project has spent everything for nothing — say so at this point rather than stage 5 |
@@ -131,8 +131,28 @@ risk for stage 2:
 * **Real activation ranges** - the parity harness feeds synthetic bytes; a quantiser can agree on random data
   and disagree on the model's actual dynamic range.
 
-The natural next step is cheap and closes those gaps: extend the parity set to the **exact op sequence of one
-real encoder layer**, with that layer's real weights and activations read from the diar model, and compare the
-layer output between the runtimes. If that passes, stage 2 (the full graph) is a mechanical extension of
-something already known to agree, rather than an open bet. It is the same harness and the same comparison, with
-a bigger graph - hours, not the days a full port costs.
+### Stage 1b: the encoder layer's actual op vocabulary, also byte-identical
+
+The first pass deliberately tested ops I chose. Reading audiocpp's lowering showed the layer's *version-sensitive*
+ops are different from the ones I happened to pick, so the harness was extended to the real sequence:
+
+| op | where it comes from in the layer |
+|----|-----------------------------------|
+| `ggml_flash_attn_ext` (precision pinned F32) | `GroupedQueryAttentionModule` via `build_flash_grouped` - the attention itself |
+| `ggml_gelu_erf` | `GeluModule({ExactErf})` - the FFN activation, a *different op* from the `ggml_gelu` first tested |
+| `sub`/`mul`/`add` on the head halves with cos/sin | `SplitRoPEModule` |
+| `permute` + `cont` | `TransposeModule({{0,2,1,3}})` **plus** the layout fix-up `ensure_backend_addressable_layout` inserts - the cont is part of the sequence, not an optimisation |
+| `reshape_4d` | the QKV-to-heads reshape |
+
+**1,251,602 bytes, byte-identical across 17 outputs.** Three harness bugs surfaced on the way (a
+`ggml_scale`/`ggml_pad` signature mismatch, a bias added with the wrong shape, and a reshape that changed the
+element count); all three were caught by ggml's own asserts in both trees, which is the behaviour a parity
+harness should have.
+
+What this leaves open is now a short list, and it is mostly *sequencing* rather than numerics: the exact order
+of ops across a whole 1,771-node graph, and real activation ranges (the harness feeds synthetic bytes; a
+quantiser can agree on random data and disagree on the model's actual dynamic range).
+
+**So stage 2 is no longer a bet on whether the runtimes agree.** It is a port whose arithmetic is known to
+match op-for-op, and whose remaining risk is bookkeeping - graph order, layout fix-ups, and the AOS state
+machine that has to move as C++ regardless.
