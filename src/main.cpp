@@ -27,6 +27,10 @@ static void usage(const char* p) {
         "usage: %s --audio clip16k.wav [--xasr-model M] [--diar-model M] [options]\n"
         "  --xasr-model PATH     x-asr GGUF (default models/x-asr-zh-en-q8_0.gguf)\n"
         "  --diar-model PATH     Nemotron-3 diarization GGUF (default models/nemotron-3-diarization-q8_0.gguf)\n"
+        "  --models-bundle PATH  one GGUF holding BOTH models (built by tools/merge_gguf.py); implies\n"
+        "                        --xasr-model/--diar-model PATH and looks the ASR up under the 'asr.' prefix.\n"
+        "                        Same weights, same mmap count as one file; the diar needs no changes because\n"
+        "                        its tensors are already architecture-namespaced and keep the native namespace.\n"
         "  --audio PATH          16 kHz mono PCM16; resample first, this tool refuses anything else\n"
         "  -t, --threads N       worker threads, keep equal to the core count you pin to (default 2)\n"
         "  --piece-ms N          audio fed per step (default 100)\n"
@@ -66,6 +70,16 @@ int main(int argc, char** argv) {
         if (a == "--audio") cfg.audio = next("--audio");
         else if (a == "--xasr-model") cfg.xasr_model = next("--xasr-model");
         else if (a == "--diar-model") cfg.diar_model = next("--diar-model");
+        else if (a == "--models-bundle") {
+            // One file, two models. The diar reads the native namespace (its tensors are already
+            // architecture-prefixed); the ASR reads the 'asr.' namespace, which is the one lookup change
+            // that makes this work - see CRISPASR_GGUF_PREFIX in crispasr's core_gguf loader. This is a
+            // deployment change: identical weights, identical output, one mmap and one file to ship.
+            const std::string bundle = next("--models-bundle");
+            cfg.xasr_model = bundle;
+            cfg.diar_model = bundle;
+            cfg.asr_gguf_prefix = "asr.";
+        }
         else if (a == "-t" || a == "--threads") cfg.threads = atoi(next("--threads"));
         else if (a == "--piece-ms") cfg.piece_ms = atoi(next("--piece-ms"));
         else if (a == "--chunk-ms") cfg.chunk_ms = atoi(next("--chunk-ms"));

@@ -80,6 +80,10 @@ struct Config {
     // (chat69 transcript hash changes, gate_ms_v2 does not), so this ships as a deliberate re-bless backed
     // by .auto/validate.sh evidence, not as a byte-identical change. Pass the old value back with
     // --diar-session-opt nemotron_3_diar.spkcache_len=264 to A/B it.
+    // Tensor-name prefix for the x-asr half of a merged GGUF bundle ("" = standalone file). Set by
+    // --models-bundle; handed to crispasr's loader, which tries "<prefix><name>" before the bare name.
+    std::string asr_gguf_prefix;
+
     std::vector<std::pair<std::string, std::string>> diar_session_opts = {
         {"nemotron_3_diar.latency_profile",                 "custom"},
         {"nemotron_3_diar.chunk_len",                        "340"},

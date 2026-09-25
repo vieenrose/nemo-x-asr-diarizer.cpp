@@ -122,3 +122,28 @@ metric to trade against.
 - Optimisations that are bit-identical by construction (layout, thread partitioning, index arithmetic) are
   the right first probes, but "no accuracy risk" is not "no risk of being pointless": three of them moved
   profiled CPU time a lot and wall time not at all.
+
+
+## 7. Status: the container merge is DONE (and it is neutral, as predicted)
+
+`tools/merge_gguf.py` builds one GGUF carrying both models: the diar keeps the native namespace (its tensors
+are already architecture-prefixed, so it needs no code change beyond tolerating a name list that is a prefix
+of the file's tensors), and the ASR is stored under `asr.` with crispasr's loader taught to try the prefixed
+name first. `--models-bundle FILE` points both engines at it.
+
+Verified: all 1328 tensor payloads byte-identical to the two source files, 40 KV entries intact, and the
+four gate clips reproduce the blessed transcript hash `192184ebcd54977e` exactly - same output as two files.
+On the phone (armed, 2352 MHz, 95.9% at 2.4 GHz): chat69 26.05 s vs 26.55 s, gate 16.59 s vs 16.58 s, peak RSS
+404 MB either way, load 0.15 s vs 0.12 s. **Neutral, exactly as the arithmetic predicted** - and that is the
+point: it buys one file, one mmap and one deployable artifact, not speed. Treat it as infrastructure for the
+one-runtime merge, never as an optimization.
+
+Three bugs were found and fixed while building it, all of the same species - silent, not loud:
+1. GGUF array elements must not repeat the type field; writing one per element desynchronised the whole KV
+   block (the diar metadata has arrays of strings, so it showed up immediately).
+2. Tensor offsets are relative to the data section, not the file. Using the file size for the last tensor
+   inflated it by the header length, and because `b'\0' * negative` is a no-op rather than an error, every
+   later tensor landed early and the file still parsed.
+3. A loader that returns a *default* when a key is missing (here: `vocab_size -> 0`) turns "wrong namespace"
+   into "corrupt model". Any bundle-capable loader must try the prefixed name in its metadata helpers too,
+   not only in its tensor lookups.

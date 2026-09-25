@@ -132,6 +132,9 @@ bool Engine::init(std::string& err) {
         // penalty I spent a long time misattributing to thread pools and page faults. Always say cpu.
         p.use_gpu = false;
         p.chunk_ms = cfg_.chunk_ms;
+        // Bundle support: the loader reads this once from the environment. Set it before init, and always
+        // set it (empty included) so a previous bundle run in the same process cannot leak its prefix.
+        ::setenv("CRISPASR_GGUF_PREFIX", cfg_.asr_gguf_prefix.c_str(), 1);
         asr_ctx_ = xasr_init_from_file(cfg_.xasr_model.c_str(), p);
         if (!asr_ctx_) { err = "x-asr model failed to load: " + cfg_.xasr_model; return false; }
         asr_stream_ = xasr_stream_init((xasr_context*)asr_ctx_);

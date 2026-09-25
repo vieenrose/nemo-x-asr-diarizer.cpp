@@ -25,6 +25,13 @@ ARM_MIN=${ARM_MIN:-1950}
 REPS=${REPS:-2}
 XM=x-asr-zh-en-q8_0.gguf
 DM=nemotron-3-diarization-q8_0.gguf
+# BUNDLE=1 measures the single merged GGUF (tools/merge_gguf.py) instead of the two-file layout. Same weights,
+# so the transcript hash must be unchanged either way - if it is not, the bundle is broken, not faster.
+if [ "${BUNDLE:-0}" = "1" ] && adb -s "$DEV" shell "test -f $D/bundle.gguf" >/dev/null 2>&1; then
+  MODEL_ARGS="--models-bundle bundle.gguf"
+else
+  MODEL_ARGS="--xasr-model $XM --diar-model $DM"
+fi
 BIN=build-android/nemo-x-asr-diarizer
 DEV_BIN=./nemo-x-asr-diarizer   # what it is called ON THE DEVICE - pushing to $D flattens the path, so the
                                 # local build-android/ prefix must not leak into the remote command
@@ -96,7 +103,7 @@ run_cell() { # run_cell <wav> <reps>  -- accumulates into the totals; per-clip R
   local ca=0 cw=0 casr=0 cdi=0 fp="" 
   for i in $(seq 1 "$reps"); do
     line=$(adb -s "$DEV" shell "cd $D && LD_LIBRARY_PATH=. taskset $MASK $DEV_BIN --audio wav/$wav --threads $THREADS \
-            --windows --xasr-model $XM --diar-model $DM --out out/ar_${wav}_$i.txt 2>&1" | tr -d '\r' | grep '^\[stats\]')
+            --windows $MODEL_ARGS --out out/ar_${wav}_$i.txt 2>&1" | tr -d '\r' | grep '^\[stats\]')
     [ -z "$line" ] && { echo "ERROR: no [stats] from $wav pass $i"; return 1; }
     local a w asr di f p r cores
     a=$(echo "$line"   | grep -oE 'audio [0-9.]+s'         | grep -oE '[0-9.]+')
@@ -150,7 +157,7 @@ for attempt in 1 2 3; do
     echo "METRIC audio_s=$(python3 -c "print(round($AUDIT_TOT,2))")"
     echo "METRIC rtf_chat69=${CLIP_RTF[chat69.wav]:-0}"
     echo "HASH $(cat /tmp/ar_chat69.wav.txt /tmp/ar_gate_ms_v2.wav.txt 2>/dev/null | sha256sum | cut -c1-12)"
-    echo "note loadavg=$LOAD batt=$BATT mask=$MASK t=$THREADS r=$REPS attempt=$attempt"
+    echo "note loadavg=$LOAD batt=$BATT mask=$MASK t=$THREADS r=$REPS attempt=$attempt models=$([ "${BUNDLE:-0}" = "1" ] && echo bundle || echo two-files)"
     exit 0
   fi
   echo "attempt $attempt partial-arm (mean ${MHZ} MHz < ${ARM_MIN}) - cooling 30 s"
