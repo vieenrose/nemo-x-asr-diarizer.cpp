@@ -240,3 +240,26 @@ The generalisable rule, and the one this session kept relearning: **if a change 
 difference, suspect the build before believing the physics.** A real optimisation on this hardware moved the
 clock by 0% three separate times (#1091 copies, #1092 thread partition, the index-arithmetic fix), and a
 broken build looks identical from the outside.
+
+
+## 10. Why the model-format lever is closed by arithmetic, not by measurement
+
+Five requantisation experiments tied or regressed, and the usual reading was "compute-bound, quantisation
+cannot help". That is right but it was an inference. The mechanism is in the ggml type table plus one fact
+about the core:
+
+* Every quantised ggml type declares `vec_dot_type = GGML_TYPE_Q8_0` - q4_0, q5_0, q4_K, q6_k, q8_0, all of
+  them. So the activation side is quantised to int8 and the dot is an integer MAC. The *weight* format only
+  decides how the weights are prepared for that one int8 path; it cannot change which path runs.
+* Cortex-A78 is ARMv8.2-A with two 128-bit NEON pipes, so per cycle: SDOT (int8) is ~4x the fp32 FMA rate,
+  fp16 FMLA is ~2x, and fp32 is 1x. **The fastest arithmetic this core has is the int8 dot both models are
+  already using.**
+
+That closes the lever in the strong sense. Converting the diar encoder from `q5_0` to `f16` - which looked
+attractive for 6.6 s/clip of encoder time - would move it from the 4x path to the 2x path and roughly double
+the matmul time. The same argument retires the idea of f16 activations on either leg, and it explains every
+earlier null result at once: q4_k tying q5_0, all-q8_0 tying, q6_k and iq4_nl regressing, and CrispASR's F16
+weights measuring slower (that copy patches F16 to an f32 dot, so it drops all the way to 1x).
+
+What is left on the arithmetic axis is therefore only: fewer FLOPs (a different or smaller model, outside the
+contract) or a better int8 GEMM (KleidiAI, blocked on a network fetch). Both encoders are on the right path.

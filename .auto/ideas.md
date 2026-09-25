@@ -40,9 +40,12 @@ Plus one merged GGUF (`--models-bundle`), measured neutral by design.
 ## Measured out — do not retry without a changed assumption
 
 - Leg concurrency / diar on a worker thread: 37-47% slower; also pointless given the sum-of-parts floor.
-- Requantising x-asr (q4_k / q4_0 / iq4_nl / q6_k / all-q8_0): no win, some worse. Every quantised type
-  declares `vec_dot_type = Q8_0`, so activations are quantised and dotted with int8 SDOT regardless of the
-  weight format - which is *why* the weight format cannot matter.
+- Requantising x-asr (q4_k / q4_0 / iq4_nl / q6_k / all-q8_0): no win, some worse - and now closed by
+  arithmetic rather than by measurement. Every quantised type declares `vec_dot_type = Q8_0`, so the dot is
+  int8 SDOT whatever the weights are; on A78 (2x128-bit NEON, ARMv8.2) int8 is ~4x fp32 and fp16 FMLA ~2x,
+  so both models already sit on the fastest arithmetic the core has. f16 weights would move the diar encoder
+  from the 4x path to the 2x path and roughly double its matmul time. Fewer FLOPs (different model) or a
+  better int8 GEMM (KleidiAI) are the only remaining arithmetic levers.
 - F16 weights for the ASR: crispasr deliberately patches F16 to an f32 dot (upstream's f32->f16 cast
   saturates above 65504 and produced NaN matmuls). The A78's fp16 pipe is unreachable without solving that.
 - ASR `chunk_ms` 960: ~12% faster on the leg, but WER +5.9 pts on gate_ms_v2 and past the holdout_en ceiling.
