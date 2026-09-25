@@ -22,12 +22,15 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "gguf.h"
 
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
 #include <vector>
+#include <string>
+#include <sys/stat.h>
 
 // Deterministic bytes: same inputs in both builds, no RNG, no time, no environment.
 static void fill_pattern(uint8_t * p, size_t n, uint32_t seed) {
@@ -42,7 +45,9 @@ static void fill_pattern(uint8_t * p, size_t n, uint32_t seed) {
 // LayerNorm, Gelu, Sigmoid, Add, Slice, Transpose, SplitRoPE/RoPE, GroupedQueryAttention, plus the q8_0
 // matmul that is 52% of the x-asr leg and a large share of the diar leg).
 static void run_case(ggml_backend_t backend, ggml_context * ctx_alloc, const char * name,
-                     std::vector<uint8_t> & out) {
+                     std::vector<uint8_t> & out,
+                     const std::vector<uint8_t> * real_wq = nullptr,
+                     const std::vector<uint8_t> * real_ffn = nullptr) {
     const int64_t K = 512, M = 256, Ncols = 6;    // K and M from the models; Ncols deliberately tiny
     out.clear();
 
@@ -55,6 +60,9 @@ static void run_case(ggml_backend_t backend, ggml_context * ctx_alloc, const cha
     ggml_tensor * xq  = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, K, Ncols);
     ggml_tensor * xf  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, Ncols);
     ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, M);   // a real Linear's bias broadcasts over rows
+    // A second q8_0 weight at a different k, so the real-weight path is exercised at k=512 and k=2048 - the
+    // two k values the encoder's attention and FFN projections actually use.
+    ggml_tensor * wffn = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, K, 4 * M);
 
     // 1. q8_0 x q8_0 matmul - the hot path on both legs
     ggml_tensor * mm = ggml_mul_mat(ctx, wq, xq);
@@ -62,6 +70,7 @@ static void run_case(ggml_backend_t backend, ggml_context * ctx_alloc, const cha
     ggml_tensor * mmf = ggml_mul_mat(ctx, wq, xf);
     // 3. f32 matmul + bias add ([M] broadcasts over the [M, Ncols] result)
     ggml_tensor * mm2 = ggml_add(ctx, ggml_mul_mat(ctx, wf, xf), bias);
+    ggml_tensor * mm3 = ggml_mul_mat(ctx, wffn, xq);   // real k x n path with a model weight
     // 4. norm (LayerNormModule is a LayerNorm with bias in this model)
     ggml_tensor * nrm = ggml_norm(ctx, xf, 1e-5f);
     // 5. elementwise chain: gelu, silu, sigmoid, add
@@ -111,7 +120,7 @@ static void run_case(ggml_backend_t backend, ggml_context * ctx_alloc, const cha
 
     ggml_cgraph * gf = ggml_new_graph(ctx);
     for (ggml_tensor * t : {mm, mmf, mm2, nrm, adds, ct, cc, sm, sc, pd, tr,
-                            ge, flash, rope_a, rope_b, heads, resh}) ggml_build_forward_expand(gf, t);
+                            mm3, ge, flash, rope_a, rope_b, heads, resh}) ggml_build_forward_expand(gf, t);
 
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
     if (!buf) { fprintf(stderr, "%s: alloc failed\n", name); ggml_free(ctx); return; }
@@ -120,7 +129,7 @@ static void run_case(ggml_backend_t backend, ggml_context * ctx_alloc, const cha
     ggml_gallocr_free(galloc);
 
     struct { ggml_tensor * t; uint32_t seed; } feeds[] = {
-        {wq, 1}, {wq2, 2}, {wf, 3}, {xq, 4}, {xf, 5}, {bias, 6},
+        {wq, 1}, {wq2, 2}, {wf, 3}, {xq, 4}, {xf, 5}, {bias, 6}, {wffn, 16},
         {q4, 7}, {k4, 8}, {v4, 9}, {msk, 10}, {x1, 11}, {x2, 12}, {cs, 13}, {sn, 14}, {qkv4, 15},
     };
     std::vector<uint8_t> tmp;
@@ -129,6 +138,13 @@ static void run_case(ggml_backend_t backend, ggml_context * ctx_alloc, const cha
         fill_pattern(tmp.data(), tmp.size(), f.seed);
         ggml_backend_tensor_set(f.t, tmp.data(), 0, tmp.size());
     }
+    // Overwrite with the MODEL's own Q8_0 blocks (scales included) where provided. These are byte-identical
+    // in both builds by construction - the file is the same - so what is being compared is the KERNELS and the
+    // quantiser on real weight distributions, not the input bytes.
+    if (real_wq && real_wq->size() == ggml_nbytes(wq))
+        ggml_backend_tensor_set(wq, real_wq->data(), 0, real_wq->size());
+    if (real_ffn && real_ffn->size() == ggml_nbytes(wffn))
+        ggml_backend_tensor_set(wffn, real_ffn->data(), 0, real_ffn->size());
     if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "%s: compute failed\n", name);
         ggml_backend_buffer_free(buf);
@@ -139,6 +155,7 @@ static void run_case(ggml_backend_t backend, ggml_context * ctx_alloc, const cha
     // Dump every distinct output, with a small header naming it, so a mismatch can be localised.
     struct { const char * label; ggml_tensor * t; } outs[] = {
         {"mul_mat_q8xq8", mm}, {"mul_mat_q8xf32", mmf}, {"mul_mat_f32_plus_bias", mm2},
+        {"mul_mat_q8xq8_k4m", mm3},
         {"norm", nrm}, {"gelu_silu_sigmoid_add", adds}, {"cont_transpose", ct},
         {"concat", cc}, {"soft_max", sm}, {"scale", sc}, {"pad", pd}, {"transpose", tr},
         // the encoder layer's version-sensitive ops
@@ -162,6 +179,33 @@ static void run_case(ggml_backend_t backend, ggml_context * ctx_alloc, const cha
     (void) ctx_alloc;
 }
 
+// Load one tensor's raw bytes straight out of a GGUF file. Used to feed the parity graph the model's REAL
+// weights: synthetic bytes can agree across runtimes while the real per-block Q8_0 scales - which are what
+// the dot path actually consumes - disagree. Both builds run this identical code, so the bytes are the same.
+static bool load_gguf_tensor(const char * path, const char * name, std::vector<uint8_t> & out) {
+    ggml_context * ctx = NULL;
+    struct gguf_init_params p = { true, &ctx };
+    struct gguf_context * g = gguf_init_from_file(path, p);
+    if (!g) return false;
+    bool ok = false;
+    for (int64_t i = 0; i < gguf_get_n_tensors(g); i++) {
+        if (strcmp(gguf_get_tensor_name(g, i), name) == 0) {
+            const size_t n = gguf_get_tensor_size(g, i);
+            out.resize(n);
+            FILE * fh = fopen(path, "rb");
+            if (fh) {
+                fseek(fh, (long) (gguf_get_data_offset(g) + gguf_get_tensor_offset(g, i)), SEEK_SET);
+                ok = fread(out.data(), 1, n, fh) == n;
+                fclose(fh);
+            }
+            break;
+        }
+    }
+    gguf_free(g);
+    if (ctx) ggml_free(ctx);
+    return ok;
+}
+
 int main(int argc, char ** argv) {
     const char * tag = argc > 1 ? argv[1] : "unknown";
     const char * path = argc > 2 ? argv[2] : "/data/local/tmp/nemo_x/parity.bin";
@@ -172,8 +216,25 @@ int main(int argc, char ** argv) {
     ggml_init_params ip = { ggml_tensor_overhead() * 8, nullptr, true };
     ggml_context * scratch = ggml_init(ip);
 
+    // If a model is supplied, the parity graph runs a second time with the model's real Q8_0 weights from
+    // encoder layer 0 - the layer a port would move first.
     std::vector<uint8_t> out;
     run_case(backend, scratch, "q8xq8", out);
+    if (argc > 3) {
+        std::vector<uint8_t> wq_real, ffn_real;
+        const bool a_ok = load_gguf_tensor(argv[3], "encoder.layers.0.attn.w_qkv.weight", wq_real);
+        const bool b_ok = load_gguf_tensor(argv[3], "encoder.layers.0.ffn.net.0.weight", ffn_real);
+        printf("real weights: w_qkv %s (%zu bytes), ffn.net.0 %s (%zu bytes)\n",
+               a_ok ? "loaded" : "MISSING", wq_real.size(), b_ok ? "loaded" : "MISSING", ffn_real.size());
+        std::vector<uint8_t> out_real;
+        run_case(backend, scratch, "real-weights", out_real,
+                 a_ok ? &wq_real : nullptr, b_ok ? &ffn_real : nullptr);
+        char path2[512];
+        snprintf(path2, sizeof(path2), "%s.real", path);
+        FILE * fh2 = fopen(path2, "wb");
+        if (fh2) { fwrite(out_real.data(), 1, out_real.size(), fh2); fclose(fh2); }
+        printf("%s: wrote %zu real-weight bytes to %s\n", tag, out_real.size(), path2);
+    }
 
     FILE * fh = fopen(path, "wb");
     if (!fh) { fprintf(stderr, "cannot write %s\n", path); return 1; }

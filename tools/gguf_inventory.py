@@ -23,7 +23,11 @@ import merge_gguf as M   # noqa: E402
 # Type ids as THESE vendored ggml trees number them. Only used for the label; the density column is the
 # part that cannot be wrong.
 NAMES = {0: 'F32', 1: 'F16', 2: 'BF16', 3: 'Q4_0', 4: 'Q4_1', 6: 'Q5_0', 7: 'Q5_1', 8: 'Q8_0',
-         9: 'Q8_1', 10: 'Q2_K', 11: 'Q3_K', 12: 'Q4_K', 13: 'Q5_K', 14: 'Q6_K', 15: 'Q8_K', 30: 'type30'}
+         9: 'Q8_1', 10: 'Q2_K', 11: 'Q3_K', 12: 'Q4_K', 13: 'Q5_K', 14: 'Q6_K', 15: 'Q8_K',
+         # 30 is plain GGML_TYPE_BF16 in BOTH vendored trees. It was recorded here as an unknown
+         # "audio.cpp-specific" id until the enum was read; the density said 16 bits and the enum says
+         # BF16, and the enum is what the loader uses. Another case of assuming custom when it was standard.
+         30: 'BF16'}
 
 
 def payload_bytes(model, i):
@@ -58,6 +62,8 @@ def audit(path):
         # disagreement means the id was read with the wrong enum (or the file is unusual).
         expected = {'Q4_0': 4.5, 'Q4_1': 5.0, 'Q5_0': 5.5, 'Q5_1': 6.5, 'Q8_0': 8.5, 'Q8_1': 9.0,
                     'F16': 16.0, 'F32': 32.0, 'BF16': 16.0}
+        # F16 and BF16 share a density, so bits/element cannot separate them - only the enum can, and
+        # that is exactly why the label column exists next to the density column.
         if name in expected and abs(bits - expected[name]) > 0.6:
             note = 'DENSITY MISMATCH: %.1f bits/elem is not %s' % (bits, name)
         print('   %-8s %5d %7.1fM %10.1f %12.2f   %s' % (

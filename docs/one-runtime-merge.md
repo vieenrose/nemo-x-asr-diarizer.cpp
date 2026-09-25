@@ -87,8 +87,12 @@ two vendored ggml trees, and a bug fixed in one does not fix the other — the s
 found the same per-element division and thread-partition issue in both copies separately. One runtime is
 also one weight buffer, one allocator and one place where a memory or numerics bug can hide.
 
-So the recommendation is: **do stage 1 now** (cheap, decisive), and treat stages 2-5 as justified only if
-stage 1 passes *and* either the overlap prize survives a more careful bound or the kernel work has started.
+**Recommendation, updated after stage 1 passed:** the numerical risk that would have sunk this port is gone,
+so the decision is now purely economic. The overlap prize is ≤10% and was measured; the port is days of work;
+and the strategic case (one tuned kernel set for both models) only becomes real if the GEMM work starts, which
+currently needs kernels this machine does not have. So: **the port is not justified today**, and stage 1's
+result is what makes that a safe conclusion rather than a guess - the thing that would have made it a bad bet
+was tested, and it passed.
 
 
 ## 7. Stage 1 result: the two runtimes agree bit-for-bit
@@ -149,10 +153,32 @@ ops are different from the ones I happened to pick, so the harness was extended 
 element count); all three were caught by ggml's own asserts in both trees, which is the behaviour a parity
 harness should have.
 
-What this leaves open is now a short list, and it is mostly *sequencing* rather than numerics: the exact order
-of ops across a whole 1,771-node graph, and real activation ranges (the harness feeds synthetic bytes; a
-quantiser can agree on random data and disagree on the model's actual dynamic range).
+### Stage 1c: the model's REAL Q8_0 weights, also byte-identical
 
-**So stage 2 is no longer a bet on whether the runtimes agree.** It is a port whose arithmetic is known to
-match op-for-op, and whose remaining risk is bookkeeping - graph order, layout fix-ups, and the AOS state
-machine that has to move as C++ regardless.
+The last declared gap was real activation ranges: a quantiser can agree on random bytes and disagree on the
+model's actual weight distributions, because the per-block scales are what the dot path consumes. The harness
+now reads `encoder.layers.0.attn.w_qkv.weight` (835,584 bytes) and `encoder.layers.0.ffn.net.0.weight`
+(1,114,112 bytes) straight out of the diar GGUF and feeds those blocks into the graph, so the comparison runs
+the kernels and the quantiser on the model's own data at both k values the encoder uses (512 and 2048).
+
+**1,276,200 bytes, byte-identical.** The input blocks are the same file in both builds by construction - what
+is being compared is the computation on real weights, not the bytes.
+
+### Where stage 1 leaves the decision
+
+All three declared gaps are closed:
+
+| gap | result |
+|-----|--------|
+| op vocabulary (incl. flash attention, gelu_erf, SplitRoPE, QKV->heads) | byte-identical |
+| the layout fix-up conts that the module wrappers insert | byte-identical |
+| real Q8_0 weight distributions and scales | byte-identical |
+
+What remains is *sequencing*, not numerics: the exact op order across a whole 1,771-node graph, and the AOS
+state machine (speaker cache, FIFO, compression), which has to move as C++ regardless of which runtime draws
+the graph.
+
+**So stage 2 is no longer a bet.** It is a port whose arithmetic is known to match op-for-op on this device,
+with the residual risk in bookkeeping - and with a clear instruction for de-risking it: port ONE layer, compare
+it against audio.cpp's own output for the same input, and only then extend. The cheapest way to do that is a
+debug dump of layer 0's input and output on the audio.cpp side, which is a small env-gated change.
