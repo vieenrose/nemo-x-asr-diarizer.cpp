@@ -32,49 +32,136 @@ WAV() { case $1 in *aligned|*ph35200) echo "$EV/$1.wav";; gate_ms*) echo "$EV/$1
 
 if [ -n "$CMP1" ]; then
   python3 - "$CMP1" "$CMP2" "$DIR" "$SCORER" <<'PY'
-import sys, os, math, subprocess, re
+import sys, os, math, re, subprocess
+
 tag1, tag2, d, scorer = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-clips = os.environ.get("CLIPS","").split() or []
-def wer_of(t, man):
-    if not os.path.exists(t): return None
+
+# index.tsv is tag/clip/manifest; take the union of the two tags' clips, in a stable order.
+index = {}
+with open(os.path.join(d, "index.tsv")) as fh:
+    for line in fh:
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) == 3:
+            index[(parts[0], parts[1])] = parts[2]
+clips = sorted({c for (t, c) in index if t in (tag1, tag2)})
+
+# The scorer prints "WER  0.1765 (S=6 D=8 I=1 H=71) over 85 ref tokens". The counts are what a micro-average
+# needs. An earlier version of this script looked for "N <digits>", never matched, swallowed the exception
+# in its except branch and reported every clip as "(missing)" - which is why two comparisons in this session
+# had to be redone by hand.
+def score(path, manifest):
+    if not os.path.exists(path):
+        return None
     try:
-        out = subprocess.run(["python3", scorer, t, man], capture_output=True, text=True, timeout=300).stdout
-        m = re.search(r"WER\s+([0-9.]+)", out);  n = re.search(r"N\s+(\d+)", out)
-        return (float(m.group(1)), int(n.group(1))) if m else (None, None)
-    except Exception: return (None, None)
-rows=[]; tot_w=[0.0,0.0]; b0=b1=0
-print("%-24s %8s %8s %8s %10s" % ("clip","WER(ref)","WER(cand)","delta","discordant"))
-for line in open(os.path.join(d, "index.tsv")):
-    tag, clip, man = line.rstrip("\n").split("\t")
-    if tag not in (tag1, tag2): continue
-    a = wer_of(os.path.join(d, tag1, clip+".txt"), man); b = wer_of(os.path.join(d, tag2, clip+".txt"), man)
-    if a[0] is None or b[0] is None: print("%-24s   (missing)" % clip); continue
-    ha = open(os.path.join(d, tag1, clip+".txt")).read(); hb = open(os.path.join(d, tag2, clip+".txt")).read()
-    wa, wb = ha.split(), hb.split()
-    # word-level DP over the two hypotheses: count positions where they disagree with each other
-    n, m = len(wa), len(wb)
-    if n*m < 4_000_000:
-        D = [[0]*(m+1) for _ in range(n+1)]
-        for i in range(n+1): D[i][0]=i
-        for j in range(m+1): D[0][j]=j
-        for i in range(1, n+1):
-            Di, Dp = D[i], D[i-1]
-            for j in range(1, m+1):
-                Di[j] = min(Dp[j]+1, Di[j-1]+1, Dp[j-1] + (wa[i-1] != wb[j-1]))
-        disc = D[n][m]
-    else: disc = -1
-    rows.append((clip, a[0], b[0], a[1], b[1], disc))
-    tot_w[0] += a[0]*a[1]; tot_w[1] += b[0]*b[1]
-    b0 += a[1]; b1 += b[1]
-    print("%-24s %8.4f %8.4f %+8.4f %10s" % (clip, a[0], b[0], b[0]-a[0], disc if disc>=0 else "n/a"))
-W0 = tot_w[0]/b0 if b0 else 0; W1 = tot_w[1]/b1 if b1 else 0
-print("\nmicro- aggregate WER  %s=%.4f  %s=%.4f  delta=%+.4f  (n=%d words)" % (tag1, W0, tag2, W1, W1-W0, b0))
-# McNemar needs per-item correctness, which the scorer does not emit; report the sign test over clips and
-# the absolute WER movement as the honest floor of what can be claimed.
-worse = sum(1 for r in rows if r[2] > r[1] + 1e-9); better = sum(1 for r in rows if r[2] < r[1] - 1e-9)
-print("clips worse %d, better %d, equal %d  (sign test p=%.3f)" % (
-    worse, better, len(rows)-worse-better,
-    sum(math.comb(len(rows),k) for k in range(min(worse,better), max(worse,better)+1))/2**len(rows)*2 if rows else 1))
+        out = subprocess.run(["python3", scorer, path, manifest],
+                             capture_output=True, text=True, timeout=600).stdout
+    except Exception:
+        return None
+    w = re.search(r"WER\s+([0-9.]+)", out)
+    e = re.search(r"\(S=(\d+)\s+D=(\d+)\s+I=(\d+)\s+H=(\d+)\)", out)
+    if not w or not e:
+        return None
+    s, de, i, h = (int(x) for x in e.groups())
+    return s, de, i, h
+
+def wer_of(counts):
+    s, de, i, h = counts
+    return (s + de + i) / float(s + de + i + h) if (s + de + i + h) else 0.0
+
+# Text with the window counters and speaker labels removed, and with segment joins collapsed, so a change of
+# SPEAKER TAG or of where a line splits is not counted as a change of words. The raw windowed output
+# interleaves both; an earlier version compared it raw and reported 74 "edits" on a clip whose text was
+# character-identical.
+LABEL = re.compile(r"^\s*(?:\[\d+/\d+\]\s*)?(?:speaker\s+)?[A-Za-z]?\d*\s*[:：]\s*", re.I)
+def normalized_text(path):
+    out = []
+    for line in open(path, encoding="utf-8", errors="replace"):
+        line = line.rstrip("\n")
+        if not line.strip():
+            continue
+        line = re.sub(r"^\s*\[\d+/\d+\]\s*", "", line)
+        out.append(LABEL.sub("", line).strip())
+    return "".join(out)
+
+def labels(path):
+    got = []
+    for line in open(path, encoding="utf-8", errors="replace"):
+        line = line.rstrip("\n")
+        if not line.strip():
+            continue
+        m = re.match(r"^\s*(?:\[\d+/\d+\]\s*)?(?:speaker\s+)?([A-Za-z]?\d*)\s*[:：]", line, re.I)
+        got.append(m.group(1) if m else "?")
+    return got
+
+def word_edits(a, b):
+    wa, wb = a.split(), b.split()
+    if len(wa) * len(wb) > 4000000:
+        return -1
+    prev = list(range(len(wb) + 1))
+    for i, x in enumerate(wa, 1):
+        cur = [i] + [0] * len(wb)
+        for j, y in enumerate(wb, 1):
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (x != y))
+        prev = cur
+    return prev[-1]
+
+print("# WER columns are recomputed from the scorer's S/D/I/H, so they are internally consistent but may")
+print("# differ in the third decimal from the scorer's own printed WER and from .auto/bless.txt. Judge the")
+print("# DELTA and the text column, not the absolute value.")
+print("%-24s %8s %8s %8s  %-11s %-14s %s" % ("clip", tag1, tag2, "delta", "text", "labels", "word edits"))
+acc = {tag1: [0, 0, 0, 0], tag2: [0, 0, 0, 0]}
+worse = better = same = text_same = scored = 0
+for clip in clips:
+    a = score(os.path.join(d, tag1, clip + ".txt"), index.get((tag1, clip), ""))
+    b = score(os.path.join(d, tag2, clip + ".txt"), index.get((tag2, clip), ""))
+    if not a or not b:
+        print("%-24s   (unscored)" % clip)
+        continue
+    scored += 1
+    for j in range(4):
+        acc[tag1][j] += a[j]
+        acc[tag2][j] += b[j]
+    pa = os.path.join(d, tag1, clip + ".txt")
+    pb = os.path.join(d, tag2, clip + ".txt")
+    ta, tb = normalized_text(pa), normalized_text(pb)
+    same_text = ta == tb
+    text_same += 1 if same_text else 0
+    la, lb = labels(pa), labels(pb)
+    churn = sum(1 for x, y in zip(la, lb) if x != y) + abs(len(la) - len(lb))
+    we = word_edits(ta, tb)
+    wa_, wb_ = wer_of(a), wer_of(b)
+    print("%-24s %8.4f %8.4f %+8.4f  %-11s %-14s %s" % (
+        clip, wa_, wb_, wb_ - wa_,
+        "identical" if same_text else "DIFFERS",
+        "%d of %d" % (churn, max(len(la), len(lb))),
+        we if we >= 0 else "n/a"))
+    if wb_ > wa_ + 1e-9:
+        worse += 1
+    elif wb_ < wa_ - 1e-9:
+        better += 1
+    else:
+        same += 1
+
+for tag in (tag1, tag2):
+    s, de, i, h = acc[tag]
+    print("micro %-10s WER %.4f   S=%d D=%d I=%d H=%d   (n=%d ref tokens)" % (tag, wer_of(acc[tag]), s, de, i, h, s + de + i + h))
+print("text identical (labels and segment joins removed) on %d of %d scored clips" % (text_same, scored))
+# Sign test over clips, discarding ties. With no clip moving in either direction there are no discordant
+# pairs and the test is vacuous: it must report p=1.0, not the p=0.001 an earlier version printed for an
+# all-equal result by including the ties in n.
+n = worse + better
+if n:
+    k = min(worse, better)
+    p = min(1.0, 2.0 * sum(math.comb(n, j) for j in range(k + 1)) / float(2 ** n))
+    verdict = "two-sided sign test p=%.3f" % p
+else:
+    verdict = "no clip moved in either direction (sign test vacuous)"
+print("clips: %d worse, %d better, %d equal  (%s)" % (worse, better, same, verdict))
+print()
+print("Reading this: 'text identical' with label churn means the candidate moved turn boundaries or speaker")
+print("tags, not words. Only 'DIFFERS' in the text column, or a WER delta, is an accuracy change - and a")
+print("candidate that fails the gate's hash but lands here as text-identical needs a deliberate re-bless,")
+print("not a widened threshold.")
 PY
   exit 0
 fi
