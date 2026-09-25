@@ -87,7 +87,7 @@ for c in $CLIPS; do
   [ -f "$w" ] || { echo "skip $c (no wav)"; continue; }
   [ -f "$m" ] || { echo "skip $c (no manifest)"; continue; }
   printf '%-24s ' "$c"
-  timeout 900 "$BIN" --audio "$w" --windows --xasr-model "$XM" --diar-model "$DM" --out "$DIR/$TAG/$c.txt" >/dev/null 2>&1 \
+  timeout 900 "$BIN" --audio "$w" --windows ${EXTRA:-} --xasr-model "$XM" --diar-model "$DM" --out "$DIR/$TAG/$c.txt" >/dev/null 2>&1 \
     || { echo "FAIL"; continue; }
   python3 "$SCORER" "$DIR/$TAG/$c.txt" "$m" 2>/dev/null | grep -oE "WER +[0-9.]+" | head -1 | tr -d '\n'
   echo "   $(basename "$w")"
