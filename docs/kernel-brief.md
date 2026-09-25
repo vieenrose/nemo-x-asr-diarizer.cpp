@@ -39,10 +39,16 @@ Three mechanisms, in descending order of how much they are worth knowing:
 
 ## What to build, in order
 
-1. **A block-scoped Q8_0 activation cache** (mechanism 1). Smallest change, no new arithmetic, bit-identical
-   output: quantise once per tensor per step rather than once per use. This is the first thing to try because it
-   is a scheduling win inside the existing kernels, not a rewrite. Expected: single-digit percent, and it is
-   cheap enough to measure in one iteration.
+1. **A block-scoped Q8_0 activation cache** (mechanism 1) - **MEASURED, AND NOT WORTH BUILDING.** I counted the
+   volume rather than assuming it (ggml's `g_ggml_quant_elems`, behind `GGML_COUNT_QUANT`): **180.8 M activation
+   elements are quantised per 69 s clip** (118.8 M for the 45 s clip). That sounds like a lot until you divide by
+   what each element is worth: a quantised activation element feeds one MAC per OUTPUT ROW, so with
+   `n_out` in 512-2048 it is reused roughly a thousand times. The conversion is therefore ~1/1000 of the
+   arithmetic, about 56 ms per clip at 1-2 cycles/element across two threads - **0.7% of the ASR leg, below the
+   0.4% noise band once you account for run-to-run spread.** The mechanism is real; the prize is not. Do not
+   build it. (The measurement is also a useful cross-check on the rest of this brief: it is what reconciled the
+   apparent 100x gap between '12.4 M MACs per frame' and '180 M quantised elements per clip' - the ratio is
+   simply the average number of output rows per activation element.)
 2. **A specialised Q5_0 x Q8_0 GEMM for the shapes these two models actually use** (mechanisms 2-3). The brief
    for the kernel: k in {512, 1536, 2048}, n in {12, 24, 48, 380, 508}, int8 accumulate into int32, output f32,
    two threads on two A78s. This is what KleidiAI's `ai_micro_kernels` provides, and it is the reason that
@@ -50,7 +56,10 @@ Three mechanisms, in descending order of how much they are worth knowing:
    CMake option) but no `ai_micro_kernels` exists anywhere on this machine, so the build cannot be completed
    offline. KleidiAI accumulation order differs from ggml's, so it needs the paired validation and a
    deliberate re-bless - not the byte-identity gate.
-3. **Only if 1 and 2 land:** fusing the surrounding elementwise chain. Measured worthless on its own (four
+2b. **If 2 lands,** re-measure mechanism 1 before dismissing it: a 2-3x faster dot makes the conversion a
+   correspondingly larger share, though still small.
+
+3. **Only if 2 lands:** fusing the surrounding elementwise chain. Measured worthless on its own (four
    separate 0% results: the ASR leg is matmul-bound and its elementwise work is already overlapped underneath),
    but it stops being separate work once the GEMM itself is fast.
 
