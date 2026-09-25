@@ -37,13 +37,22 @@ import sys, os, math, re, subprocess
 tag1, tag2, d, scorer = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 
 # index.tsv is tag/clip/manifest; take the union of the two tags' clips, in a stable order.
-index = {}
-with open(os.path.join(d, "index.tsv")) as fh:
-    for line in fh:
-        parts = line.rstrip("\n").split("\t")
-        if len(parts) == 3:
-            index[(parts[0], parts[1])] = parts[2]
-clips = sorted({c for (t, c) in index if t in (tag1, tag2)})
+# Manifest paths are DERIVED from the clip name rather than read from a side file. An index file looked
+# authoritative but was truncated by every run, so a comparison between two tags could silently score zero
+# clips - and an empty table reads as "no difference", which is the most dangerous way for this tool to fail.
+EV = os.environ.get("EV", "../eval-bilingual")
+def manifest_for(clip):
+    if clip == "gate_ms": return os.path.join(EV, "manifest_ms.json")
+    if clip.startswith("gate_ms_"): return os.path.join(EV, "manifest_" + clip[len("gate_"):] + ".json")
+    return os.path.join(EV, "manifest_%s.json" % clip)
+clips = []
+for tag in (tag1, tag2):
+    tdir = os.path.join(d, tag)
+    if os.path.isdir(tdir):
+        for f in sorted(os.listdir(tdir)):
+            if f.endswith(".txt"):
+                clips.append(f[:-4])
+clips = sorted(set(clips))
 
 # The scorer prints "WER  0.1765 (S=6 D=8 I=1 H=71) over 85 ref tokens". The counts are what a micro-average
 # needs. An earlier version of this script looked for "N <digits>", never matched, swallowed the exception
@@ -112,10 +121,12 @@ print("%-24s %8s %8s %8s  %-11s %-14s %s" % ("clip", tag1, tag2, "delta", "text"
 acc = {tag1: [0, 0, 0, 0], tag2: [0, 0, 0, 0]}
 worse = better = same = text_same = scored = 0
 for clip in clips:
-    a = score(os.path.join(d, tag1, clip + ".txt"), index.get((tag1, clip), ""))
-    b = score(os.path.join(d, tag2, clip + ".txt"), index.get((tag2, clip), ""))
+    a = score(os.path.join(d, tag1, clip + ".txt"), manifest_for(clip))
+    b = score(os.path.join(d, tag2, clip + ".txt"), manifest_for(clip))
     if not a or not b:
-        print("%-24s   (unscored)" % clip)
+        if not (os.path.exists(os.path.join(d, tag1, clip + ".txt")) and os.path.exists(os.path.join(d, tag2, clip + ".txt"))):
+            continue   # clip belongs to only one tag
+        print("%-24s   (present but UNSCORED - scorer output unparsed; treat as a failure, not a pass)" % clip)
         continue
     scored += 1
     for j in range(4):
@@ -168,18 +179,36 @@ fi
 
 [ -n "$XM" ] && [ -n "$TAG" ] || { echo "usage: validate.sh --xasr PATH --tag NAME   |   --compare A B"; exit 2; }
 [ -x "$BIN" ] || bash scripts/build_host.sh >/tmp/ar_host.log 2>&1
-mkdir -p "$DIR/$TAG"; : > "$DIR/index.tsv"
+mkdir -p "$DIR/$TAG"
+# Append, never truncate: truncating this file silently deleted every OTHER tag's
+# manifest mapping, so a later --compare scored zero clips and printed an empty table that
+# looks like "no difference". The mapping is derivable from the clip name anyway (see compare).
 for c in $CLIPS; do
   m=$(MAN "$c"); w=$(WAV "$c")
   [ -f "$w" ] || { echo "skip $c (no wav)"; continue; }
   [ -f "$m" ] || { echo "skip $c (no manifest)"; continue; }
   printf '%-24s ' "$c"
-  timeout 900 "$BIN" --audio "$w" --windows ${EXTRA:-} --xasr-model "$XM" --diar-model "$DM" --out "$DIR/$TAG/$c.txt" >/dev/null 2>&1 \
-    || { echo "FAIL"; continue; }
+  # Capture the run's stats as well as its transcript. The session's contract includes 'first-output latency
+  # must not get worse', and checks.sh verifies bytes and WER only - so a candidate could satisfy every gate
+  # and still stall first output on a clip nobody timed. Numbers are printed per clip and warned on here.
+  timeout 900 "$BIN" --audio "$w" --threads 2 --windows ${EXTRA:-} --xasr-model "$XM" --diar-model "$DM" \
+      --out "$DIR/$TAG/$c.txt" > "$DIR/$TAG/$c.stats" 2>&1 || { echo "FAIL"; continue; }
   python3 "$SCORER" "$DIR/$TAG/$c.txt" "$m" 2>/dev/null | grep -oE "WER +[0-9.]+" | head -1 | tr -d '\n'
+  fp=$(sed -nE 's/.*first partial (-?[0-9.]+)s.*/\1/p' "$DIR/$TAG/$c.stats" | head -1)
+  p95=$(sed -nE 's/.*p95 piece ([0-9.]+)ms.*/\1/p' "$DIR/$TAG/$c.stats" | head -1)
+  case "$fp" in ""|-1) fp="n/a";; esac
+  case "$p95" in "") p95="n/a";; esac
+  warn=""
+  case "$fp" in n/a) warn=" (NO FIRST PARTIAL - inspect the run)";;
+    *) python3 -c "import sys; sys.exit(0 if float('$fp') < ${FIRST_PARTIAL_MAX:-1.0} else 1)" 2>/dev/null || warn=" (first partial ${fp}s > ${FIRST_PARTIAL_MAX:-1.0}s)";; esac
+  case "$p95" in n/a) warn="${warn} (no p95 reported)";; *)
+    python3 -c "import sys; sys.exit(0 if float('$p95') < ${P95_PIECE_MAX:-150} else 1)" 2>/dev/null || warn="${warn} (p95 piece ${p95}ms > ${P95_PIECE_MAX:-150}ms)";; esac
+  printf '  first_partial=%ss p95_piece=%s%s\n' "$fp" "$p95" "$warn"
   echo "   $(basename "$w")"
 done
 # keep every tag's clip->manifest mapping so --compare can resolve them
-for t in $(ls "$DIR" 2>/dev/null); do for c in $(ls "$DIR/$t" 2>/dev/null); do printf '%s\t%s\t%s\n' "$t" "${c%.txt}" "$(MAN "${c%.txt}")" >> "$DIR/index.tsv"; done; done
-sort -u -o "$DIR/index.tsv" "$DIR/index.tsv"
+for t in $(ls "$DIR" 2>/dev/null); do for c in $(ls "$DIR/$t"/*.txt 2>/dev/null); do printf '%s\t%s\t%s\n' "$t" "${c##*/}"; done; done | sed 's/\.txt$//' > /dev/null
+# Rewrite the index from every tag currently on disk (2 columns; compare derives the manifest).
+: > "$DIR/index.tsv"
+for t in $(ls "$DIR" 2>/dev/null); do for c in $(ls "$DIR/$t"/*.txt 2>/dev/null); do printf '%s\t%s\n' "$t" "$(basename "$c" .txt)" >> "$DIR/index.tsv"; done; done
 echo "tagged $TAG into $DIR/$TAG"
