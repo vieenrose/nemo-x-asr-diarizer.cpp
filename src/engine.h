@@ -30,12 +30,6 @@ struct Config {
     // call costs ~7-9 s per stream REGARDLESS of clip length (3 s clip 7.27, 15 s 8.59, 45 s 8.74, 69 s 8.55)
     // - a fixed prepare/flush, not work proportional to audio. Whether those turns were needed is the test.
     bool diar_no_finish = false;
-
-    // Run the diarizer on its own thread. The legs share nothing (different models, different ggml,
-    // different heaps) and the loop used to serialise them: wall was asr + diar. Tags come from the FINAL
-    // attribute pass over the complete turn list, and the worker is joined before it, so output stays
-    // deterministic. Interim live_provisional output stays sync-only.
-    bool diar_async = false;
     std::string xasr_model;         // x-asr-zh-en-q8_0.gguf
     std::string diar_model;         // nemotron-3-diarization-q8_0.gguf
     std::string audio;              // 16 kHz mono PCM16 wav
