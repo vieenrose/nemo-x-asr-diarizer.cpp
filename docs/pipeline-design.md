@@ -147,3 +147,63 @@ Three bugs were found and fixed while building it, all of the same species - sil
 3. A loader that returns a *default* when a key is missing (here: `vocab_size -> 0`) turns "wrong namespace"
    into "corrupt model". Any bundle-capable loader must try the prefixed name in its metadata helpers too,
    not only in its tensor lookups.
+
+
+## 8. What the instrumentation found AFTER the design was written (read this first)
+
+The section above was written from the state of the tree at 0.4651. Four measurements then changed the
+picture, and they are the reusable lessons from this round:
+
+**1. A "model-bound" leg was 40% signal processing.** `AUDIOCPP_PROF` phase timers (features / pre_encode /
+encode / AOS) showed the diar leg spending 4.52 s of an 11.1 s budget in the mel frontend against 6.61 s in
+the transformer. The cause was `MelFilterbank::compute_custom`: it walked all 128x257 filterbank weights per
+frame and accumulated in `long double`, which on ARM64 is **software-emulated IEEE quad precision** - a libgcc
+call per term, not an FPU op. The diarizer's bank has 504 nonzero weights out of 32,896. Skipping exact zeros
+in the same frequency order is bit-identical (adding +0 to a finite partial sum is exact; the only possible
+difference is a sum of exactly zero, where ±0 both feed the same log). Frontend 4.518 s -> 0.249 s, an 18x
+improvement on that phase, and the single largest win of the session: **phone_rtf 0.47 -> 0.3142**.
+
+**2. The ASR leg is ~93% ggml compute, and that is now measured, not assumed.** The same treatment on the
+x-asr side (host phase timers around the chunk loop) gives, per 69 s clip: compute ~19 s profiled vs 1.3 s of
+host work (build 0.196, alloc 0.349, inputs 0.223, outputs 0.551, pos-enc 0.034, fbank 0.000). The encoder is
+MUL_MAT-bound on int8 SDOT; the elementwise chain is already overlapped under it. That is why three
+bit-identical micro-optimisations of the elementwise path (copy removal, thread-partition threshold, index
+arithmetic) cut profiled CPU time by up to 28% and moved the wall clock by 0.0%.
+
+**3. Two pieces of per-step bookkeeping were pure waste, and one of them was a latent use-after-free.**
+`build_chunk_graph` rebuilt and re-allocated the whole ~4,000-node graph on every decode step (143 builds for
+145 steps on a 69 s clip) - and it returned a graph whose `ggml_context` it had already freed, so the graph
+lived in freed memory through alloc/compute/get_output and only survived on allocation luck. Owning the
+context and reusing the graph across steps (llama.cpp's pattern for streaming models) is bit-identical and
+worth ~3% of the composite, with p95 piece latency *improving* 101 -> 97 ms.
+
+**4. The transducer joint is a fourth cost centre that no profiler was showing.** It is a [5000 x 512] matvec
+per encoder frame in plain host C++ - 4.4 GMAC and 3.87 s per 69 s clip, 31% of the ASR leg - and the ggml
+eval-callback profile cannot see it at all. Two attacks failed and are documented in the source: four
+independent NEON accumulators (3.87 -> 3.84 s, with NEON genuinely enabled) and sharing one pass over the
+10.2 MB matrix across frames that share the decoder state (3.87 -> 6.43 s). The matrix is streamed at
+~4.5 GB/s with exactly one use per element, so the remaining lever is **bytes, not instructions**: f16 or
+q8_0 storage for the joint weights. That moves the logits, so it is a validation-and-re-bless change, not a
+byte-identity one.
+
+### The method that actually paid
+
+Both big wins came from the same move: **measure the phases of a "model-bound" leg before theorising about
+it.** Three separate times this session, a phase timer or an op/byte histogram found something that no
+amount of reasoning about the model would have: 40% of the diar leg in a scalar filterbank, a 4,000-node
+graph rebuilt per step, a use-after-free, and a 3.87 s matvec outside ggml entirely. The pattern to carry
+forward: for any leg someone calls "compute-bound", split it into (a) host phases around the engine call,
+(b) engine-internal phases, and (c) work that happens outside the engine entirely.
+
+### Current state and what is left
+
+Composite phone RTF is **0.307-0.314** (hot row) against a 0.4651-0.47 baseline, byte-identical throughout.
+The two files are now merged into one working GGUF (`--models-bundle`, neutral by design). Both legs are
+genuinely compute-bound in their kernels. The ranked remainder:
+
+1. **f16/q8_0 joint weights** - est. -6 to -10% composite, numerics-changing, validation path ready.
+2. **One-runtime merge** - the single pool is the only overlap form that can pay (the two-pool form lost
+   37-47%); ceiling is the 1.6-of-2-cores utilisation; the container merge is already in place to support it.
+3. **KleidiAI** - the only untried kernel-level lever, blocked on a network fetch for the `arm_llama` kernels.
+4. **ASR cache round-trip** (outputs 0.563 + inputs 0.278 s per clip) - ggml-native double-buffered caches;
+   bit-identical in principle, but expect it to be largely hidden under the matmuls like the other host work.
