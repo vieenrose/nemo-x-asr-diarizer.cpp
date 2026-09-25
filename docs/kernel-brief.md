@@ -85,6 +85,11 @@ Three mechanisms, in descending order of how much they are worth knowing:
 
 ## What to build, in order
 
+0. **Nothing to convert.** An earlier draft proposed converting the diar's weights to q8_0 to reach ggml's
+   `.nrows = 2` path, on the belief that they were q5_0 (which is hard-coded to `.nrows = 1`). They are already
+   q8_0, so the two-row path is already in use on both legs and there is nothing to win here. Recorded because
+   the idea is superficially very convincing and the belief underneath it was wrong.
+
 1. **A block-scoped Q8_0 activation cache** (mechanism 1) - **MEASURED, AND NOT WORTH BUILDING.** I counted the
    volume rather than assuming it (ggml's `g_ggml_quant_elems`, behind `GGML_COUNT_QUANT`): **180.8 M activation
    elements are quantised per 69 s clip** (118.8 M for the 45 s clip). That sounds like a lot until you divide by
@@ -137,3 +142,42 @@ timers around the engine calls (`NEMO_PROF`, `AUDIOCPP_PROF`) are sound and are 
 - A protocol row that is not thermally confounded: cool ~180 s first, or interleave candidate and baseline in
   one armed window. The row-to-row band is 0.4% cool and ~10% hot, and sub-1% claims are meaningless without
   that discipline.
+
+
+## 13. Correction: the GGUF type ids were being read with the wrong enum
+
+An earlier draft of this brief (and several ledger rows) described both models as shipping `q5_0` weights, and
+brief proposed converting the diar's `q5_0` tensors to `q8_0` so the matmuls would reach ggml's `.nrows = 2`
+dotprod path, which `q5_0` does not have. **Both claims were wrong, and the error was a measurement error
+rather than a modelling one.**
+
+These two vendored ggml copies number the quantised types `Q4_0 = 2, Q4_1 = 3, Q5_0 = 6, Q5_1 = 7, Q8_0 = 8`.
+The histograms that produced the "q5_0" story were read with the older llama.cpp numbering
+(`q8_0 = 7, q5_0 = 8`), in which type 8 means q5_0. In these trees type 8 is **q8_0**, so:
+
+* x-asr is 619 F32, 49 F16 and **298 Q8_0** - not q5_0.
+* the Nemotron-3 diarizer is **130 Q8_0** - which is what its filename always said - plus 229 tensors of an
+  audio.cpp-specific type id whose meaning has not been established (2.0 MB total, so not worth chasing).
+
+Two independent checks confirm the reading, and both were available before the claim was written:
+
+1. **Payload density.** 278,528 bytes for a 512x512 tensor is 1.0625 bytes/element - 8.5 bits - which is
+   q8_0's density exactly (34 bytes per 32 values) and not q5_0's (5.5).
+2. **ggml's own answer.** `gguf_get_tensor_size` reported the same 278,528 where my q5_0 arithmetic expected
+   180,224. When the library and your arithmetic disagree about a file format, the library is right; the useful
+   move is to ask it, which is what `gsize.c` in this session now does.
+
+What survives, and what does not:
+
+* **Does not survive:** "the diar's weights are q5_0", "the diar is missing the two-row dotprod path", and any
+  conversion motivated by either. The tools/requant_gguf.py written to do that conversion has been deleted
+  rather than left behind as a plausible-looking tool for a job that does not exist.
+* **Survives, and is reinforced:** weight format cannot help this composite. Every quantised ggml type declares
+  `vec_dot_type = Q8_0`, the shipped weights are already Q8_0, and Q8_0 is the type that gets `.nrows = 2` under
+  dotprod. The conclusion was right and the reasoning behind it was wrong, which is worth recording separately -
+  a right answer for the wrong reason will not survive the next person who looks at the evidence.
+* **Worth noting about the requantisation sweep:** its "all q8_0" arm was probably vacuous, because the model was
+  already q8_0. The other arms (q4_k, q4_0, iq4_nl, q6_k) were genuine conversions and tied or regressed, so the
+  sweep's conclusion stands; one arm of it just was not a test of anything.
+* **Unaffected:** every shape and timing measurement in this brief. Those came from the profilers, not from the
+  dtype histograms.

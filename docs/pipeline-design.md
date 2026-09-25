@@ -365,3 +365,17 @@ and a tool that reports results must be able to report failure.**
 3. Anything numerics-changing needs the paired validation, and the gate's four clips are the contract. A
    candidate can be WER-neutral and still need a deliberate re-bless if it moves speaker tags or segment
    boundaries - `--compare` now separates those cases explicitly.
+
+
+## 14. Correction: both models ship Q8_0, not q5_0 (see kernel-brief §13)
+
+Several rows in this session - and two drafts of the kernel brief - described the models' weights as `q5_0`.
+They are `Q8_0`. These ggml copies number the quantised types `Q5_0 = 6, Q8_0 = 8`; the histograms were read
+with the older llama.cpp numbering in which 8 meant q5_0. Confirmed independently by payload density (8.5
+bits/element, which is q8_0's) and by `gguf_get_tensor_size` disagreeing with the q5_0 arithmetic.
+
+The conclusion it supported - weight format cannot help here, because every quantised type dots through
+`vec_dot_q8_0` and int8 SDOT is the fastest arithmetic the core has - is unchanged and in fact reinforced: the
+weights are already in the type that gets the two-row dotprod path. But the reasoning was wrong, and a right
+answer for the wrong reason does not survive the next person who reads the evidence. Full account, including
+the conversion tool that was written and then deleted, in kernel-brief §13.
