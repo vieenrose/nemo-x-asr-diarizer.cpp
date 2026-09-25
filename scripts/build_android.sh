@@ -36,7 +36,9 @@ cmake -S "$A" -B "$A/build-android" \
   -DANDROID_ABI=$ABI -DANDROID_PLATFORM=android-$API -DCMAKE_BUILD_TYPE=Release \
   -DBUILD_SHARED_LIBS=OFF -DAUDIOCPP_BUILD_C_API=ON \
   -DCMAKE_SHARED_LINKER_FLAGS="-llog" >/dev/null
-cmake --build "$A/build-android" --target audiocpp -j"$(nproc)" >/dev/null
+cmake --build "$A/build-android" --target audiocpp -j"$(nproc)" > /tmp/ar_audiocpp_build.log 2>&1 || {
+  echo "audiocpp build FAILED (a stale library would be linked and measured as if it were the change):"
+  grep -E "error|Error" /tmp/ar_audiocpp_build.log | head -10; exit 1; }
 SO=$A/build-android/bin/libaudiocpp.so
 [ -f "$SO" ] || { echo "no $SO"; exit 1; }
 LEAK=$($READER --dyn-syms "$SO" 2>/dev/null | grep -cE ' (ggml|gguf)_' || true)
@@ -55,7 +57,9 @@ if [ -f "$ROOT/patches/crispasr-token-times.patch" ] &&
    git -C "$C" apply --check "$ROOT/patches/crispasr-token-times.patch" 2>/dev/null; then
   git -C "$C" apply "$ROOT/patches/crispasr-token-times.patch" && echo "   applied token-times patch"
 fi
-cmake --build "$C/build-android" --target xasr -j"$(nproc)" >/dev/null
+cmake --build "$C/build-android" --target xasr -j"$(nproc)" > /tmp/ar_crispasr_build.log 2>&1 || {
+  echo "CrispASR build FAILED (a stale archive would be linked and measured as if it were the change):"
+  grep -E "error|Error" /tmp/ar_crispasr_build.log | head -10; exit 1; }
 if $NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm --defined-only "$C/build-android/src/libxasr.a" 2>/dev/null \
      | grep -q xasr_stream_token_times; then
   TIMES="-DNEMO_HAVE_TOKEN_TIMES"; echo "   exact token timestamps: available"

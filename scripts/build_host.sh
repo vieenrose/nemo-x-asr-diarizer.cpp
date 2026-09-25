@@ -25,7 +25,9 @@ echo "== audio.cpp C API (shared, ggml hidden inside)"
 # missing checkout rather than a switched-off option.
 cmake -S "$A" -B "$A/build-host" -DCMAKE_BUILD_TYPE=Release -DAUDIOCPP_BUILD_C_API=ON \
       -DENGINE_ENABLE_NATIVE_CPU="${NATIVE_CPU:-ON}" -DENGINE_ENABLE_OPENMP=ON >/dev/null
-cmake --build "$A/build-host" --target audiocpp -j"$THREADS" >/dev/null
+cmake --build "$A/build-host" --target audiocpp -j"$THREADS" > /tmp/ar_audiocpp_host.log 2>&1 || {
+  echo "audiocpp host build FAILED (a stale .so would be measured as if it were the change):"
+  grep -E "error|Error" /tmp/ar_audiocpp_host.log | head -10; exit 1; }
 LIB_DIAG="$A/build-host/bin/libaudiocpp.so"
 [ -f "$LIB_DIAG" ] || { echo "ERROR: $LIB_DIAG not produced" >&2; exit 1; }
 if nm -D --defined-only "$LIB_DIAG" | grep -qE " T ggml_| T gguf_"; then
@@ -49,7 +51,9 @@ if [ -f "$ROOT/patches/crispasr-token-times.patch" ]; then
 fi
 cmake -S "$C" -B "$C/build-host" -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON >/dev/null
 for t in xasr crispasr-core ggml ggml-base ggml-cpu; do
-  cmake --build "$C/build-host" --target "$t" -j"$THREADS" >/dev/null
+  cmake --build "$C/build-host" --target "$t" -j"$THREADS" > /tmp/ar_crisp_host.log 2>&1 || {
+    echo "crispasr host build FAILED for target $t (a stale archive would be measured as if it were the change):"
+    grep -E "error|Error" /tmp/ar_crisp_host.log | head -10; exit 1; }
 done
 
 echo "== composite"
