@@ -7,14 +7,18 @@
 # version script keeps its ggml out of the global symbol table, and the ASR comes in as static CrispASR.
 #
 # Layout expected (override with DEPS_ROOT):
-#   $DEPS_ROOT/crispasr     https://github.com/CrispStrobe/CrispASR        (measured at cb6171b)
-#   $DEPS_ROOT/audiocpp     https://github.com/0xShug0/audio.cpp           (measured at fc24c99)
+#   $DEPS_ROOT/crispasr     https://github.com/CrispStrobe/CrispASR        (exact heads in deps.lock)
+#   $DEPS_ROOT/audiocpp     https://github.com/0xShug0/audio.cpp           (exact heads in deps.lock)
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 DEPS_ROOT=${DEPS_ROOT:-$(for c in ../ref ../../ref ../deps; do [ -d "$ROOT/$c/crispasr" ] && { echo "$(cd "$ROOT/$c" && pwd)"; break; }; done)}
 [ -n "${DEPS_ROOT:-}" ] || { echo "ERROR: no upstream checkouts found - set DEPS_ROOT to a dir containing crispasr/ and audiocpp/" >&2; exit 1; }
 C="$DEPS_ROOT/crispasr"; A="$DEPS_ROOT/audiocpp"
+
+# Refuse to build against dependency worktrees that are not the state this project was measured
+# against: a silently stale dependency is indistinguishable from a failed optimisation.
+bash scripts/check_deps.sh || exit 1
 THREADS=${THREADS:-$(nproc)}
 [ -d "$C" ] || { echo "ERROR: $C missing" >&2; exit 1; }
 [ -d "$A" ] || { echo "ERROR: $A missing" >&2; exit 1; }

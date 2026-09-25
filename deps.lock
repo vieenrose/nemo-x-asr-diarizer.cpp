@@ -1,0 +1,20 @@
+# Pinned state of the two dependency worktrees this project builds against.
+#
+# WHY THIS FILE EXISTS: the composite links CrispASR (static, with its own vendored ggml) and audio.cpp
+# (shared, with a second hidden ggml). Both live in SEPARATE repositories outside this one, so nothing here
+# tracked them - and every optimisation of this session lives in those repos, not in this one. A clean
+# checkout would therefore rebuild the 0.47 baseline while the ledger claimed 0.269. scripts/check_deps.sh
+# compares the worktrees against this file and the build scripts refuse to continue on drift, because a
+# silently stale dependency is indistinguishable from a failed optimisation.
+#
+# What the pinned commits contain (all measured on the phone, armed):
+#   crispasr 6b93fc1  graph-reuse + latent-use-after-free fix; f16 transducer joint (3.5x on that phase);
+#                     host phase timers; GGUF tensor-name prefix support for the merged bundle
+#   crispasr/ggml     work-size threshold for small copy/elementwise ops; removal of a per-element 64-bit
+#                     division in the strided binary-op index (both bit-identical, both measured 0% here)
+#   audiocpp   428d924  mel filterbank skips its 98.5% zero weights and drops software quad precision
+#                     (frontend 18x, the session's largest win); no padding of streaming encoder windows;
+#                     tensor-name list may prefix the file's tensor list (bundle support); phase timers
+crispasr=6b93fc1
+crispasr_ggml=32d6394
+audiocpp=428d924

@@ -15,6 +15,10 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+
+# Refuse to build against dependency worktrees that are not the state this project was measured
+# against: a silently stale dependency is indistinguishable from a failed optimisation.
+bash scripts/check_deps.sh || exit 1
 NDK=${NDK:-/tmp/ndk/android-ndk-r26d}
 ABI=${ABI:-arm64-v8a}
 API=${API:-33}
