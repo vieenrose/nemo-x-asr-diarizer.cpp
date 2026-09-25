@@ -17,4 +17,4 @@
 #                     tensor-name list may prefix the file's tensor list (bundle support); phase timers
 crispasr=f8bfb70
 crispasr_ggml=66fb373
-audiocpp=88549f8
+audiocpp=44c4f36
