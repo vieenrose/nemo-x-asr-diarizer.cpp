@@ -21,6 +21,34 @@ its real MAC count is roughly 5x higher and its efficiency is correspondingly lo
 the same ~4.9 ms per frame is a coincidence of size, not a shared bottleneck - but it does mean a kernel win
 applies to both legs almost equally.
 
+## Why: the shapes are skinny, and that is now measured
+
+The race-free profiler (`XASR_PROF`, per-thread accumulators) with a MUL_MAT histogram answers the question
+this brief previously said was inferable. On chat69 (`--no-diar`, armed):
+
+| k x n | calls | us/call | share of accounted time |
+|-------|-------|---------|------------------------|
+| 512 x 6 | 9,344 | 166 | 7.9% |
+| 768 x 3 | 5,840 | 230 | 6.9% |
+| 1536 x 3 | 2,190 | 303 | 3.4% |
+| 256 x 12 | 4,672 | 101 | 2.4% |
+| 1152 x 6 | 2,336 | 187 | 2.2% |
+
+Essentially **all** of the encoder's matmul time is in calls with **n between 3 and 24 columns**, and the top 12
+of 54 distinct shapes cover about a third of it. The cause is structural: the encoder downsamples time by
+[1, 2, 4, 8, 4, 2] across its six stages, so a 24-frame chunk arrives at the deep stages as 6, 3 and 3
+columns - and those deep, wide stages (dims 512-768, ffn 1536-2048) hold most of the parameters. A GEMM with
+n=3 gets single-digit percent of peak no matter how good the kernel is: there is no reuse of the weight matrix
+across columns to amortise the stream, and the per-call setup and thread barrier dominate.
+
+**This has a consequence that rules out the usual remedy.** Batching skinny GEMMs is the standard fix, and it
+is unavailable here: the number of columns IS the number of time frames after downsampling, which the model's
+streaming chunk fixes. Enlarging the chunk is exactly the change measured at +5.9 WER on the primary gate clip,
+and halving the step count while keeping the same rows would recompute rows the model already emitted. So the
+skinny shape cannot be engineered away in-graph - it has to be handled by a kernel that is good at n=3, which
+is precisely what a tuned small-N GEMM path is for. That is a sharper requirement than "make the GEMM faster":
+**the kernel must be fast at n = 3-24, k = 512-2560.**
+
 ## Why the current path leaves 4-7x on the table
 
 Three mechanisms, in descending order of how much they are worth knowing:
@@ -49,9 +77,10 @@ Three mechanisms, in descending order of how much they are worth knowing:
    build it. (The measurement is also a useful cross-check on the rest of this brief: it is what reconciled the
    apparent 100x gap between '12.4 M MACs per frame' and '180 M quantised elements per clip' - the ratio is
    simply the average number of output rows per activation element.)
-2. **A specialised Q5_0 x Q8_0 GEMM for the shapes these two models actually use** (mechanisms 2-3). The brief
-   for the kernel: k in {512, 1536, 2048}, n in {12, 24, 48, 380, 508}, int8 accumulate into int32, output f32,
-   two threads on two A78s. This is what KleidiAI's `ai_micro_kernels` provides, and it is the reason that
+2. **A specialised Q5_0 x Q8_0 GEMM for the shapes these two models actually use** (mechanisms 2-3), now with
+   the shape requirement measured rather than assumed: **k in {192..2560}, n in {3, 6, 12, 24}** for the x-asr
+   encoder, plus n in {380, 508} for the diar. int8 accumulate into int32, output f32, two threads on two A78s.
+   The small-N path is the one that matters; a kernel tuned for large N would not help this workload at all. This is what KleidiAI's `ai_micro_kernels` provides, and it is the reason that
    dependency is the only open lever: both vendored ggml copies ship the glue (`kleidiai.h`, `kernels.h`, the
    CMake option) but no `ai_micro_kernels` exists anywhere on this machine, so the build cannot be completed
    offline. KleidiAI accumulation order differs from ggml's, so it needs the paired validation and a
