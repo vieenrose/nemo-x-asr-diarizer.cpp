@@ -84,7 +84,29 @@ void harvest_turns(const audiocpp_result* r, std::vector<Turn>& out) {
     }
 }
 
+namespace {
+// Read the file in strides so the page cache holds it. A plain read() of the whole file into a buffer would
+// cost an allocation the size of the model; 64 KB at a time is enough to fault every 4 KB page in.
+void prefault_file(const std::string& path) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return;
+    std::fseek(f, 0, SEEK_END);
+    const long sz = std::ftell(f);
+    std::rewind(f);
+    char buf[65536];
+    volatile long got = 0;
+    for (long off = 0; off < sz; off += (long)sizeof buf) {
+        const size_t n = std::fread(buf, 1, sizeof buf, f);
+        if (!n) break;
+        got += (long)buf[0];           // touch, or the compiler may drop the read
+    }
+    (void)got;
+    std::fclose(f);
+}
+}  // namespace
+
 bool Engine::init(std::string& err) {
+    const double init_t0 = now_s();
     {                                    // thread-count probe, its own scope on purpose
         DIR* d0 = opendir("/proc/self/task");
         int n0 = 0; if (d0) { while (readdir(d0)) n0++; closedir(d0); }
@@ -169,7 +191,8 @@ bool Engine::init(std::string& err) {
         }
         if (st != AUDIOCPP_OK) { err = std::string("diar stream_start: ") + audiocpp_last_error(); return false; }
     }
-    stats_.load_s = now_s() - t0;
+    if (cfg_.prefault) prefault_file(cfg_.xasr_model), prefault_file(cfg_.diar_model);
+    stats_.load_s = now_s() - t0;   // the prefault is deliberately INSIDE this: the point is to charge it
     double latency = cfg_.asr_latency_ms;
     if (latency < 0) latency = cfg_.chunk_ms;    // the encoder's own window is its floor
     fusion_ = Fusion(16000, latency / 1000.0);

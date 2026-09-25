@@ -85,6 +85,7 @@ int main(int argc, char** argv) {
         else if (a == "--main-affinity") cfg.main_affinity = std::strtol(next("--main-affinity"), nullptr, 16);
         else if (a == "--engine-affinity") cfg.engine_affinity = std::strtol(next("--engine-affinity"), nullptr, 16);
         else if (a == "--windows") windowed = true;
+        else if (a == "--prefault") cfg.prefault = true;
         else if (a == "--diar-no-finish") cfg.diar_no_finish = true;
         else if (a == "--diar-tail-ms") cfg.diar_tail_ms = atoi(next("--diar-tail-ms"));
         else if (a == "--window-ms") window_s = atof(next("--window-ms")) / 1000.0;
@@ -271,9 +272,9 @@ int main(int argc, char** argv) {
         std::printf(" \"text\": \"%s\"\n}\n", eng.transcript().c_str());
     } else {
         std::printf("\n[stats] audio %.2fs wall %.2fs rtf %.4f  asr %.2fs + diar %.2fs  first partial %.3fs  "
-                    "p95 piece %.1fms  peak RSS %.0fMB  cpu %.1fs (%.2f cores)\n",
+                    "p95 piece %.1fms  peak RSS %.0fMB  cpu %.1fs (%.2f cores)  load %.2fs\n",
                     st.audio_s, st.wall_s, st.wall_s / st.audio_s, st.asr_compute_s, st.diar_compute_s,
-                    st.first_partial_s, st.piece_p95_ms, st.peak_rss_mb, st.cpu_s, st.cpu_s / st.wall_s);
+                    st.first_partial_s, st.piece_p95_ms, st.peak_rss_mb, st.cpu_s, st.cpu_s / st.wall_s, st.load_s);
         std::printf("[timing]  %s over %zu tokens\n",
                     st.timing_mode == 1 ? "model token timestamps (40 ms grid)" : "inferred placement", st.tokens);
         std::printf("[diar]    %zu turns, %zu speakers; %zu segments, %zu unattributed, %zu by proximity fill; first turn at "

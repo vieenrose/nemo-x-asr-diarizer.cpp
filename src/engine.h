@@ -26,6 +26,12 @@ struct Config {
     // first should let the flush reuse an already-built graph. 0 = today's behaviour.
     int diar_tail_ms = 0;
 
+    // Touch every page of both model files before the run loop starts. NOT a speedup mechanism: it moves
+    // first-pass page faults out of the measured window and into load_s. Kept because it settles whether
+    // faults matter on this device at all - and because the honest comparison for any "warm up at load"
+    // idea is load_s + wall_s, not wall_s alone.
+    bool prefault = false;
+
     // Skip audiocpp_stream_finish and keep only the turns the stream already committed as events. The finish
     // call costs ~7-9 s per stream REGARDLESS of clip length (3 s clip 7.27, 15 s 8.59, 45 s 8.74, 69 s 8.55)
     // - a fixed prepare/flush, not work proportional to audio. Whether those turns were needed is the test.
@@ -124,6 +130,10 @@ struct Stats {
     // expected value is well under the 2 cores the mask allows - and it separates "CPU-bound and efficient"
     // from "CPU-bound but only one core is working".
     double cpu_s = 0;
+    // Wall time of Engine::init (model loads). The RTF metric counts the run loop only, so anything moved
+    // into init would look like a speedup without being one. Printing it makes that visible: the honest
+    // comparison for any "warm up at load" idea is init_s + wall_s, not wall_s.
+
     double prof_pushdelta_s = 0, prof_tokenbuild_s = 0, prof_attrfinal_s = 0, prof_drain_s = 0;
 };
 
