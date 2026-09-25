@@ -182,3 +182,49 @@ the graph.
 with the residual risk in bookkeeping - and with a clear instruction for de-risking it: port ONE layer, compare
 it against audio.cpp's own output for the same input, and only then extend. The cheapest way to do that is a
 debug dump of layer 0's input and output on the audio.cpp side, which is a small env-gated change.
+
+## 8. Appendix: the exact op sequence a port must reproduce
+
+Extracted from `audiocpp/src/models/nemotron_3_diar/encoder.cpp` and the module lowerings, because the port's
+only remaining risk is sequencing rather than numerics (§7). Shapes below use ggml's `ne` order
+(`ne[0]` fastest). Input is `[1, T, 512]` logically, i.e. a `[512, T]` tensor.
+
+**The subtlety that makes this mechanical:** audiocpp's `TensorShape` is *logical* `[..., seq, hidden]`, while
+a ggml tensor is `[hidden, seq]`. `LinearModule` therefore needs **no transpose and no cont** - `mul_mat`
+already produces `[out, seq]`, which the logical shape reinterprets as `[..., seq, out]`. The only conts in the
+whole layer are the ones `ensure_backend_addressable_layout` inserts after a *slice* or a *permute*, where the
+memory layout really does stop matching.
+
+```
+# --- LayerNormModule({hidden, eps, use_weight=true, use_bias=true})
+# NOTE: plain ggml_norm, i.e. mean-square WITHOUT bias subtraction; bias is a post-norm shift.
+n1 = ggml_add(ggml_mul(ggml_norm(x, eps), norm1.weight), norm1.bias)
+
+# --- build_attention
+qkv    = ggml_mul_mat(w_qkv, reshape(n1, [512, T]))            # w_qkv ne=[1536,512]; no bias
+qkv    = cont_if_not_addressable(qkv)                          # ensure_backend_addressable_layout
+# per part p in {q:0, k:512, v:1024}:
+#   v_p = slice(qkv, feature offset, 512) ; cont_if_needed ; reshape [1,T,16,32] ; permute{0,2,1,3}
+# SplitRoPE applies to q and k only:
+#   out[0:hd/2] = x1*cos - x2*sin ; out[hd/2:] = x2*cos + x1*sin      (sub/mul/add)
+attn   = ggml_flash_attn_ext(q, k, v, mask, 1/sqrt(32), 0.0f, 0.0f)
+         ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32)     # k and v passed as VIEWS (view_kv=true)
+attn   = cont_if_not_addressable(attn) ; reshape to [512, T]
+o_proj = ggml_add(ggml_mul_mat(out_proj.weight, attn), out_proj.bias)
+
+# --- residual, then the FFN
+x1     = ggml_add(x, o_proj)
+n2     = ggml_add(ggml_mul(ggml_norm(x1, eps), norm2.weight), norm2.bias)
+# ffn_in is net.3 (ne=[2048,512]: hidden->intermediate); ffn_out is net.0 (ne=[512,2048])
+h      = ggml_add(ggml_mul_mat(ffn.net.3.weight, reshape(n2,[512,T])), ffn.net.3.bias)
+h      = ggml_gelu_erf(h)                                      # ExactErf, NOT ggml_gelu
+out    = ggml_add(ggml_mul_mat(ffn.net.0.weight, reshape(h,[2048,T])), ffn.net.0.bias)
+layer_out = ggml_add(x1, out)
+```
+
+Weights arrive as BF16 (`norm*`, all biases) and Q8_0 (the four matrices); the loader's `ensure_f32` converts
+the BF16 ones, so a port must do the same conversion rather than feeding BF16 tensors to `ggml_norm`.
+
+**What is left to discover, and it is small:** the exact `cos`/`sin` table layout `SplitRoPEModule` validates,
+and the exact `mask` tensor the encoder builds (`[1,1,T,T]` F16 with `-10000` outside the valid length). Both
+are visible in the same two files. Everything else above is read directly off the source.
