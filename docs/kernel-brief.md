@@ -157,7 +157,8 @@ The histograms that produced the "q5_0" story were read with the older llama.cpp
 
 * x-asr is 619 F32, 49 F16 and **298 Q8_0** - not q5_0.
 * the Nemotron-3 diarizer is **130 Q8_0** - which is what its filename always said - plus 229 tensors of an
-  audio.cpp-specific type id whose meaning has not been established (2.0 MB total, so not worth chasing).
+  audio.cpp-specific type id, which `tools/gguf_inventory.py` resolves by density to **16 bits per element**
+  (F16/BF16-class storage: the norms and biases, 1.0 M elements, 2.0 MB).
 
 Two independent checks confirm the reading, and both were available before the claim was written:
 
@@ -181,3 +182,22 @@ What survives, and what does not:
   sweep's conclusion stands; one arm of it just was not a test of anything.
 * **Unaffected:** every shape and timing measurement in this brief. Those came from the profilers, not from the
   dtype histograms.
+
+
+## 14. The audit that would have caught it, and what it says
+
+`tools/gguf_inventory.py` reports every tensor by type **and by bits per element**, where the density comes
+from the payload size and the element count alone - no enum involved. Run on both models:
+
+| model | type | tensors | elements | bits/elem | verdict |
+|-------|------|---------|----------|-----------|---------|
+| x-asr | Q8_0 | 298 | 151.0 M | 8.50 | matches Q8_0 |
+| x-asr | F32 | 619 | 1.6 M | 32.00 | matches F32 |
+| x-asr | F16 | 49 | 0.6 M | 16.00 | matches F16 |
+| diar | Q8_0 | 130 | 98.2 M | 8.50 | matches Q8_0 |
+| diar | type30 | 229 | 1.0 M | 16.00 | F16/BF16-class: the norms and biases |
+| diar | F32 / F16 | 1 / 2 | - | 32 / 16 | matches |
+
+A tensor labelled `q5_0` that occupies 8.5 bits per element is visibly not a `q5_0`, whatever the type id
+says - so this table is self-checking, and the cross-check against `gguf_get_tensor_size` is the second half.
+Both halves are cheap; the error they prevent was not.
