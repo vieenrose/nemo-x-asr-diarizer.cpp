@@ -13,13 +13,13 @@ core offers — and the measured efficiency is **13-20% of that peak**.
 
 | leg | useful MACs per emitted frame | measured cost per frame | effective rate |
 |---|---|---|---|
-| x-asr encoder | 12.4 M (19 layers: dims 192/256/512/768/512/256, ffn 512/768/1536/2048/1536/768) | ~4.9 ms | ~12.7 G MAC/s |
-| diar encoder | 97.5 M (31 layers, hidden 512, ffn 2048, qkv 1536) | ~4.9 ms | ~20 G MAC/s |
+| x-asr encoder | 12.4 M useful (19 layers: dims 192/256/512/768/512/256, ffn 512/768/1536/2048/1536/768), run at **n = 3-24** | ~4.9 ms | ~12.7 G MAC/s |
+| diar encoder | 97.5 M (31 layers, hidden 512, ffn 2048, qkv 1536), run at **n = 351-548** | ~4.9 ms | ~20 G MAC/s |
 
 The x-asr figure is *useful* work; the graph actually evaluates a 61-row window to emit 12 encoder frames, so
 its real MAC count is roughly 5x higher and its efficiency is correspondingly lower. The two legs landing on
-the same ~4.9 ms per frame is a coincidence of size, not a shared bottleneck - but it does mean a kernel win
-applies to both legs almost equally.
+the same ~4.9 ms per frame is a coincidence of size, not a shared bottleneck - and the shape measurement below
+shows they are not even the same problem.
 
 ## Why: the shapes are skinny, and that is now measured
 
@@ -41,7 +41,25 @@ columns - and those deep, wide stages (dims 512-768, ffn 1536-2048) hold most of
 n=3 gets single-digit percent of peak no matter how good the kernel is: there is no reuse of the weight matrix
 across columns to amortise the stream, and the per-call setup and thread barrier dominate.
 
-**This has a consequence that rules out the usual remedy.** Batching skinny GEMMs is the standard fix, and it
+**The diar leg is the opposite case, and it is the better target.** Measured structurally on the same clip
+(AUDIOCPP_PROF, chat69): its MUL_MAT shapes are **k = 512 / 1536 / 2048 with n = 351, 380 and 548** - 20 to 30
+nodes per shape per window, 3.7-11.6 M elements each. Those are *conventional* GEMM shapes: hundreds of columns,
+plenty of cross-column reuse, the regime any tuned int8 kernel is designed for. It also explains the measured
+efficiency gap between the legs (diar ~20 G MAC/s versus x-asr ~12.7) without appealing to kernel quality at
+all: same library, same instruction set, different shapes.
+
+So the two legs are **different kernel problems**, and the ranking inverts:
+
+| leg | n | what a tuned kernel can do | difficulty |
+|-----|---|--------------------------|-----------|
+| diar encoder | 351-548 | the ordinary case: 2-3x is plausible, no structural obstacle | moderate - it is a drop-in GEMM replacement |
+| x-asr encoder | 3-24 | only a dedicated small-N path helps; large-N work is irrelevant | high - and batching is impossible (below) |
+
+**Prioritise the diar.** It is roughly a quarter of the composite (14.9 s of 60.9 s), it is already feeding
+kernels the right shape, and it is the leg this project has spent the least time on. If the small-N kernel work
+ever becomes possible, it is a second project - not the first.
+
+**This has a consequence that rules out the usual remedy for the ASR.** Batching skinny GEMMs is the standard fix, and it
 is unavailable here: the number of columns IS the number of time frames after downsampling, which the model's
 streaming chunk fixes. Enlarging the chunk is exactly the change measured at +5.9 WER on the primary gate clip,
 and halving the step count while keeping the same rows would recompute rows the model already emitted. So the
