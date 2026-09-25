@@ -15,20 +15,43 @@ disagree about a format, the library is right.
 Usage: gguf_inventory.py MODEL.gguf [MODEL.gguf ...]
 """
 import collections
+import os
 import sys
 
 sys.path.insert(0, __file__.rsplit('/', 1)[0])
 import merge_gguf as M   # noqa: E402
 
-# Type ids as THESE vendored ggml trees number them. Only used for the label; the density column is the
-# part that cannot be wrong.
-NAMES = {0: 'F32', 1: 'F16', 2: 'BF16', 3: 'Q4_0', 4: 'Q4_1', 6: 'Q5_0', 7: 'Q5_1', 8: 'Q8_0',
-         9: 'Q8_1', 10: 'Q2_K', 11: 'Q3_K', 12: 'Q4_K', 13: 'Q5_K', 14: 'Q6_K', 15: 'Q8_K',
-         # 30 is plain GGML_TYPE_BF16 in BOTH vendored trees. It was recorded here as an unknown
-         # "audio.cpp-specific" id until the enum was read; the density said 16 bits and the enum says
-         # BF16, and the enum is what the loader uses. Another case of assuming custom when it was standard.
-         30: 'BF16'}
+# Type ids are DERIVED from a ggml header, never hardcoded. This file exists because a hand-written enum
+# produced a confident, wrong story twice in one session: first by reading type 8 as q5_0 when these trees
+# number it Q8_0, and then by labelling type 2 BF16 when it is Q4_0 (BF16 is 30). Both trees in this repo carry
+# the SAME enum - Q4_0=2, Q4_1=3, Q5_0=6, Q5_1=7, Q8_0=8, BF16=30 - but a map written from memory is exactly
+# the thing that goes wrong, so parse it instead. The density column remains the check that needs no enum at all.
+import re as _re
 
+DEFAULT_HEADERS = [
+    os.path.join(os.path.dirname(__file__), '..', '..', 'ref', 'crispasr', 'ggml', 'include', 'ggml.h'),
+    os.path.join(os.path.dirname(__file__), '..', '..', 'ref', 'audiocpp', 'external', 'ggml', 'include', 'ggml.h'),
+]
+
+
+def load_type_names(headers=None):
+    names = {}
+    for h in (headers or DEFAULT_HEADERS):
+        try:
+            text = open(h, encoding='utf-8', errors='replace').read()
+        except OSError:
+            continue
+        start = text.find('enum ggml_type')
+        if start < 0:
+            continue
+        body = text[start:text.find('};', start)]
+        for name, value in _re.findall(r'(GGML_TYPE_[A-Z0-9_]+)\s*=\s*(\d+)', body):
+            names.setdefault(int(value), name.replace('GGML_TYPE_', ''))
+        break
+    return names or {0: 'F32', 1: 'F16', 2: 'Q4_0', 6: 'Q5_0', 8: 'Q8_0', 30: 'BF16'}
+
+
+NAMES = load_type_names()
 
 def payload_bytes(model, i):
     t = model['tensors'][i]

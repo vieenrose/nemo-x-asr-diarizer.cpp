@@ -47,8 +47,11 @@ Plus one merged GGUF (`--models-bundle`), measured neutral by design.
 ## Measured out — do not retry without a changed assumption
 
 - Leg concurrency / diar on a worker thread: 37-47% slower; also pointless given the sum-of-parts floor.
-- Requantising x-asr (q4_k / q4_0 / iq4_nl / q6_k / all-q8_0): no win, some worse - and now closed by
-  arithmetic rather than by measurement. Every quantised type declares `vec_dot_type = Q8_0`, so the dot is
+- Requantising x-asr (q4_k / q4_0 / iq4_nl / q6_k / all-q8_0). Re-measured properly at 0.4% noise with an
+  accuracy check: **Q4_0 is 3-10% faster and 72 MB smaller, and costs 32 WER points** (gate 0.1765 -> 0.4941
+  against a 0.18 ceiling). The old "it ties" was measured in the +/-10% noise era with no WER check - wrong on
+  both axes at once. Closed on evidence, and the arithmetic (Q8_0 is already the int8 SDOT path, the core's
+  fastest) explains why nothing above Q4_0 can help. Every quantised type declares `vec_dot_type = Q8_0`, so the dot is
   int8 SDOT whatever the weights are; on A78 (2x128-bit NEON, ARMv8.2) int8 is ~4x fp32 and fp16 FMLA ~2x,
   so both models already sit on the fastest arithmetic the core has. f16 weights would move the diar encoder
   from the 4x path to the 2x path and roughly double its matmul time. Fewer FLOPs (different model) or a

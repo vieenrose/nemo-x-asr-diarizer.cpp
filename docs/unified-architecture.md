@@ -121,3 +121,51 @@ design problem of the whole proposal, and it is visible only because the shape c
 **The one-sentence version:** recycle the ASR wholesale and the diar's 1.9 MB head, discard the diar's
 99.7 MB encoder, and do it only if a frozen-trunk adapter can recover speaker separation — because the
 measurements say the win is in *not running a second encoder*, not in running two more cheaply.
+
+
+## 5. What is possible with zero training, and what it is worth
+
+B and C both need training, so the zero-training scope is A plus whatever is already on the table. Two things
+changed while answering this, both corrections to my own record.
+
+### The last format knob, measured on both axes (and it was never a tie)
+
+The ledger said "requantisation ties or regresses", measured in the +/-10% noise era and without checking
+accuracy. Re-run properly with today's 0.4% band, Q4_0 on the x-asr (the one quantised type that also gets
+ggml's `.nrows = 2` while halving bytes):
+
+| model | size | chat69 | gate_ms_v2 | peak RSS | gate WER |
+|---|---|---|---|---|---|
+| Q8_0 (shipped) | 160.4 MB | 11.42 s | 7.86 s | 259 / 254 MB | **0.1765** |
+| Q4_0 | 88.4 MB | 11.04 s (-3.3%) | 7.07 s (-10.1%) | 187 / 182 MB | **0.4941** |
+
+So weight format *does* matter, in both directions: Q4_0 buys 3-10% and 72 MB and costs **32 WER points**
+against a 0.18 ceiling. The old "it ties" was a measurement made before the noise floor was known and without
+an accuracy check - two ways of being wrong at once. The format lever is now closed on evidence rather than on
+inference.
+
+### The zero-training prize, priced two ways
+
+Per-leg core usage on the same clip, armed, back to back:
+
+| leg | wall | cpu | cores |
+|-----|------|-----|-------|
+| ASR | 11.69 s | 20.0 core-s | 1.71 |
+| diar | 7.50 s | 14.5 core-s | 1.93 |
+
+Sequential today: **19.19 s**. Perfect packing of the same work onto two cores: **17.25 s**. That is **-10.1%**,
+and the same number falls out of the weighted idle mask (14.5% idle during the ASR leg, 3.3% during diar).
+
+So the honest zero-training summary is:
+
+* **Banked already**: the mel filterbank (18x on that phase), the f16 joint (3.5x on that phase), graph reuse
+  across decode steps, no window padding, the 128-to-40 frame spkcache reduction. Composite 0.4651 -> ~0.269.
+* **Available, zero training**: tier A - one runtime, one pool, one arena, one mel pass, and up to **-10%** from
+  overlapping the two graphs. Numerically de-risked (the runtimes agree bit-for-bit on the whole op vocabulary
+  *and* on this model's real Q8_0 weights), but it is a multi-day port.
+* **Not available without training**: anything that fixes the ASR's 44%-of-plateau shape problem, and anything
+  that avoids running the diar's 99.7 MB encoder. Both need a trained trunk, and both are where the real money
+  is.
+
+The uncomfortable summary: with zero training, the remaining work is a consolidation project worth about a
+tenth, not a performance project. The performance work left is all downstream of training.
