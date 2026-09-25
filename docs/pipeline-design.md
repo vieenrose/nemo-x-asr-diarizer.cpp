@@ -297,3 +297,71 @@ The mistake was reading a mask that exists as a causal mask. It is worth stating
 cache on top of an attention mask, check whether the mask is indexed by POSITION or only by VALIDITY.** A
 validity mask says "ignore the padding"; a causal mask says "ignore the future". They look similar in code and
 mean opposite things, and only one of them makes incremental decoding legal.
+
+## 12. Status: where this ended, and how to resume
+
+**Composite phone RTF 0.4651 -> 0.2659 (-42.8%)**, byte-identical on the four gate clips throughout, with
+first-partial latency *improved* 0.32 s -> 0.25 s and p95 piece latency 101 ms -> 78 ms. Seven consecutive
+protocol rows sit inside 0.2659-0.2695 (0.4%), after a cooldown so the thermal confound is controlled.
+
+### The five kept changes, in order of what they were worth
+
+| # | change | repo | effect | numerics |
+|---|--------|------|--------|----------|
+| 1 | mel filterbank: skip the 98.5% of weights that are exactly zero, and stop accumulating in `long double` (software quad precision on ARM64) | audiocpp | **-16.6%** | bit-identical |
+| 2 | transducer joint matrix f16 (a [5000x512] matvec per frame, 10.2 MB streamed per frame) | crispasr | **-12%** composite, -19% ASR leg | gate + all 11 validation WERs identical |
+| 3 | diar speaker cache 264 -> 128 frames | this repo | **-9%** | re-blessed on 11-clip evidence |
+| 4 | build the x-asr chunk graph once instead of per step (also fixed a latent use-after-free) | crispasr | -1.8% | bit-identical |
+| 5 | stop padding diar streaming windows up to the configured capacity | audiocpp | -1.2% | bit-identical |
+
+Plus one deployment change, measured **neutral by design**: both models merged into a single GGUF
+(`tools/merge_gguf.py`, `--models-bundle`), which reproduces the blessed transcript hash exactly.
+
+### The method that produced all of it
+
+Every large win came from disbelieving a label rather than a number. Three separate legs were called
+"model-bound" and each was carrying work no model profiler could see:
+
+1. **Phase timers around the engine call** found 40% of the diar leg in a scalar mel filterbank.
+2. **Phase timers inside the streaming loop** found a 4,000-node graph rebuilt every step, and a use-after-free.
+3. **Asking what the ggml op profile structurally cannot see** found a 3.87 s/clip matvec in plain host C++.
+
+And three times a measurement said something false while looking fine: a compile error swallowed by a
+`cmake ... >/dev/null`, an unpinned dependency worktree, and a comparison tool reporting `(missing)` for every
+clip. Each is now structurally prevented (builds fail loudly, `deps.lock` is enforced by `scripts/check_deps.sh`,
+the comparison reports its own parse failures). The rule: **a surprising number is a bug until proven otherwise,
+and a tool that reports results must be able to report failure.**
+
+### Closed levers, with the mechanism that closed them
+
+- **Weight format** - every quantised ggml type declares `vec_dot_type = Q8_0`, so the dot is int8 SDOT whatever
+  the weights are. On Cortex-A78 int8 is ~4x the fp32 FMA rate and fp16 FMLA ~2x, so both models already sit
+  on the fastest arithmetic the core has. f16 would move them *down* a rung. Fewer FLOPs (different model) or a
+  better int8 GEMM (KleidiAI, verified network-blocked - the glue is vendored, the `ai_micro_kernels` are not)
+  are the only arithmetic levers left.
+- **Geometry** - `chunk_ms` and the per-stage left context are paired in the model's own metadata and both fail
+  badly when separated (chunk_ms 960: +5.9 WER on the primary gate clip; left context 128: +12.9 WER). Diar
+  `chunk_len` grows trade first-turn latency (30.5 s -> 44.1 s at 510), which the contract forbids; the drain is
+  the price of that latency, not waste.
+- **Host-side work in the ASR leg** - measured 0% four times (copy removal, thread-partition threshold,
+  index arithmetic, buffer reuse). The discriminator is not "host-side" but "serialised before a compute":
+  the per-step graph rebuild paid because nothing can compute until it exists, while work *between* computes
+  overlaps with the matmuls on the other core.
+- **Diar encoder structure** - the encoder is linear in packed frames (4.85-5.46 ms/frame measured at
+  380/548/351 frames), and its attention is *bidirectional* over [state | fifo | chunk] (the mask is indexed by
+  validity, not position - see §11), so the carried state cannot be cached. The only reducible term is
+  `spkcache_len`, which moves speaker decisions.
+- **Concurrency** - two thread pools overlap 37-47% worse; the single-pool form is the only version that could
+  pay, and its ceiling has shrunk as utilisation rose from 1.61/2 to 1.81/2 cores.
+
+### If you pick this up
+
+1. `bash scripts/check_deps.sh` first. It refuses to build against anything but the three pinned heads, and the
+   pinned commits are where every optimisation lives (this repo tracks none of them - that was a real gap, now
+   closed).
+2. `./.auto/measure.sh` for a row, `.auto/checks.sh` for the byte-identity gate, `.auto/validate.sh --xasr ... --tag X`
+   then `--compare X Y` for any candidate that legitimately moves output. Cool the phone ~180 s first, or
+   interleave candidate and baseline in one armed window: the row-to-row band is 0.4% cool and ~10% hot.
+3. Anything numerics-changing needs the paired validation, and the gate's four clips are the contract. A
+   candidate can be WER-neutral and still need a deliberate re-bless if it moves speaker tags or segment
+   boundaries - `--compare` now separates those cases explicitly.
