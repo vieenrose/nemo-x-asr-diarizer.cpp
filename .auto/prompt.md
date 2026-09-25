@@ -60,6 +60,11 @@ RTF 20-60 % while printing something that looks fine.
   (`0.3` / `45`). They were tuned on the bilingual clips once; re-tuning them against `gate_ms_v2` would be
   optimizing on the accuracy gate.
 - No new dependencies, no network at run time, no GPU path (`p.use_gpu = false` — see below).
+- Accuracy may only move with the full paired evidence `.auto/validate.sh` produces (11 clips / ~1720 s, WER
+  per clip + micro aggregate + discordance + sign test) and a deliberate re-bless. Reference table captured
+  2026-09-25: gate_ms 0.2371, gate_ms_g100 0.2165, gate_ms_g1000 0.2062, gate_ms_v2 0.1765, control_ls 0.0422,
+  holdout_en 0.2364, holdout_en_aligned 0.2500, holdout_zh 0.0791, holdout_zh2 0.0433, holdout_zh_aligned
+  0.0662, holdout_zh_ph35200 0.0641.
 
 ## Constraints
 
@@ -102,12 +107,44 @@ RTF 20-60 % while printing something that looks fine.
   worker threads — the probe runs with exactly 1 thread. Any "add threads to x-asr" idea must first explain
   that observation.
 
-**Open observations worth attacking**
+**Where the time actually goes (measured, armed, screened — do not re-litigate)**
 
-- `other_s` is a large slice of wall time (once ~8 s per 35 s). Attribution and window assembly re-scan the
-  whole timeline; `attribute()` runs on every diar turn update, which is O(chars × turns) per call.
-- audio.cpp creates ~8 threads lazily during streaming regardless of `bc.threads`.
-- The diarizer commits turns in batches (first batch ~30 s of audio in these clips), so attribution leans on
-  proximity fill early on.
-- Diar leg is ~6-10 s per 45 s of audio while the diar model is 106 MB and q8; its encoder may be the cheaper
-  half to attack with cache/geometry work.
+`phone_rtf 0.4651` is the arithmetic sum of two compute-bound model legs. On chat69, armed and screened:
+ASR alone (`--no-diar`) 15.43 s = 0.224 s/audio-s, diar alone (`--no-asr`) 16.89 s = 0.245, composite
+31.83 s. The composite is ~1.5% *faster* than the sum of its isolated legs, so scheduling has nothing to win.
+
+- `other_s` is **not** bookkeeping. Timed with `NEMO_PROF=1`: `push_delta` 0.00 s and the final `attribute()`
+  pass 0.00 s per run. It is the diarizer's last encoder window landing outside the per-piece timers.
+- The diar encoder runs a **fixed-size 188-frame window** = `chunk_len 340` × 80 ms ≈ 27 s of audio, costing
+  ~7-8.5 s per window on the two A78s. Short clips pay a whole window (3 s clip: 7.27 s at 1.3 GHz), which is
+  what made it look like a constant overhead in `audiocpp_stream_finish`.
+- Both legs are **weight-format insensitive**: q4_k (89 MB) ties the shipped q5_0 (160 MB) within 2%, all-q8_0
+  ties it, and q6_k/iq4_nl are 7-9% *worse*. Compute-bound, not bandwidth-bound. Quantisation cannot help.
+- `x-asr-zh-en-q8_0.gguf` is not q8_0: 298 tensors q5_0, 619 f32, 49 f16, arch `xasr` (zipformer-style
+  `z.0..z.5`, `emb.conv*`, `dec.*`, `join.*`). Its metadata declares supported `chunk_ms` = [160, 480, 960,
+  1920]; other values are rejected, and 960 changes the transcript.
+- `Engine::init` is 0.20 s on the phone. There is no load cost to hide, so "prefault the models" is a shift
+  between `load_s` and `wall_s`, not a win (measured: load +0.12 vs wall −0.13).
+
+**Levers measured out (all byte-identical, so all fair tests)**
+
+- Running the two legs concurrently (diar on a worker thread): 37-47% *slower*, and both legs slow ~2.8×
+  (asr 24.9 → 70.5 s per 69 s). Retried at 1 ASR thread and with per-leg core pinning: still 14% worse.
+- Thread counts (1 vs 2 both scale), piece cadence (100/200/400 ms identical to the byte), `graph_arena_mb`,
+  `weight_context_mb`, dotprod (already on: `-mcpu=cortex-a78` implies `+dotprod`; ggml's `check_cxx_source_runs`
+  probe can never pass when cross-compiling, so the CMake log misleads, not the binary), KleidiAI (kernels
+  not vendored → needs network).
+- Diar streaming geometry in both directions: `latency_profile` low/very_low/ultra_low are 1.5-5× worse
+  (per-pass overhead), and 510/1020-frame chunks are a wash that *changes speaker tags* on chat69.
+- `weight_type` f16/bf16/f32: slower and changes the transcript.
+- Skipping `stream_finish` (saves 8.5 s but loses the turn still open at end-of-audio), and diar-only trailing
+  silence (no effect; side fact: 2-4 s of trailing silence leaves the transcript byte-identical).
+
+**Probe hygiene — this bit me twice**
+
+Ad-hoc probes must arm and screen, not just run: use `.auto/arm.sh`, then `.auto/witness.sh <before> <after>`
+and refuse the row if it says UNARMED. Two bugs lived here: probes called an `arm.sh` that did not exist
+(arming was a function inside `measure.sh`, so the failure was invisible behind `>/dev/null`), and `arm.sh`
+did not clear `arm.sh`'s own disarm sentinel, so the wake stream exited at once. Unarmed means ~1.3 GHz and
+20-60% inflated numbers that look completely reasonable — that is how "ASR is 0.36 s/audio-s" turned out to
+be a frequency artifact, not a code path.

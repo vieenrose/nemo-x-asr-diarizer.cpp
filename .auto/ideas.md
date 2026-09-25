@@ -1,39 +1,38 @@
 # Ideas backlog — composite phone RTF
 
-Deferred but promising. Prune when tried or stale.
+Everything in the "measured out" list below was tested, not guessed. `prompt.md` carries the numbers; this
+file is the queue. Prune a line when it is tried or when its assumption dies.
 
-- ~~**Make attribution incremental.**~~ DEAD (run #1081): timed with NEMO_PROF - push_delta 0.00 s and the
-  final attribute pass 0.00 s per run. `other_s` was never bookkeeping; it is the diarizer's last encoder
-  window landing outside the per-piece timers. Do not re-litigate this.
-- **Overlap the two legs.** DEAD (measured, run #1082 follow-up): diar on a worker thread makes the composite
-  37-47% SLOWER (gate RTF 0.785→1.074, chat69 0.776→1.145) and slows BOTH legs ~2.8x (asr 24.9→70.5 s),
-  total CPU unchanged, peak RSS unchanged. 8 diar threads + 1 ASR thread on 2 A78s is not the mechanism -
-  the loss is superlinear in the number of concurrent big-model working sets (168 MB + 106 MB streaming
-  through the same caches). Any "run the legs concurrently" variant is predicted to fail the same way.
-  Note for the archive: this is the closest thing to the old "two ggml spin pools" folklore, but it is a
-  throughput/cache effect, not a livelock, and it happens with the GPU path already fixed.
-- **Stop rebuilding the window list per output pass.** `main.cpp`'s `--windows` path builds a char vector and
-  a per-window run map after the run; on long clips that is a second full pass over the transcript. Could be
-  emitted incrementally as windows close during the loop.
-- **Charge the loop honestly.** `other_s` = wall − asr − diar. Print a `now_s()` histogram of the three
-  regions per piece to see whether the residue is attribution, the diar `next_event` drain, or allocation.
-- **Diar push cadence.** We push 100 ms pieces. The scheduler has `chunk_len`/`chunk_left_context`/
-  `chunk_right_context`; pushing 200-400 ms per call may amortise per-call overhead (byte-identity check
-  required — geometry changes alter output).
-- **Reuse buffers.** `std::vector<float>` copies per piece and `codepoints()` allocations in the hot path;
-  a persistent arena for the char timeline could matter on ARM more than x86.
-- **Prefault the models.** 168 MB + 106 MB mmapped: touch pages once during init and measure whether pass 1
-  of a cell stops costing more than pass 2 (the archive measured a first-window premium of ~130 ms on the
-  baseline for exactly this reason).
-- **Check whether `audiocpp_request_set_option` can shrink the diar pool.** It creates ~8 threads lazily
-  during streaming regardless of `bc.threads=2`; if an option exists to cap it, the 2-cpu contention margin
-  gets wider. (Earlier thread-count probing found the pool appears mid-run, not at session_create.)
+## Floor, established 2026-09-25
 
-## Still open (post-#1082)
-- **Is the ASR leg single-threaded on device?** The archive says CrispASR's Android ggml has no OpenMP and
-  creates no worker threads. If true, asr (49.7 s of 106 s wall) occupies ONE core while the second core
-  idles - the biggest structural waste left, since the legs cannot overlap. Verify with NEMO_DEBUG_THREADS
-  (it prints a thread count per piece) before designing anything around it.
-- **Diar `--diar-batch` > 1 in streaming mode** - if the family accepts a batched window it processes the
-  same windows with fewer graph entries. Unverified; may be offline-only.
-- **Prefault the models** (still untested).
+`phone_rtf = 0.4651` = ASR 0.224 + diar 0.245 (s/audio-s), armed and screened, verified against the isolated
+legs (`--no-diar` 15.43 s, `--no-asr` 16.89 s, composite 31.83 s on chat69). The composite already beats the
+sum of its parts by ~1.5%. Both legs are compute-bound on two A78s and insensitive to weight format.
+
+## Open — needs something outside this repo
+
+- **KleidiAI matmul backend for CrispASR's ggml** (`GGML_CPU_KLEIDIAI=ON`). The glue is vendored
+  (`ggml/src/ggml-cpu/kleidiai/`) but the `arm_llama` kernels are not, so it needs a network fetch. If a
+  machine with the kernels appears, this is the only untried kernel-level lever. Accumulation order will
+  probably change, so expect to need `.auto/validate.sh` and a re-bless decision.
+- **A cheaper model pair.** Out of scope for the contract (byte-identity names these two models), but the
+  honest way to beat 0.465 is fewer FLOPs per audio-second, not better scheduling. Note the diar leg is the
+  *bigger* one (0.245 vs 0.224), and its cost is ~7-8.5 s per 27 s window because the window is a fixed 188
+  encoder frames — a model trained for smaller windows would be the win.
+- **`spkcache_len` on the diarizer** (session option, 264 frames of speaker memory). It is plausibly the
+  dominant term in that fixed per-window cost. Untouched because the speaker cache is what determines
+  *which* speaker a frame gets: expect a DER move, so it belongs with a full re-validation, and it edges
+  close to the "do not tune diarization against the accuracy gate" rule.
+
+## Measured out — do not retry without a changed assumption
+
+- Leg concurrency / diar on a worker thread (#1082, #1083): 37-47% slower; also provably pointless given the
+  sum-of-parts floor.
+- Attribution / window-assembly overhead: timed at 0.00 s. `other_s` is the last encoder window, not bookkeeping.
+- Piece cadence (100/200/400 ms), thread counts (1 vs 2), `graph_arena_mb`, `weight_context_mb`, prefault,
+  dotprod/build flags.
+- Requantising x-asr (q4_k / q4_0 / iq4_nl / q6_k / all-q8_0): no win, some worse. Compute-bound.
+- Diar `latency_profile` and chunk geometry in both directions; `weight_type`.
+- Skipping `stream_finish`; diar-only trailing silence.
+- ASR `chunk_ms` 960: ~12% faster on the leg but changes the transcript — would need the full accuracy path,
+  and the model's supported set is [160, 480, 960, 1920] so there is nothing in between to tune.
