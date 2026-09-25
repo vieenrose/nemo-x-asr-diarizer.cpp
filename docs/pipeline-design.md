@@ -263,3 +263,37 @@ weights measuring slower (that copy patches F16 to an f32 dot, so it drops all t
 
 What is left on the arithmetic axis is therefore only: fewer FLOPs (a different or smaller model, outside the
 contract) or a better int8 GEMM (KleidiAI, blocked on a network fetch). Both encoders are on the right path.
+
+
+## 11. Correction: the diar encoder's attention is NOT causal, so its state cannot be cached
+
+An earlier version of this note recorded a ~7% opportunity - cache the carried speaker state's per-layer K/V
+across windows - on the grounds that the attention mask is causal. **That was wrong, and the opportunity does
+not exist.** The mask built in `audiocpp/src/models/nemotron_3_diar/encoder.cpp` is
+`[batch, 1, frames, frames]` and masks exactly one region:
+
+```cpp
+for (int64_t query = 0; query < frames; ++query)
+    for (int64_t key = lengths[batch]; key < frames; ++key)   // keys at/past the VALID LENGTH
+        values[(query * frames) + key] = -10000.0F;
+```
+
+There is no position-dependent mask anywhere - not in `build_encoder_layer`, not in the attention module,
+which receives this tensor and nothing else. So every query attends to **every key in the valid region**:
+attention over `[speaker cache | fifo | chunk]` is bidirectional, exactly as Sortformer-with-AOS intends.
+
+Two consequences, and the second is the one that matters:
+
+1. The encoder cost is quadratic in the packed length *for the attention term only*, and the measured
+   per-window cost is linear (4.85 / 5.46 / 4.89 ms per frame at 380 / 548 / 351 frames) - so attention is a
+   small share and the encoder is dominated by per-frame FFN/conv work.
+2. **The carried state's representations depend on the newest chunk frames.** Reusing their K/V from the
+   previous window would make those frames attend only to their older context - silently turning bidirectional
+   chunk attention into causal attention and changing the model's output. The state frames are irreducibly
+   part of every window, and the only way to shrink that term is a smaller `spkcache_len`, which moves speaker
+   decisions and has already been taken as far as the evidence allows (264 -> 128, re-blessed).
+
+The mistake was reading a mask that exists as a causal mask. It is worth stating as a rule: **before building a
+cache on top of an attention mask, check whether the mask is indexed by POSITION or only by VALIDITY.** A
+validity mask says "ignore the padding"; a causal mask says "ignore the future". They look similar in code and
+mean opposite things, and only one of them makes incremental decoding legal.

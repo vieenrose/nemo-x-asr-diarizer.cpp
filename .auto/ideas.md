@@ -31,9 +31,16 @@ Plus one merged GGUF (`--models-bundle`), measured neutral by design.
   graph -> host vector -> graph (outputs 0.563 s + inputs 0.278 s per 69 s clip). Bit-identical in principle;
   every other host-side phase has been partly hidden under the matmuls, so measure before believing it.
 - **Re-profile both encoders** now that the bandwidth pressure is gone: the ASR encoder compute was measured
-  at ~19 s per 69 s clip (profiled) with the joint competing for memory, and the diar encoder at ~6.6 s has
-  never been phase-split since the filterbank fix. Both are already on int8 SDOT (x-asr 298 q5_0 tensors,
-  diar 130 q5_0 = 99.5 MB), so there is no precision lever left - only KleidiAI.
+  at ~19 s per 69 s clip (profiled) with the joint competing for memory. Both are already on int8 SDOT
+  (x-asr 298 q5_0 tensors, diar 130 q5_0 = 99.5 MB), so there is no precision lever left - only KleidiAI.
+- **DONE, and the answer is no:** the diar encoder's carried speaker state cannot be cached across windows.
+  Its attention mask is indexed by VALIDITY, not POSITION (it masks only keys past the valid length, and
+  `build_encoder_layer` passes that tensor and nothing else), so attention over [state | fifo | chunk] is
+  bidirectional: each state frame's representation depends on the newest chunk frames. Caching their K/V
+  would convert bidirectional chunk attention into causal attention and change the output. An earlier entry in
+  this file claimed the opposite, from misreading the same mask; the correction is in docs/pipeline-design.md
+  §11. The encoder is linear in packed frames (4.85-5.46 ms/frame measured at 380/548/351 frames), so the
+  state term is only reducible by a smaller `spkcache_len`, which moves speaker decisions.
 - **KleidiAI** is the only remaining kernel-level lever and needs a network fetch. Everything else measured
   out below.
 
