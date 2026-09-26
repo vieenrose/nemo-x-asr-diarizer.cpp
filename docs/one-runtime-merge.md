@@ -406,3 +406,48 @@ constructs *only* encoder layer 0 as its own graph (no other layers to alias its
 audio.cpp's own module code, so every intermediate becomes a true, un-recycled graph output and the port can
 be localised stage-by-stage again with an oracle that is sound at every step, not just at the boundary. (3)
 Then the remaining 30 layers. (4) The AOS state machine.
+
+## 13. Layer 0 is byte-exact. The port's own remaining bug was the RoPE table feed, not the axis math.
+
+Item (2) above is done: `run_layer0_isolated` (`ref/audiocpp`, deps.lock `audiocpp=3d3d2e1`, §12 addendum
+below in encoder.h) rebuilds layer 0 alone in its own graph. Its final output is byte-identical to
+production's real `layer0_out` on every window tried, and 7 of 12 traced stages (`01_norm1`, `03_q`, `04_k`,
+`06_attn_raw`, `08_resid1`, `10_gelu`, `12_resid2`) now match the production trace exactly - up from 0
+trustworthy stages before this session. (Not fully clean: `07_oproj`/`11_ffn_out` alias each other even in
+this single-layer graph - `ggml_set_output` is evidently not sufficient for every tensor shape/pattern, only
+sufficient to explain the ones it fixed. Documented in encoder.h as open; doesn't block what follows.)
+
+With a sound `03_q`/`04_k` to diff against, the port's remaining divergence stopped being mysterious
+immediately: every head's post-RoPE Q had **exactly** the reference RMS (rotation preserves norm regardless
+of angle) but only ~0.1% of elements matched - the signature of a **permutation of a valid rotation**, not a
+wrong rotation. `tools/layer0_port.cpp`'s cos/sin feed applied a manual reindexing loop, written under the
+(never-verified) assumption that the dump's on-disk layout was `[T, HEADS, HALF, 1]` and needed reshuffling
+into the `[HALF, T, HEADS, 1]` the port's tensors declare. The dump's own `.ne` sidecar file
+(`layer0_rope_cos.f32.ne`) has always read `32 339 8 1` = `[HALF, T, HEADS, 1]` - **already** the target
+layout, with no comment ever pointing at that file to check the assumption against. The remap was pure noise:
+same table values, wrong table entry paired with each `(t, head, d)`, still a valid rotation (hence identical
+RMS) at the wrong angle. Deleted the loop; `feed_raw(cos, cos_raw); feed_raw(sin, sin_raw);` replaces it.
+
+**Result: `LAYER 0 PORT: BYTE-IDENTICAL to audio.cpp`**, on `bilingual_multispk_57s.wav` at three different
+windows (339 and 679 frames) and one repeat run - not a single-window fluke. Stage 2 of the one-runtime merge
+(docs §9-10, "rebuild one encoder layer in CrispASR's ggml, byte-exact against audio.cpp") is complete.
+
+**Method note for whatever port work follows:** three of the four real bugs in this port (the Q8_0 row-size
+offset, the mask-oracle corruption, this RoPE remap) were each "the dump's own metadata already answers this"
+- a `.ne` file, a direct byte inspection - sitting one `cat`/`np.fromfile` away and never checked because the
+existing comment sounded confident. The fourth (`07_oproj`==`11_ffn_out`) is still open for exactly the
+opposite reason: nobody has yet looked at whether it's a view-vs-owned-tensor distinction in
+`ggml_set_output`'s contract or an in-place-add aliasing artifact.
+
+**What's next, in order:** (1) `07_oproj`/`11_ffn_out` aliasing in `run_layer0_isolated` - not blocking (the
+final output is sound regardless), but worth a real answer before trusting per-stage diffs on a NEW bug in a
+later layer. Prime suspect: `v` (`05_v`) is a raw `ggml_permute` view with no `cont`, so a first check is
+whether `ggml_set_output` on a view actually protects its *source* tensor's buffer, or only the view's own
+(view-less) tensor struct. (2) Loop the now-exact single-layer port over all 31 remaining layers - same op
+sequence, different weights per layer; the risk is per-layer state (none expected here, unlike the diar
+encoder's carried speaker cache) and compounding float error across 31 layers of an otherwise byte-exact
+kernel sequence (should still be exact - every op used is deterministic and both ggml trees already agree
+bit-for-bit per the parity tests in §7). (3) The AOS state machine (streaming speaker-cache bookkeeping),
+which is plain C++ and unaffected by which runtime draws the graph. (4) Only then remeasure the ~10% ceiling
+this merge was chasing (§8) - the prize was never going to grow while the port got more accurate, and it
+hasn't been re-priced since §7's kernel-brief numbers.

@@ -245,20 +245,15 @@ int main(int argc, char ** argv) {
     } else {
         feed_raw(mask, mask_raw);
     }
-    {
-        const size_t n = cos_raw.size() / sizeof(float);
-        std::vector<float> c(n), s(n), rc(n), rs(n);
-        memcpy(rc.data(), cos_raw.data(), n * sizeof(float));
-        memcpy(rs.data(), sin_raw.data(), n * sizeof(float));
-        for (int64_t t = 0; t < T; t++)
-            for (int64_t hI = 0; hI < HEADS; hI++)
-                for (int64_t d = 0; d < HALF; d++) {
-                    c[(d * T + t) * HEADS + hI] = rc[(t * HEADS + hI) * HALF + d];
-                    s[(d * T + t) * HEADS + hI] = rs[(t * HEADS + hI) * HALF + d];
-                }
-        feed_f32(cos, c);
-        feed_f32(sin, s);
-    }
+    // The dump's own .ne file for layer0_rope_cos/sin reads "HALF T HEADS 1" - already exactly the ne order
+    // `cos`/`sin` above were declared with (ggml_new_tensor_4d(..., HALF, T, HEADS, 1)). The remap this block
+    // used to do here assumed the dump was [T, HEADS, HALF, 1] and reshuffled it into a DIFFERENT, WRONG
+    // per-element layout - a valid rotation (same per-head RMS, confirmed against the sound
+    // run_layer0_isolated oracle in ref/audiocpp) at scrambled angles, since permuting which table entry
+    // pairs with which (t, head, d) doesn't change the overall magnitude, only which value rotates what.
+    // Feed the bytes as dumped; no reindexing needed.
+    feed_raw(cos, cos_raw);
+    feed_raw(sin, sin_raw);
     feed_raw(w_qkv, W[0].raw);     feed_raw(w_out, W[1].raw);
     feed_raw(w_ffn_in, W[2].raw);  feed_raw(w_ffn_out, W[3].raw);
     ggml_tensor * f1t[7] = { n1w, n1b, n2w, n2b, ob, fib, fob };

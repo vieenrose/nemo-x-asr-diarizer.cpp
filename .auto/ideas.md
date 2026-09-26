@@ -31,6 +31,14 @@ Plus one merged GGUF (`--models-bundle`), measured neutral by design.
   the layer0_port harness separately had a Q8_0-row-size offset bug on the Q/K/V slice (this repo,
   `tools/layer0_port.cpp`). Both fixed; attention is finite now but the layer's final output is still wrong
   (max delta ~30). Full writeup and next steps: docs/one-runtime-merge.md §12.
+  2026-09-26 (same session, continued): built `run_layer0_isolated` (audiocpp `deps.lock` now 3d3d2e1) - a
+  sound single-layer oracle, byte-identical final output to production, 7/12 stages now trustworthy (up from
+  0). Diffing the port's `03_q`/`04_k` against it showed a permuted-but-valid rotation (same per-head RMS,
+  ~0.1% elements matching) - `tools/layer0_port.cpp`'s RoPE cos/sin feed applied an unnecessary reindex loop;
+  the dump's own `.ne` file already showed the target layout. Deleted the loop: **layer 0 port is now
+  byte-identical to audio.cpp**, verified on 3 windows (339 and 679 frames). Stage 2 of the one-runtime merge
+  is done. Full writeup: docs/one-runtime-merge.md §13. Next: loop over the remaining 31 layers, then the AOS
+  state machine, then remeasure the ~10% ceiling.
 - **KleidiAI** (`GGML_CPU_KLEIDIAI=ON`): the only untried kernel-level lever; needs a network fetch for the
   `arm_llama` kernels. Expect accumulation-order changes -> validation.
 - **ggml-native streaming caches** on the ASR side: 114 cache tensors per step currently go
