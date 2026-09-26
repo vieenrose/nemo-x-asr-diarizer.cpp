@@ -228,3 +228,47 @@ the BF16 ones, so a port must do the same conversion rather than feeding BF16 te
 **What is left to discover, and it is small:** the exact `cos`/`sin` table layout `SplitRoPEModule` validates,
 and the exact `mask` tensor the encoder builds (`[1,1,T,T]` F16 with `-10000` outside the valid length). Both
 are visible in the same two files. Everything else above is read directly off the source.
+
+## 9. Stage 2 progress: one layer, four porting bugs, and what the instrumentation cost
+
+Rebuilding encoder layer 0 in CrispASR's ggml and diffing it against audio.cpp's own output. Current state:
+**stage 1 of the layer (`01_norm1`) reproduces byte-identically** - the input, the weights, the eps and the
+norm layout are all confirmed correct. The divergence is localised to the head/RoPE axis handling, and the
+tooling to localise it (audio.cpp's env-gated dump plus a 12-stage trace) is committed and verified inert.
+
+### Four porting bugs, all the same species
+
+1. **The layout fix-up was in the wrong place.** The source order is `slice -> cont -> reshape -> transpose`;
+   this port did `slice -> reshape -> permute -> cont`, and `ggml_reshape_4d` asserts contiguity, so a
+   slice at a non-zero offset aborted the build. *The cont must sit between the slice and the reshape.*
+2. **The concat axis.** `ConcatModule({last_axis})` uses the **logical** last axis, which for a
+   `[1, heads, frames, hd]` tensor is the head-dim axis - and in ggml ne order that is axis **0**. Concat
+   along ne3 stacks the halves on a new axis and trips flash attention's batch check.
+3. **`head_dim`/`heads` were assumed, not read.** audio.cpp's traced `q` is `ne=[64, 391, 8, 1]`: head_dim 64,
+   heads 8 - not the 32/16 that `512/32` "obviously" suggests. The RoPE table `[391, 8, 32, 1]` has the
+   *same element count* under either reading, so nothing asserted. The port now reads the head config from the
+   traced `.ne` files, making the artefact the authority rather than my arithmetic.
+4. **The RoPE views undid the permutation.** `x` arrives permuted as `ne=[HD, T, HEADS, 1]`; splitting the
+   head-dim axis must keep the remaining axes *in that order*. Declaring them `[HALF, HEADS, T, 1]` silently
+   made the sequence axis the head axis, and the resulting concat came out `[HD, HEADS, T, 1]`. The port now
+   takes the head config from the trace and slices the permuted tensor correctly.
+
+### The instrumentation had three bugs of its own - all of them mine, none of them the port
+
+* It recorded the **last** layer, not the first: clearing on each `01_norm1` left layer 30's stages, so the
+  port was being diffed against a different layer and every stage "differed" by construction. The check that
+  would have caught it: `corr(layer0_12_resid2, layer0_out) == 1.0`, since they are the same tensor.
+* Its layer counter **survived the second window's graph rebuild**, so nothing was recorded at all.
+* Unconditionally clearing on `01_norm1` meant **layer 30 wiped layer 0's stages on its way past**
+  ("0 traced stage(s) written").
+
+### And the instrumentation changed the product
+
+Adding the trace around the FFN re-emitted the `GeluModule` line that was already there, so the encoder applied
+**`gelu_erf` twice**. That is a model change, not a diagnostic change, and the byte-identity gate caught it
+immediately: the transcript hash moved off the blessed `192184ebcd54977e` and DER-lite on the bilingual gate
+went **23.28% -> 30.44%**. Fixed, re-verified, and the hash is back.
+
+The lesson generalises past this session: **"env-gated diagnostic code" is not automatically
+behaviour-preserving.** The guard covered the dump; the edit that added the trace line also duplicated a line
+outside it. The four-clip gate answered in 70 seconds what the port harness never would have.
