@@ -129,6 +129,28 @@ too much padding wastes more compute than the page faults cost, matching audio.c
 padding its streaming windows in the first place) - left as the next step with the mechanism proven, not
 guessed. Full writeup: docs/one-runtime-merge.md §23.
 
+**Attempted the same night, not left for later: SS23's redesign, with a fallback removing its main risk.**
+Sampled `T` across 6 more clips - every one converges on a real, empirical ceiling of exactly **548** (never
+exceeded), with 380 as the universal first-call value. Implemented in two verified steps: (1) pure refactor
+(extract graph-building into `Impl::build_graph(T)`, byte-identical, no logic change), (2) the fixed graph
+itself, `T_max`-sized, built once, padding+masking+truncation for `T <= T_max`, exact per-call rebuild
+fallback otherwise. Verified byte-identical on 5 clips (host and device) before measuring anything.
+
+**Decisively worse, at two different `T_max` values.** `gate_ms_v2.wav`: baseline 19.84s wall / 733k page
+faults; `T_max=576` 23.21s / 583k page faults; `T_max=548` (the exact observed ceiling, no margin) 22.80s /
+560k page faults. Page faults dropped 20-24% either way - the mechanism was real - but this clip's actual
+calls (T=380, 391) are well under even the tightest `T_max`, so every call pays for 548 queries' worth of
+31-layer flash attention instead of ~385's worth, and that costs more than the avoided page faults save.
+Tightening `T_max` barely moved the result, because the clip's own `T` was never close to the ceiling to
+begin with - there is no single `T_max` that helps a clip whose real `T` sits well below it, which is most
+calls, most of the time, given how much the packed length varies. Reverted (clean `git checkout`).
+
+**Three architectural fixes attempted tonight, all correctly implemented and verified, all decisively
+disproven by measurement**: shared backend, persistent thread pool, fixed-capacity graph. `--diar-native`
+stays exactly where SS20 left it - correct, WER-neutral, ~5% slower, default-off - with the mechanism (page
+faults) proven and three concrete non-fixes on record so nobody re-derives them from scratch. Full writeup:
+docs/one-runtime-merge.md §24.
+
 ## Open, ranked
 
 - **One-runtime merge** (port the diar encoder into crispasr's ggml so one scheduler, one pool, one arena

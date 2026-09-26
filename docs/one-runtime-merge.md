@@ -975,3 +975,62 @@ positive is real work, not a small change - the wrong moment to attempt it is la
 subtle bug in diarization output is harder to catch than usual. Left as the concrete, now well-evidenced next
 step, with the mechanism proven rather than guessed. `NEMO_PAGEFAULTS=1` kept as a permanent diagnostic to
 verify against once it is attempted.
+
+## 24. SS23's redesign, actually attempted: implemented correctly, decisively worse - closed
+
+Picked SS23's "next step" back up the same night rather than leaving it, since the risk it flagged (a
+fatigue-driven correctness bug) has a real mitigation: a fallback path. If `T` ever exceeds `T_max`, fall back
+to exactly today's per-call rebuild, unchanged - so a value this session never observed cannot silently
+corrupt anything, it just skips the fast path for that one call. That removes the main correctness risk, so
+implemented it in full, in two verified steps.
+
+**T_max, from data, not a guess.** Sampled `DIARCRISPASR_DEBUG_T` across 6 more validation clips (`gate_ms`,
+`gate_ms_g1000`, `control_ls`, `holdout_zh`, plus the 2 from SS18): every clip's steady-state value converges
+on exactly **548**, never exceeded, with 380 as the universal first-call value before state fills. This is a
+real empirical ceiling, not the crude `spkcache_len+fifo_len+chunk_len` sum (508) that undershot it.
+
+**Step 1: refactor.** Extracted the ~90 lines of inline graph-building code in `encode()` into a private
+`Impl::build_graph(T)` method - a pure extraction, no logic change, verified byte-identical before touching
+anything else (this is the same discipline as every other change this session, applied to the refactor step
+itself, not just the feature).
+
+**Step 2: the fixed graph.** Built once at construction for `T_max`, gated behind `DIARCRISPASR_FIXED_CAP=1`.
+For `T <= T_max`: zero-pad the embeddings into a `T_max`-sized input (real frames first - ggml's `[H,T]`
+layout makes this a single `memcpy` into a zeroed buffer), build the mask for `T_max` frames using the SAME
+real `valid_frames[0]` boundary (which already masks every frame `>= valid_frames[0]` as an invalid key,
+covering the padding automatically - no separate padding-mask logic needed), compute, then read back only the
+first `T * (out_elements / T_max)` elements of the output (real frames land first, in frame-major order,
+computed from the graph's own actual per-frame width rather than assumed). RoPE tables move from "per
+rebuild" to "built once ever," a free bonus.
+
+**Verified byte-identical before measuring anything, thoroughly**: 5 clips on host (`gate_ms_v2`,
+`holdout_en` - which exercises T=548 five times AND the small T=213 against the same persistent graph -
+`control_ls`, `gate_ms_g1000`, `gate_ms`), then confirmed again on-device. Every one matched exactly.
+
+**Performance: decisively worse, confirmed twice.** `gate_ms_v2.wav`, `taskset C0`:
+
+| build | wall | diar_s | peak RSS | minor page faults |
+|---|---|---|---|---|
+| per-call rebuild (baseline) | 19.84s | 3.80s | 1517 MB | 733,037-733,489 |
+| fixed cap, `T_max=576` | 23.21s / 23.12s | 6.05s / 6.01s | 2019 MB | 582,749 |
+| fixed cap, `T_max=548` (exact ceiling, no margin) | 22.80s | 5.83s | 1944 MB | 559,978 |
+
+Page faults DID drop, ~20-24% at either `T_max` - SS23's mechanism was real. But `gate_ms_v2.wav`'s actual
+calls are T=380 and T=391, both well under even the tightest possible `T_max=548`: every call now pays for
+548 queries' worth of flash attention and 31 layers of compute instead of ~380-391's worth, and that extra
+compute costs far more than the avoided page faults save. Tightening `T_max` to the exact observed ceiling
+barely moved the result (23.12s -> 22.80s) because the clip's own calls were never close to that ceiling in
+the first place - there is no `T_max` that helps a clip whose real `T` sits well below it, which describes
+most calls, most of the time, given how much the packed length actually varies.
+
+**Closed, reverted (`git checkout`, clean).** This is the third architectural fix this session that was
+correctly identified from real evidence, correctly implemented, correctly verified for byte-identity, and
+decisively disproven by measurement (after SS22's shared-backend and persistent-threadpool attempts). It also
+independently reconfirms, from the other side this time, exactly why audio.cpp's own team never pads its
+streaming windows (SS-earlier, `ideas.md` "measured out"): the page-fault cost SS23 found is real, but paying
+compute for frames that are not there is reliably worse than paying for the allocation, for this specific
+workload's frame-length variance. **`--diar-native` remains where SS20 left it**: correct, WER-neutral, ~5%
+slower, default-off - now with three concrete, well-evidenced non-fixes on record (thread-pool ownership,
+persistent thread pool, fixed-capacity graph) so a future session does not re-derive any of them from
+scratch. The mechanism (page faults) is proven; no fix for it that keeps this port's per-call frame-length
+variance has been found.
