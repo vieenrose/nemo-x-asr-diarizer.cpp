@@ -184,8 +184,12 @@ int main(int argc, char ** argv) {
     ggml_tensor * qkv = ggml_cont(ctx, qkv_raw);                      // ensure_backend_addressable_layout
 
     // (1) cont between slice and reshape; (3)+(4) the permuted head layout.
+    // `off` is a feature-element offset into qkv's row (0, H, 2H for q/k/v); qkv is F32 (mul_mat's output
+    // type, cont'd), so the byte offset is off * sizeof(float) - NOT off * a Q8_0 row size. The stray
+    // GGML_TYPE_Q8_0 here was a leftover from the weight tensors' type and put q0 at the right place (off=0)
+    // by coincidence while sending k0/v ~136x too far into the buffer - wrong memory, not a wrong axis.
     const auto heads = [&](int64_t off) {
-        ggml_tensor * sl = ggml_view_2d(ctx, qkv, H, T, qkv->nb[1], (size_t) off * ggml_row_size(GGML_TYPE_Q8_0, H));
+        ggml_tensor * sl = ggml_view_2d(ctx, qkv, H, T, qkv->nb[1], (size_t) off * ggml_element_size(qkv));
         return ggml_permute(ctx, ggml_reshape_4d(ctx, ggml_cont(ctx, sl), HD, HEADS, T, 1), 0, 2, 1, 3);
     };
     ggml_tensor * q0 = heads(0), * k0 = heads(H), * v = heads(2 * H);

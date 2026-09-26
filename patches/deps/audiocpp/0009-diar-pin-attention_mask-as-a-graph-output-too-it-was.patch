@@ -1,0 +1,58 @@
+From ea5a86cadf406cf98bb932c35d72661eca018d13 Mon Sep 17 00:00:00 2001
+From: autoresearch <agent@localhost>
+Date: Sat, 26 Sep 2026 03:23:33 +0000
+Subject: [PATCH 09/10] diar: pin attention_mask as a graph output too - it was
+ being silently corrupted
+
+rope_cos and rope_sin already carry both ggml_set_input AND ggml_set_output (needed so gallocr does not
+recycle their buffer once the last layer consumes it), with a comment explaining why. attention_mask never
+got the second call - an oversight, not a deliberate choice, since the comment at the read-back site claims
+all three "are graph INPUTS, so they are materialised in the backend buffer and can simply be read back",
+which is only true for the two that also carry the output flag.
+
+Found while resuming the one-runtime-merge port (docs/one-runtime-merge.md): the port's flash_attn_ext was
+producing 100% non-finite output for every axis-convention variant, which looked like a Q/K/V layout bug.
+Dumping AUDIOCPP_DUMP_LAYER0's own layer0_mask.f16 and inspecting it directly showed it was not a mask at
+all - 2301 of 152881 elements NaN, 6 Inf, values up to +-65000, and only 2739 real zeros where a session with
+no padding should be all zeros. The values cluster near -2.0 with activation-like precision, consistent with
+a later layer's normalized hidden state having been allocated over the mask's freed buffer by the time the
+dump read it back. Feeding that garbage mask into flash attention is sufficient on its own to produce the
+NaN the port was chasing.
+
+With this pinned, a fresh AUDIOCPP_DUMP_LAYER0 dump's mask is clean (single unique value 0.0 on a
+window with no padding), and the port's flash attention output is finite. Also newly visible: 02_qkv,
+07_oproj and 11_ffn_out remain corrupted in the SAME way despite already being ggml_set_output (07_oproj and
+11_ffn_out read back the identical rms to many digits, i.e. two different tensors sharing one recycled
+address) - marking a tensor as a graph output does not protect it from a later layer's structurally
+identical tensor landing on the same gallocr slot. That confirms docs/one-runtime-merge.md's own conclusion
+that traced intermediates from the running 32-layer graph cannot be a sound oracle; only layer0_in, the now-
+fixed mask/rope tables, and a layer built in true isolation can be trusted.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QJVEwbN82WXJr6Us6kowEX
+---
+ src/models/nemotron_3_diar/encoder.cpp | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/src/models/nemotron_3_diar/encoder.cpp b/src/models/nemotron_3_diar/encoder.cpp
+index 67424c9..0826e31 100644
+--- a/src/models/nemotron_3_diar/encoder.cpp
++++ b/src/models/nemotron_3_diar/encoder.cpp
+@@ -290,7 +290,13 @@ void ensure_encoder_graph(
+     next->probabilities = modules::SigmoidModule().build(ctx, output);
+     ggml_set_input(next->input.tensor);
+     ggml_set_input(next->attention_mask.tensor);
+-    // These tables are populated once and must survive every graph execution.
++    // These tables are populated once and must survive every graph execution. attention_mask needs the same
++    // ggml_set_output pin as rope_cos/rope_sin - set_input alone does not stop gallocr from recycling its
++    // buffer once the last layer consumes it, so a later read (the layer0 dump, or a second window reusing
++    // the same persistent tensor) can return whatever node was allocated on top of it. Without this line the
++    // dumped mask was garbage (2301/152881 NaN, values up to +-65000, only 2739 real zeros) - not a real
++    // 0/-10000 validity mask at all - which is why every downstream layer0_port comparison saw NaN.
++    ggml_set_output(next->attention_mask.tensor);
+     ggml_set_input(next->rope_cos.tensor);
+     ggml_set_input(next->rope_sin.tensor);
+     ggml_set_output(next->rope_cos.tensor);
+-- 
+2.53.0
+

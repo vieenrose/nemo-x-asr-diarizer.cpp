@@ -340,3 +340,56 @@ The discipline this slice has established, which is worth more than the layer: *
 oracle only** (`layer0_out`, a true graph output - never a traced intermediate, which the allocator recycles),
 **read the vendored source for conventions instead of inferring them** (every one of the six bugs so far was a
 logical-axis/ne-axis mix-up that the source settles in one read), and **hold the acceptance test to bytes**.
+
+## 12. CORRECTION: the "2.0000x v" and the NaN attention were the mask, not the permute
+
+The §10-11 diagnosis (v scaled 2x, attention entirely non-finite, fault presumed to be in `reshape_4d`/
+`permute`) was chasing the wrong tensor. Two bugs, found in this order:
+
+**Bug A (this repo, `tools/layer0_port.cpp`): the Q/K/V slice offset used the wrong type's row size.**
+`heads(off)` computed the byte offset into `qkv` (F32, the `mul_mat` output, `cont`'d) as
+`off * ggml_row_size(GGML_TYPE_Q8_0, H)` - a leftover from the weight tensors' type. `off=0` (q) landed
+correctly by coincidence; `off=H` and `off=2H` (k, v) landed ~136x too far into the buffer - wrong memory,
+not a wrong axis. Fixed to `off * ggml_element_size(qkv)`. This is necessary but was not sufficient: the
+rebuilt binary still produced 100% non-finite attention output under every one of the 16 `PORT_VARIANT`
+combinations.
+
+**Bug B (`ref/audiocpp`, deps.lock `audiocpp=58e8496`): the mask oracle itself was corrupted.** Dumping
+`layer0_mask.f16` directly and inspecting it (rather than trusting the comment that graph inputs "can simply
+be read back") showed it was not a validity mask at all: of 152,881 elements, 2,301 were NaN, 6 were Inf,
+values ranged to +-65000, and only 2,739 were the real `0.0`, on a window with no padding where *every*
+element should have been `0.0`. `rope_cos`/`rope_sin` already carried `ggml_set_output` (with a comment
+explaining why - `ggml_set_input` alone doesn't stop gallocr recycling a persistent tensor's buffer once the
+last layer consumes it); `attention_mask` never got the same line. Feeding that garbage mask into flash
+attention is sufficient on its own to produce all-non-finite output - no permute bug required. Fixed by
+pinning `attention_mask` as an output too, **gated on `AUDIOCPP_DUMP_LAYER0`**: doing it unconditionally
+measurably shifted gallocr's layout for unrelated tensors and moved production confidence scores in the
+5th/6th decimal (turn boundaries/speaker labels unchanged) - a real byte-identity-gate failure, verified by
+building the immediate parent commit from scratch and diffing, not by trusting a pre-existing device binary.
+Gated, the fix is confirmed byte-identical to the parent commit in production while making the debug dump
+clean.
+
+**With both fixed, the attention output is finite** but the layer's final output is still wrong (max delta
+~30 against reference values of magnitude ~1.3-1.5, 100% of elements differ). This is now a real,
+un-obscured port bug rather than an artefact of two broken instruments at once.
+
+**A new, stronger version of the pre-existing oracle-soundness finding.** With the mask fixed, three *other*
+traced stages are still visibly corrupted in the exact same way as the previously-known `02_qkv`: `07_oproj`
+and `11_ffn_out` read back implausible values (rms in the millions) and - tellingly - the *same* rms as each
+other to many digits, i.e. two distinct, both-`ggml_set_output`-marked tensors evidently sharing one
+recycled address. So marking a stage tensor as a graph output is necessary but empirically **not sufficient**
+to protect it from a later, structurally-identical layer's tensor landing on the same gallocr slot across the
+32-layer loop. `01_norm1`, `03_q`/`04_k` (rms only - rotation preserves it either way), and `12_resid2` /
+`layer0_out` (cross-checked byte-identical against each other, and load-bearing as layer 1's actual input,
+which is the strongest argument available that it is genuinely live) are the stages still worth trusting.
+`02_qkv`, `05_v` in isolation, `07_oproj`, and `11_ffn_out` are not sound oracles regardless of their output
+flag.
+
+**What I would do next, in order**, superseding §11's list: (1) The mask fix already closes the NaN dead end -
+re-run the `PORT_VARIANT` sweep now that attention is finite and read off which variant (if any) gets closest,
+using only `layer0_in`/`layer0_out` as the acceptance test, not the still-untrustworthy intermediate stages.
+(2) If no variant is byte-exact, build the structural fix §10 already specified: a standalone harness that
+constructs *only* encoder layer 0 as its own graph (no other layers to alias its memory), linked against
+audio.cpp's own module code, so every intermediate becomes a true, un-recycled graph output and the port can
+be localised stage-by-stage again with an oracle that is sound at every step, not just at the boundary. (3)
+Then the remaining 30 layers. (4) The AOS state machine.

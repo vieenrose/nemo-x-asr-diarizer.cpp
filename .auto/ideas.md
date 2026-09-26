@@ -24,7 +24,13 @@ Plus one merged GGUF (`--models-bundle`), measured neutral by design.
   Low priority.
 - **One-runtime merge** (port the diar encoder into crispasr's ggml so one scheduler, one pool, one arena
   serve both). Ceiling is the 1.6-of-2-cores utilisation. The two-pool form is measured dead (37-47% slower).
-  The container merge is already done and committed, which is the prerequisite.
+  The container merge is already done and committed, which is the prerequisite. 2026-09-26: the "attention
+  is 100% non-finite" blocker in docs/one-runtime-merge.md §10-11 was a broken oracle, not a port bug -
+  `attention_mask` was never pinned as a graph output (audiocpp `deps.lock` now 58e8496, gated on
+  `AUDIOCPP_DUMP_LAYER0` after an unconditional version measurably moved production confidence scores) and
+  the layer0_port harness separately had a Q8_0-row-size offset bug on the Q/K/V slice (this repo,
+  `tools/layer0_port.cpp`). Both fixed; attention is finite now but the layer's final output is still wrong
+  (max delta ~30). Full writeup and next steps: docs/one-runtime-merge.md §12.
 - **KleidiAI** (`GGML_CPU_KLEIDIAI=ON`): the only untried kernel-level lever; needs a network fetch for the
   `arm_llama` kernels. Expect accumulation-order changes -> validation.
 - **ggml-native streaming caches** on the ASR side: 114 cache tensors per step currently go

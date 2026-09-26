@@ -15,6 +15,14 @@
 #   audiocpp   428d924  mel filterbank skips its 98.5% zero weights and drops software quad precision
 #                     (frontend 18x, the session's largest win); no padding of streaming encoder windows;
 #                     tensor-name list may prefix the file's tensor list (bundle support); phase timers
+#   audiocpp   58e8496  fixes the layer0-dump oracle: attention_mask was never pinned as a graph output
+#                     (unlike rope_cos/rope_sin, which were), so gallocr could recycle its buffer before the
+#                     post-hoc AUDIOCPP_DUMP_LAYER0 read - the dumped mask was garbage (NaN/Inf/+-65000, not
+#                     0/-10000), which alone explains the layer0_port harness's "100% non-finite" attention
+#                     output that looked like a Q/K/V axis bug. Gated on AUDIOCPP_DUMP_LAYER0 after an
+#                     unconditional first attempt measurably moved production confidence scores in the
+#                     5th/6th decimal (turn boundaries/speaker labels unchanged) - verified byte-identical to
+#                     the pre-fix parent commit when the env var is unset.
 crispasr=714f457
 crispasr_ggml=512a020
-audiocpp=b609d32
+audiocpp=58e8496
