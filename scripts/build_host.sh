@@ -67,6 +67,7 @@ mkdir -p "$ROOT/build"
 # points at nothing relevant. That cost a debugging detour once; the cheapest fix is to never have it.
 rm -f "$ROOT/build"/*.o "$ROOT/build"/nemo-x-asr-diarizer
 INC="-I$ROOT/src -I$C/src -I$A/include"
+GGML_INC="-I$C/ggml/include -I$C/ggml/src -I$C/ggml/src/ggml-cpu"
 # Compile-time availability only; the choice between exact and inferred timing happens at run time.
 if nm --defined-only "$C/build-host/src/libxasr.a" 2>/dev/null | grep -q xasr_stream_token_times; then
   INC="$INC -DNEMO_HAVE_TOKEN_TIMES"; echo "   exact token timestamps: available"
@@ -76,7 +77,11 @@ fi
 g++ -O2 -std=c++17 $INC -c "$ROOT/src/engine.cpp" -o "$ROOT/build/engine.o"
 g++ -O2 -std=c++17 $INC -c "$ROOT/src/fusion.cpp" -o "$ROOT/build/fusion.o"
 g++ -O2 -std=c++17 $INC -c "$ROOT/src/main.cpp"  -o "$ROOT/build/main.o"
-g++ "$ROOT/build/engine.o" "$ROOT/build/fusion.o" "$ROOT/build/main.o" \
+# diar_crispasr.cpp needs CrispASR's ggml headers directly (docs/one-runtime-merge.md SS16: it builds the
+# diar encoder+head on CrispASR's own ggml, the actual one-runtime merge) - a separate include path from the
+# rest of the composite, which only ever saw ggml through xasr.h/audiocpp.h's own C APIs before this.
+g++ -O2 -std=c++17 $INC $GGML_INC -c "$ROOT/src/diar_crispasr.cpp" -o "$ROOT/build/diar_crispasr.o"
+g++ "$ROOT/build/engine.o" "$ROOT/build/fusion.o" "$ROOT/build/main.o" "$ROOT/build/diar_crispasr.o" \
     -o "$ROOT/build/nemo-x-asr-diarizer" \
     -L "$A/build-host/bin" -l:libaudiocpp.so \
     "$C/build-host/src/libxasr.a" "$C/build-host/src/libcrispasr-core.a" \

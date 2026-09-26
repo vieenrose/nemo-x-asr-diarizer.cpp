@@ -77,9 +77,13 @@ echo "== composite"
 # $ORIGIN in RUNPATH means libaudiocpp.so sits next to the binary in the device dir, no LD_LIBRARY_PATH
 # needed for the common case (the harnesses still set it because adb does not always honour RUNPATH).
 rm -f "$OUT"/*.o "$OUT"/nemo-x-asr-diarizer
+# diar_crispasr.cpp needs CrispASR's ggml headers directly (docs/one-runtime-merge.md SS16: it builds the
+# diar encoder+head on CrispASR's own ggml, the actual one-runtime merge, behind --diar-native) - the rest of
+# this composite only ever sees ggml through xasr.h/audiocpp.h's own C APIs.
 "$CLANG" --target=aarch64-linux-android$API -O2 -g0 -std=c++17 $TIMES \
-  -I"$ROOT/src" -I"$C/src" -I"$A/include" -w \
-  "$ROOT/src/fusion.cpp" "$ROOT/src/engine.cpp" "$ROOT/src/main.cpp" \
+  -I"$ROOT/src" -I"$C/src" -I"$A/include" \
+  -I"$C/ggml/include" -I"$C/ggml/src" -I"$C/ggml/src/ggml-cpu" -w \
+  "$ROOT/src/fusion.cpp" "$ROOT/src/engine.cpp" "$ROOT/src/main.cpp" "$ROOT/src/diar_crispasr.cpp" \
   -o "$OUT/nemo-x-asr-diarizer" \
   -L"$A/build-android/bin" -l:libaudiocpp.so \
   "$C/build-android/src/libxasr.a" "$C/build-android/src/libcrispasr-core.a" \
