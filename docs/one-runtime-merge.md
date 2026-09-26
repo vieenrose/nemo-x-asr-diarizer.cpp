@@ -728,3 +728,10 @@ redesign, not a one-line fix, and is where item (2) should resume: it would addr
 ~11%) and this memory gap in one change, or show they are unrelated if it fixes one but not the other. Not
 attempted this session - `--diar-native` remains default-off and this is scoped, measured information for
 whoever picks it up next, not a blocker on anything currently shipped.
+
+**Candidate (c) (thread/affinity contention) is closed, ruled out by evidence already in hand:** `cores_used`
+is 1.82 for both paths, identical to two decimal places, on the same clip, same mask. If `DiarCrispASR`'s own
+`ggml_backend_cpu_init()` were contending with `xasr_context`'s threads for the same two pinned cores, that
+would show up as a change in delivered core utilisation, not just wall time. It doesn't - the ~11% gap is
+real serial compute or allocation overhead per call, not scheduling. Of SS16's three candidates: (a) fixed,
+not the differentiator; (b) is the open redesign above; (c) closed, not the differentiator.
