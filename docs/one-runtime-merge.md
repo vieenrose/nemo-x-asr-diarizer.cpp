@@ -383,7 +383,20 @@ to protect it from a later, structurally-identical layer's tensor landing on the
 `layer0_out` (cross-checked byte-identical against each other, and load-bearing as layer 1's actual input,
 which is the strongest argument available that it is genuinely live) are the stages still worth trusting.
 `02_qkv`, `05_v` in isolation, `07_oproj`, and `11_ffn_out` are not sound oracles regardless of their output
-flag.
+flag. `05_v`'s corruption has a clean smoking gun worth keeping as a regression check for whatever harness
+replaces this one: `layer0_05_v.bin` is **byte-identical** to `layer0_12_resid2.bin`/`layer0_out.f32` - the
+traced "v" tensor's memory was fully overwritten by the layer's own final output by the time the dump read it
+back, not merely perturbed.
+
+A `PORT_VARIANT` sweep (all 16 combinations) against a clean dump came back uninformative: every variant
+produced the identical first-mismatch value. The reason is structural, not a harness bug - every clip
+available to this session (`chat69`, `gate_ms_v2`, `holdout_en`, `holdout_zh`, `bilingual_multispk_57s`,
+`sil45`, `tiny3`, `tiny15`) currently produces an **all-valid, unpadded** mask on its dumped window (the
+shipped "stop padding diar encoder windows to capacity" change means production windows are sized to exactly
+their valid frame count), so `PORT_VARIANT`'s `mask_T` bit transposes an all-zero matrix into itself and
+proves nothing. Testing the mask orientation for real needs a window with a genuinely short tail, which
+none of the current gate/watchdog clips produce against this model's window sizing - worth generating one
+deliberately (a clip a few frames longer than a window boundary) before trusting the mask path further.
 
 **What I would do next, in order**, superseding §11's list: (1) The mask fix already closes the NaN dead end -
 re-run the `PORT_VARIANT` sweep now that attention is finite and read off which variant (if any) gets closest,
