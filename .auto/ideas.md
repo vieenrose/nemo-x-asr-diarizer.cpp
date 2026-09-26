@@ -126,8 +126,16 @@ difference, not overhead from graph churn. Caught before spending the redesign e
   graph -> host vector -> graph (outputs 0.563 s + inputs 0.278 s per 69 s clip). Bit-identical in principle;
   every other host-side phase has been partly hidden under the matmuls, so measure before believing it.
 - **Re-profile both encoders** now that the bandwidth pressure is gone: the ASR encoder compute was measured
-  at ~19 s per 69 s clip (profiled) with the joint competing for memory. Both are already on int8 SDOT
-  (x-asr 298 q5_0 tensors, diar 130 q5_0 = 99.5 MB), so there is no precision lever left - only KleidiAI.
+  at ~19 s per 69 s clip (profiled) with the joint competing for memory. **Correction, 2026-09-26:** "already
+  on int8 SDOT" was false when this was written - `scripts/build_android.sh` never actually compiled dotprod
+  in (docs/pipeline-design.md §15); that ~19 s number predates the fix and may no longer be accurate now that
+  x-asr's Q8_0 kernels genuinely dispatch to SDOT. Measured instead, at the leg level: dotprod left the ASR
+  leg flat (36.3-38.1s pre-fix range vs 36.7-41.1s post, noisy, no clear direction) while the diar leg fell
+  30-34% - consistent with the ASR leg's dominant cost being memory-bandwidth-bound (§9: the joint's own win
+  came from cutting bytes streamed per frame, not from faster arithmetic), so a purely-arithmetic lever like
+  dotprod has less to work with there. Not confirmed with a phase-level profile (the XASR_PROF callback is
+  itself ~2x-distorting per this file's own method notes) - flagged as the honest next step if anyone wants
+  a real answer rather than a leg-level proxy. Only KleidiAI remains as an untried kernel-level lever.
 - **DONE, and the answer is no:** the diar encoder's carried speaker state cannot be cached across windows.
   Its attention mask is indexed by VALIDITY, not POSITION (it masks only keys past the valid length, and
   `build_encoder_layer` passes that tensor and nothing else), so attention over [state | fifo | chunk] is
