@@ -480,3 +480,57 @@ ranked" to "Measured out." No config in this repository enables it; `GGML_CPU_KL
 into `scripts/build_android.sh` and should not be. Test artifacts (build dirs, device directory) were
 throwaway and have been removed - this environment is disk-constrained (a shared machine, ~94-97% full
 independent of this session's own usage) and the test needed no permanent trace to be conclusive.
+
+## 17. The last open item (q8_0 joint weights): implemented, measured, and correctly NOT the new default
+
+`ideas.md`'s one remaining "Open, ranked" item was quantizing the transducer joint matrix further, f16 (5.1
+MB) to q8_0 (2.6 MB) - the natural next step after §9's f16 conversion, explicitly estimated there as "~2%
+composite, low priority."
+
+**Implementation** (`ref/crispasr` `86bf8fe`): the joint is plain host C++, never a ggml op (§9's own
+comment), so it needed its own quantize+dot code rather than a graph change - reused ggml's own
+`quantize_row_q8_0`/`ggml_vec_dot_q8_0_q8_0` directly (same block layout and int8 SDOT accumulation the rest
+of both models already use inside their ggml graphs) instead of hand-rolling either, gated on
+`__ARM_FEATURE_DOTPROD`. **One real bug found and fixed on the way**: `xasr.cpp`'s inline ARM intrinsics
+compile as part of the separate `xasr` CMake target, not `ggml-cpu` - and only `ggml-cpu` was getting
+`GGML_CPU_ARM_ARCH`'s `-march` flag (§15's own fix). Without it, `__ARM_FEATURE_DOTPROD` was undefined for
+`xasr.cpp` specifically, and the new code path compiled to dead code - caught by measuring (the ASR leg did
+not move at all on the first on-device run) rather than assuming the code that compiled was the code that ran.
+
+**Performance, confirmed real:** re-measured after fixing the `-march` gap, all 11 validation clips, on
+device, same build otherwise: ASR leg **-5% to -7%**, consistent across every clip (e.g. `holdout_zh`
+55.58s -> 52.01s, `control_ls` 46.27s -> 44.00s).
+
+**Accuracy: measured, and NOT clean like §9's f16 conversion was.** The critical methodological point: the
+first comparison mistakenly checked the new on-device numbers against *host*-measured reference WER
+(`bless.txt`), which conflates the change under test with pre-existing ARM/x86 numeric drift the f16 path
+already has. Redone properly - same device, same binary otherwise, f16-only vs f16+q8_0, all 11 clips:
+
+| clip | f16 WER | q8_0 WER | delta |
+|---|---|---|---|
+| gate_ms | 0.2165 | 0.2371 | +0.0206 |
+| gate_ms_g100 | 0.1649 | 0.2165 | +0.0516 |
+| gate_ms_g1000 | 0.2062 | 0.1443 | -0.0619 |
+| gate_ms_v2 | 0.2471 | 0.1765 | -0.0706 |
+| control_ls | 0.0443 | 0.0422 | -0.0021 |
+| holdout_en | 0.2409 | 0.2455 | +0.0046 |
+| holdout_en_aligned | 0.2591 | 0.2500 | -0.0091 |
+| holdout_zh | 0.0855 | 0.0791 | -0.0064 |
+| holdout_zh2 | 0.0474 | 0.0454 | -0.0020 |
+| holdout_zh_aligned | 0.0791 | 0.0726 | -0.0065 |
+| holdout_zh_ph35200 | 0.0684 | 0.0641 | -0.0043 |
+
+9 of 11 clips improve or hold flat; 2 get measurably worse (`gate_ms` +0.02, `gate_ms_g100` +0.05). Micro
+WER across all 11 (summed S/D/I/H) is **0.1073 -> 0.1022, a real net improvement** - but `holdout_en`'s 0.2455
+exceeds this project's own blessed ceiling of 0.2400 (`.auto/bless.txt`), and `gate_ms_g100`'s +0.05 is a
+large single-clip swing. This is a fundamentally different kind of result from §9's f16 conversion, which was
+WER-*identical* on all 11 clips - q8_0's lower precision (8-bit-equivalent + block scaling vs f16's 10-bit
+mantissa) genuinely relocates some borderline greedy-decode decisions, for better on most clips and worse on
+a couple, not merely shifting segment boundaries the way the diar head's ~1e-3 gap does (SS15/16/17 of
+one-runtime-merge.md).
+
+**Decision: opt-in (`XASR_JOINT_Q8=1`), not the default.** "Better on average, worse on some clips you can
+name" is a product tradeoff, not a bug fix, and this project's own bar for an automatic accuracy-affecting
+change (set by the f16 conversion itself) is higher than "net positive." Confirmed byte-identical to the
+existing f16-only path when the env var is unset, so this adds a real, measured, documented option without
+touching what ships today - the same posture this project already takes with `--diar-native`.

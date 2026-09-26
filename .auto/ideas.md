@@ -65,9 +65,6 @@ difference, not overhead from graph churn. Caught before spending the redesign e
 
 ## Open, ranked
 
-- **q8_0 joint weights.** f16 took the joint from 3.87 s to 1.11 s per 69 s clip; the phase is now small
-  enough that a further 2x is worth ~1 s per clip (~2% composite) and would need the validation path again.
-  Low priority.
 - **One-runtime merge** (port the diar encoder into crispasr's ggml so one scheduler, one pool, one arena
   serve both). Ceiling is the 1.6-of-2-cores utilisation. The two-pool form is measured dead (37-47% slower).
   The container merge is already done and committed, which is the prerequisite. 2026-09-26: the "attention
@@ -143,6 +140,16 @@ difference, not overhead from graph churn. Caught before spending the redesign e
   this file claimed the opposite, from misreading the same mask; the correction is in docs/pipeline-design.md
   §11. The encoder is linear in packed frames (4.85-5.46 ms/frame measured at 380/548/351 frames), so the
   state term is only reducible by a smaller `spkcache_len`, which moves speaker decisions.
+- **DONE and shipped, opt-in: q8_0 joint weights.** Implemented (`ref/crispasr` 86bf8fe, reusing ggml's own
+  `quantize_row_q8_0`/`ggml_vec_dot_q8_0_q8_0`, not hand-rolled), and found the same class of bug as SS15
+  fixing it: the `xasr` CMake target never inherited `GGML_CPU_ARM_ARCH`'s `-march` flag (only `ggml-cpu`
+  did), so the new path first compiled to dead code - caught by measuring, not assuming. Once actually
+  running: ASR leg -5 to -7% on all 11 validation clips (real, consistent). But unlike the f16 conversion
+  (WER-identical on all 11 clips), q8_0 moves WER both directions - better on 9 clips, worse on 2
+  (`gate_ms_g100` +0.05), and `holdout_en`'s WER exceeds this repo's own blessed ceiling. Net micro-WER across
+  all 11 is better (0.1073 -> 0.1022) but "better on average, worse on some clips you can name" needed a
+  decision, not just a measurement - shipped behind `XASR_JOINT_Q8=1`, off by default, confirmed byte-
+  identical to the existing f16 path when unset. Full writeup: docs/pipeline-design.md §17.
 - No open kernel-level lever remains - see KleidiAI in "Measured out" below. Everything else measured out too.
 
 ## Measured out — do not retry without a changed assumption

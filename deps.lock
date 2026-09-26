@@ -45,6 +45,14 @@
 #                     every other piece of the family (mel frontend, streaming state, turn decoding) keeps
 #                     running audio.cpp's own code unmodified. ggml symbol visibility unaffected (leak check
 #                     still 0). This is the actual merge point nemo-x-asr-diarizer.cpp wires up.
-crispasr=714f457
+#   crispasr 86bf8fe  opt-in Q8_0 mirror of the transducer joint (XASR_JOINT_Q8=1), reusing ggml's own
+#                     quantize_row_q8_0/ggml_vec_dot_q8_0_q8_0. Also fixes the xasr CMake target never
+#                     inheriting GGML_CPU_ARM_ARCH's -march flag (only ggml-cpu had it), without which
+#                     __ARM_FEATURE_DOTPROD was undefined here and this path compiled to dead code. Cuts the
+#                     ASR leg 5-7% (all 11 validation clips, on-device) but is NOT WER-neutral like the f16
+#                     mirror was - better on 9 clips, worse on 2, one exceeding this repo's blessed ceiling -
+#                     so it stays opt-in. Confirmed byte-identical to the existing f16 path when unset.
+#                     Full account: docs/pipeline-design.md SS17.
+crispasr=86bf8fe
 crispasr_ggml=512a020
 audiocpp=4d3de79
