@@ -63,6 +63,20 @@ streaming chunk. The fixed-max-capacity redesign is very unlikely to move the ~1
 addressed, the ~11% gap's real cause is unidentified - likely a small genuine per-call kernel/scheduling
 difference, not overhead from graph churn. Caught before spending the redesign effort, not after.
 
+**Correction, next session ("continue toward the goal"):** the ~11% figure itself was wrong - not the
+comparison, the *metric*. `[stats]`'s `diar` figure structurally excludes the clip's LAST diarization window
+(its flush happens inside `audiocpp_stream_finish`'s drain phase, timed separately) - true for BOTH paths
+equally (confirmed by re-running default with the same new diagnostic), so it isn't a native-specific bug,
+but it does mean the diar-only comparison SS16-18 used wasn't measuring the full cost on either side.
+`wall`/`rtf` are unaffected (drain IS included in final wall time) - only the diar/asr/other breakdown was
+off. Re-measured on wall time instead: default 18.92-18.94s, native 19.84-19.90s on `gate_ms_v2.wav` -
+**~5% slower, not ~11%**. Confirmed the per-call compute itself is real and large (~3.1-3.6s/call, isolated
+via new `tools/diar_crispasr_bench.cpp` with zero engine/ASR interference) - not an artifact - just smaller
+in aggregate than previously stated. Still default-off, still an unresolved (smaller) gap, but this is a
+materially more accurate number for anyone deciding whether closing it is worth the effort. Full writeup,
+and the two new permanent diagnostics (`DIARCRISPASR_PROF`, `ENGINE_DIAR_PUSH_PROF`) kept for next time:
+docs/one-runtime-merge.md §19.
+
 ## Open, ranked
 
 - **One-runtime merge** (port the diar encoder into crispasr's ggml so one scheduler, one pool, one arena

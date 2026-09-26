@@ -752,3 +752,56 @@ sequence and shape range - not identified further this session. This is exactly 
 project's own method notes warn about: the redesign would have been built on an assumption carried over from
 a different part of the codebase (audio.cpp's chunk-level accounting) without checking it held at the layer
 actually being changed - caught here by measuring first, not after building it.
+
+## 19. Correction: the "~11% slower" figure itself was measuring the wrong thing - the real gap is ~5%
+
+Picking this back up to answer "continue toward the goal" - specifically, whether the true unified runtime
+(one ggml scheduler for both models, not just one process) could be made to not regress RTF at all, which is
+what would let it become the default. Re-profiled `DiarCrispASR::encode()` with new per-phase timing
+(`DIARCRISPASR_PROF=1`, `src/diar_crispasr.cpp`) expecting to finally isolate where SS16-18's ~11% gap comes
+from. Instead it found the ~11% figure was never measuring the actual diar compute cost in the first place -
+for either path.
+
+**The composite's own `[stats] diar` figure under-counts, structurally, for both `--diar-native` and the
+default path equally.** Each streaming window's diarization encoder call fires from inside exactly one
+`audiocpp_stream_push()` in `src/engine.cpp`'s main per-piece loop, timed into `stats_.diar_compute_s` -
+*except* the clip's LAST window, whose flush happens inside `audiocpp_stream_finish()` in the drain phase
+below it, timed into `stats_.prof_drain_s` instead. Found by adding a second diagnostic
+(`ENGINE_DIAR_PUSH_PROF`) that logs every `>50ms` push delta: `gate_ms_v2.wav` shows exactly ONE such delta
+for the whole 45s clip (matching `[stats]`'s reported `diar` almost exactly), even though
+`DIARCRISPASR_DEBUG_T` (SS18) already established the encoder is called twice. The second call's cost -
+confirmed genuinely real via `tools/diar_crispasr_bench.cpp` (new: loads the model and calls `encode()` in a
+loop with synthetic input, no engine, no ASR, nothing else running - ~3.1-3.6s per call, repeatable) -
+disappears into drain time that isn't part of the printed `[stats]` line at all. **Confirmed pre-existing and
+generic, not specific to this merge work**: the default/audiocpp-native path was re-run with the same
+`ENGINE_DIAR_PUSH_PROF` diagnostic and shows the identical one-big-delta pattern.
+
+This does NOT affect `wall`/`rtf` in `[stats]` - `stats_.wall_s` is set again after the drain phase completes
+(`src/engine.cpp` line ~577), so the drain phase's cost is correctly included in the composite's actual total
+wall-clock time. Only the `diar`/`asr`/`other` *breakdown* SS16-18 relied on is affected, and only for
+whichever leg's tail window happens to land in drain - which apparently differs enough in cost between the
+two paths that the diar-only comparison overstated the gap.
+
+**Re-measured on wall time, the number this project should have been comparing on all along** (same clip,
+same mask, two runs each, `--windows`, cold-instrumentation-free build):
+
+| build | wall (44.98s audio) |
+|---|---|
+| default | 18.92s / 18.94s |
+| `--diar-native` | 19.84s / 19.90s |
+
+**~5% slower, not ~11%.** Still a real regression, still not a reason to flip the default - but half the
+size SS16-18 believed, and for a boring, fully explained reason (a measurement artifact in this project's own
+`[stats]` line, not a new mechanism in the merge). The three profiled candidates (a/b/c) still account for
+zero of it; the ~5% residual is smaller, and correspondingly less likely to hide one large fixable cause -
+more likely several small ones (the per-call kernel/scheduling differences SS18 already guessed at). Not
+pursued further: at this size, and against `--diar-native`'s real, measured benefit (this is the actual
+single-scheduler, single-arena unified runtime the project's stated goal describes, WER-neutral per SS17),
+the honest state to leave this in is "correct, measured, close, default-off" - not "close enough to force
+into the default over an unresolved 5% cost."
+
+Kept as permanent, env-gated diagnostics rather than reverted: `DIARCRISPASR_PROF` (per-call phase timing),
+`ENGINE_DIAR_PUSH_PROF` (per-push wall time in the engine), and `tools/diar_crispasr_bench.cpp` (isolated,
+no-engine timing of `DiarCrispASR::encode()` against synthetic input) - the tool that finally settled whether
+this session's numbers were measuring real compute or an artifact, so it stays for the next person who needs
+to ask that question again.

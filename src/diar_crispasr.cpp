@@ -25,6 +25,7 @@
 #include "ggml-cpu.h"
 #include "gguf.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -332,6 +333,15 @@ std::vector<float> DiarCrispASR::encode(
     const int n_layers = m.n_layers;
 
     if (getenv("DIARCRISPASR_DEBUG_T") != nullptr) fprintf(stderr, "DIARCRISPASR_T %lld\n", (long long) T);
+    // DIARCRISPASR_PROF: per-call phase timing. Used to settle whether --diar-native's ~11% "diar_s" gap
+    // (docs/one-runtime-merge.md SS16) was graph-rebuild/allocation overhead - it isn't: compute_ms alone is
+    // ~3.1-3.6s per call (confirmed in total isolation via tools/diar_crispasr_bench.cpp, no engine/ASR
+    // running), dwarfing rebuild_ms (tens to ~200ms) and feed_ms (~2ms). This also surfaced a real
+    // measurement artifact in the composite's own [stats] line, unrelated to this class: see
+    // docs/one-runtime-merge.md SS19.
+    const bool prof = getenv("DIARCRISPASR_PROF") != nullptr;
+    const auto t_call0 = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    double ms_rebuild = 0.0;
     if (!m.graph || m.graph->frames != T) {
         // (Re)build the ACTIVATION graph for this frame count. Cheap regardless of how often it happens -
         // ~10 small tensors plus the compute-node graph, referencing the persistent weight tensors above by
@@ -421,10 +431,13 @@ std::vector<float> DiarCrispASR::encode(
 
         g->in = in; g->mask = mask; g->out = out;
         m.graph = std::move(g);
+        if (prof) ms_rebuild = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_call0).count();
     }
 
     // Every call, cached or not: the activation inputs. `mask` depends on valid_frames[0], which can differ
     // call to call even at the same T, so - unlike the RoPE tables above - it cannot be pinned to rebuild.
+    const auto t_feed0 = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     Impl::Graph & g = *m.graph;
     ggml_backend_tensor_set(g.in, embeddings.data(), 0, embeddings.size() * sizeof(float));
     {
@@ -433,13 +446,24 @@ std::vector<float> DiarCrispASR::encode(
         ggml_fp32_to_fp16_row(mvals.data(), mf16.data(), (int64_t) mvals.size());
         ggml_backend_tensor_set(g.mask, mf16.data(), 0, mf16.size() * sizeof(ggml_fp16_t));
     }
+    const auto t_compute0 = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
     if (ggml_backend_graph_compute(backend, g.gf) != GGML_STATUS_SUCCESS) {
         throw std::runtime_error("DiarCrispASR::encode: graph compute failed");
     }
+    const auto t_readback0 = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
     std::vector<float> result((size_t) ggml_nelements(g.out));
     ggml_backend_tensor_get(g.out, result.data(), 0, result.size() * sizeof(float));
+    if (prof) {
+        const auto t_end = std::chrono::steady_clock::now();
+        fprintf(stderr, "DIARCRISPASR_PROF T=%lld rebuild_ms=%.2f feed_ms=%.2f compute_ms=%.2f readback_ms=%.2f total_ms=%.2f\n",
+                (long long) T, ms_rebuild,
+                std::chrono::duration<double, std::milli>(t_compute0 - t_feed0).count(),
+                std::chrono::duration<double, std::milli>(t_readback0 - t_compute0).count(),
+                std::chrono::duration<double, std::milli>(t_end - t_readback0).count(),
+                std::chrono::duration<double, std::milli>(t_end - t_call0).count());
+    }
     return result;
 }
 

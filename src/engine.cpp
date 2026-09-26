@@ -480,7 +480,21 @@ bool Engine::run(const std::function<void(const Segment&)>& on_segment, std::str
                     }, false);
                 }
             }
-            stats_.diar_compute_s += now_s() - d0;
+            {
+                const double delta = now_s() - d0;
+                // ENGINE_DIAR_PUSH_PROF (>50ms deltas only): found while investigating --diar-native's
+                // reported RTF gap (docs/one-runtime-merge.md SS16-18) that [stats]'s "diar" figure is not
+                // the full diar compute cost, for EITHER path. Each streaming window's encode() call fires
+                // from inside exactly one audiocpp_stream_push() here, EXCEPT the clip's last window, whose
+                // flush happens inside audiocpp_stream_finish() below - timed into prof_drain_s, not
+                // diar_compute_s. This is a pre-existing measurement quirk, not specific to --diar-native
+                // (confirmed: the default/audiocpp-native path shows the identical one-big-delta pattern) -
+                // but see SS19 for why it matters to how SS16-18's numbers should be read.
+                if (getenv("ENGINE_DIAR_PUSH_PROF") != nullptr && delta > 0.05)
+                    std::fprintf(stderr, "ENGINE_DIAR_PUSH delta_s=%.3f off=%lld n=%d running_total=%.3f\n",
+                                 delta, (long long) off, n, stats_.diar_compute_s + delta);
+                stats_.diar_compute_s += delta;
+            }
         }
 
         // 2. transcriber
