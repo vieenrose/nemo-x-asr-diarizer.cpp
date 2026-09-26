@@ -331,6 +331,7 @@ std::vector<float> DiarCrispASR::encode(
     ggml_backend_t backend = m.backend;
     const int n_layers = m.n_layers;
 
+    if (getenv("DIARCRISPASR_DEBUG_T") != nullptr) fprintf(stderr, "DIARCRISPASR_T %lld\n", (long long) T);
     if (!m.graph || m.graph->frames != T) {
         // (Re)build the ACTIVATION graph for this frame count. Cheap regardless of how often it happens -
         // ~10 small tensors plus the compute-node graph, referencing the persistent weight tensors above by

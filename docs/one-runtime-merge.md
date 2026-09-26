@@ -700,8 +700,9 @@ finding - candidate (a) is closed as "fixed, but not the differentiator."
 **A second, more concrete number surfaced while re-measuring: `--diar-native` peak RSS is 1568 MB on this 45 s
 clip, against 396 MB for the default path - 4x, not the small constant overhead SS16's fix (persistent
 weights vs. rebuild-everything) was believed to have left behind.** Reading `src/diar_crispasr.cpp::encode()`
-again with this number in hand found a real ordering bug: the per-shape activation `Graph` is rebuilt on
-(almost) every call (SS16: packed frame counts almost never repeat), and the OLD `unique_ptr<Graph>` was only
+again with this number in hand found a real ordering bug: whenever the per-shape activation `Graph` is
+rebuilt (SS16 assumed this was nearly every call - corrected below, it is not, but the bug is real on the
+calls where it does happen), the OLD `unique_ptr<Graph>` was only
 released by `m.graph = std::move(g)` *after* the NEW graph's buffer was already allocated - so for the
 duration of every rebuild, both the old and the new per-call activation buffer (a 31-layer flash-attention
 graph, not the "~10 small tensors" the code's own comment undersold it as) were resident at once. Fixed:
@@ -719,19 +720,35 @@ double-buffering read of the code was real (and the reordering is still correct 
 peak RSS is measuring here. Kept the fix - it is strictly better and free - but the doc is not claiming a WIN
 it cannot show a number for.
 
-**What this actually points at, unresolved:** the real fix implied by this is the one SS16's candidate (b)
-already named - a single fixed-max-capacity activation graph, sized once for the largest frame count this
-config can produce and reused via masking/views across every call, the same trade audio.cpp's own no-padding
-design explicitly rejected for itself (SS-prior, `ideas.md` "measured out") but which would suit
-`DiarCrispASR` specifically, since it is the one rebuilding a graph on nearly every call. That is a real
-redesign, not a one-line fix, and is where item (2) should resume: it would address the RTF gap (SS16, still
-~11%) and this memory gap in one change, or show they are unrelated if it fixes one but not the other. Not
-attempted this session - `--diar-native` remains default-off and this is scoped, measured information for
-whoever picks it up next, not a blocker on anything currently shipped.
+**What this actually points at, unresolved:** the memory gap's real mechanism (a single large deterministic
+allocation glibc's allocator never returns to the OS) is separate from the RTF gap, and neither is fixed by
+what first looked like the natural next step - see the correction right after candidate (c) below, which
+found that step's own premise does not hold. `--diar-native` remains default-off; both gaps are scoped,
+measured information for whoever picks this up next, not a blocker on anything currently shipped.
 
 **Candidate (c) (thread/affinity contention) is closed, ruled out by evidence already in hand:** `cores_used`
 is 1.82 for both paths, identical to two decimal places, on the same clip, same mask. If `DiarCrispASR`'s own
 `ggml_backend_cpu_init()` were contending with `xasr_context`'s threads for the same two pinned cores, that
 would show up as a change in delivered core utilisation, not just wall time. It doesn't - the ~11% gap is
 real serial compute or allocation overhead per call, not scheduling. Of SS16's three candidates: (a) fixed,
-not the differentiator; (b) is the open redesign above; (c) closed, not the differentiator.
+not the differentiator; (b) - see the correction directly below, its own premise does not hold up; (c)
+closed, not the differentiator.
+
+**Correction to candidate (b) above, and to SS16's own framing: "packed frame counts almost never repeat" is
+true of audio.cpp's per-CHUNK bookkeeping, but was never actually checked at `DiarCrispASR::encode()`'s own
+call granularity - and it does not hold there.** Added a one-line, env-gated diagnostic
+(`DIARCRISPASR_DEBUG_T`, `src/diar_crispasr.cpp`) and counted real calls on host: `gate_ms_v2.wav` (45 s) made
+**2** total `encode()` calls (T = 380, 391 - both distinct, both real rebuilds); `holdout_en.wav` (139.56 s)
+made **6** calls with T = 380, 548, 548, 548, 548, 213 - only **3 distinct values**, so **half the calls
+reused the cached graph with zero rebuild**. `encode()` fires roughly once per ~20-25 s of audio (once per
+accumulated diarization "window", not once per streaming audio chunk), not on every step - so the premise
+that motivated the fixed-max-capacity redesign (rebuild cost paid on nearly every call) is false at the
+granularity that matters here, and the redesign is very unlikely to move the ~11% gap: there are only 2-3
+rebuilds in a whole clip, each doing a small allocation next to 2-6 calls' worth of real 31-layer
+flash-attention compute. **Deprioritised, not attempted.** The ~11% gap, with all three original candidates
+now addressed (a: fixed but not it; b: premise falsified; c: ruled out), most likely comes down to a genuine,
+small per-call difference between CrispASR's and audio.cpp's ggml kernels/scheduling for this exact op
+sequence and shape range - not identified further this session. This is exactly the kind of thing this
+project's own method notes warn about: the redesign would have been built on an assumption carried over from
+a different part of the codebase (audio.cpp's chunk-level accounting) without checking it held at the layer
+actually being changed - caught here by measuring first, not after building it.

@@ -53,6 +53,16 @@ to the OS. Kept the fix (free and strictly correct) but the memory gap is open, 
 redesign candidate (b) already named in §16 (a fixed-max-capacity graph reused via views instead of rebuilt)
 as the next real step. `--diar-native` stays default-off. Full writeup: docs/one-runtime-merge.md §18.
 
+**Correction, same tick:** candidate (b)'s own premise ("packed frame counts almost never repeat") was never
+actually checked at `DiarCrispASR::encode()`'s call granularity - added a one-line env-gated counter
+(`DIARCRISPASR_DEBUG_T`) and found it doesn't hold there: `gate_ms_v2.wav` makes only 2 total `encode()`
+calls in 45 s, `holdout_en.wav` only 6 in 139.56 s, and half of those 6 reused the cached graph with zero
+rebuild (3 distinct T out of 6 calls). `encode()` fires roughly once per ~20-25 s of audio, not once per
+streaming chunk. The fixed-max-capacity redesign is very unlikely to move the ~11% RTF gap (there are only
+2-3 rebuilds per clip to save on) - deprioritised, not attempted. With all three SS16 candidates now
+addressed, the ~11% gap's real cause is unidentified - likely a small genuine per-call kernel/scheduling
+difference, not overhead from graph churn. Caught before spending the redesign effort, not after.
+
 ## Open, ranked
 
 - **q8_0 joint weights.** f16 took the joint from 3.87 s to 1.11 s per 69 s clip; the phase is now small
