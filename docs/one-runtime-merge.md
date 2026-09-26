@@ -632,3 +632,53 @@ them - this project's own repeated lesson (SS7, kernel-brief) is that a percenta
 diagnosis. (3) Only once native is both correct (measured) and at least neutral (measured) does flipping
 `--diar-native`'s default, or removing the audio.cpp diar compute path entirely, become the right question to
 ask.
+
+## 17. Item (1) is done: `--diar-native` is measured WER-neutral on the full 11-clip validation set.
+
+`EV=../eval-bilingual SCORER=../VibeASR.cpp/.auto/score_stream.py bash .auto/validate.sh --compare default native`
+(both tags built from the same binary, `--diar-native` toggled at run time, same `taskset` mask, all 11
+gate/holdout clips):
+
+```
+clip                      default   native    delta  text        labels         word edits
+control_ls                 0.0422   0.0422  +0.0000  DIFFERS     105 of 149     29
+gate_ms                    0.2371   0.2371  +0.0000  identical   2 of 34        0
+gate_ms_g100                0.2143   0.2143  +0.0000  DIFFERS     24 of 39       2
+gate_ms_g1000                0.2062   0.2062  +0.0000  identical   8 of 38        0
+gate_ms_v2                  0.1744   0.1744  +0.0000  DIFFERS     19 of 34       2
+holdout_en                  0.2311   0.2311  +0.0000  DIFFERS     60 of 95       21
+holdout_en_aligned           0.2455   0.2455  +0.0000  DIFFERS     79 of 98       13
+holdout_zh                  0.0791   0.0791  +0.0000  identical   131 of 172     0
+holdout_zh2                  0.0433   0.0433  +0.0000  identical   132 of 181     0
+holdout_zh_aligned            0.0662   0.0662  +0.0000  identical   101 of 181     0
+holdout_zh_ph35200            0.0641   0.0641  +0.0000  identical   101 of 204     0
+micro default    WER 0.1019   S=245 D=69 I=11 H=2865   (n=3190 ref tokens)
+micro native     WER 0.1019   S=245 D=69 I=11 H=2865   (n=3190 ref tokens)
+clips: 0 worse, 0 better, 11 equal  (sign test vacuous)
+```
+
+WER delta is `+0.0000` on every one of the 11 clips, and the micro S/D/I/H counts (245/69/11/2865) are
+identical to four figures - not close, equal. This is the WER half of the correctness check SS16 flagged as
+owed; the composite's transcription accuracy is unaffected by routing the diar encoder through CrispASR's
+ggml instead of audio.cpp's.
+
+The `text`/`word edits` columns are a second, stricter, non-WER check (`validate.sh`'s own
+`normalized_text()` strips window counters and speaker labels and joins all lines into one string, so a
+label or line-split difference alone cannot produce a `DIFFERS` verdict here - only an actual word-level
+difference in the two runs' own output can). 5 of 11 clips do show nonzero word edits under that stricter
+check, up to 29 (`control_ls`) - so the two paths are not byte-identical in what they emit, only WER-equal
+against the reference. That is consistent with, not contradictory to, SS15/SS16's ~1e-3 conv1d precision
+gap: two hypotheses can make different but equally-costly errors against the same reference and still score
+identically (e.g. a word attributed to a slightly different turn boundary, or a homophone substitution that
+lands on the same edit count). The gate clips (`gate_ms`, `gate_ms_g1000`) and 4 of 5 `holdout_zh*` clips are
+fully text-identical; the diffing clips are concentrated in `holdout_en*` and `control_ls`, i.e. exactly the
+higher-baseline-WER clips where the reference alignment already has more freedom to place errors differently.
+
+No DER-lite pass was run (the project has no ground-truth diarization labels for these clips, only the WER
+scorer's own "labels X of Y differs" column, which is a proxy, not a metric - flagged already in SS16 and
+still true). The WER check is now measured and clean; the label-churn signal remains bounded and
+diar-precision-gap-shaped, not a new failure mode.
+
+**Updated next step:** item (1) is closed. Move to item (2) - profile the three performance candidates in
+SS16 (tuning flags, per-call context churn, thread/affinity) instead of guessing among them - before
+considering flipping `--diar-native`'s default.

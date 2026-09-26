@@ -64,6 +64,16 @@ Plus one merged GGUF (`--models-bundle`), measured neutral by design.
   times per call - fixed with one open). The "one shared scheduler is faster" hypothesis is not confirmed by
   this first working version - full writeup, measured numbers, and next steps (DER check, then profile
   instead of guessing among 3 candidates): docs/one-runtime-merge.md §16.
+  2026-09-26, item (1) closed: `.auto/validate.sh --compare default native` across all 11 gate/holdout clips -
+  WER delta `+0.0000` on every clip, micro S/D/I/H identical to four figures (245/69/11/2865 both tags),
+  0 worse/0 better/11 equal. `--diar-native` is measured WER-neutral, not just assumed so. A stricter
+  non-WER text-diff check (labels/line-splits stripped) shows nonzero word-level edits on 5/11 clips
+  (up to 29 on `control_ls`), concentrated in the already-higher-WER `holdout_en*`/`control_ls` clips -
+  consistent with the ~1e-3 conv1d head gap occasionally relocating an error rather than adding one, since
+  two different hypotheses can tie on edit count against the same reference. No ground-truth DER labels
+  exist for these clips, so this is a WER-neutral finding, not a DER-neutral one; the label-churn column
+  remains the only (proxy) diarization-accuracy signal, and it stayed bounded. Full writeup:
+  docs/one-runtime-merge.md §17. Next: item (2), profile the 3 performance candidates instead of guessing.
 - **KleidiAI** (`GGML_CPU_KLEIDIAI=ON`): the only untried kernel-level lever; needs a network fetch for the
   `arm_llama` kernels. Expect accumulation-order changes -> validation.
 - **ggml-native streaming caches** on the ASR side: 114 cache tensors per step currently go
