@@ -379,3 +379,65 @@ The conclusion it supported - weight format cannot help here, because every quan
 weights are already in the type that gets the two-row dotprod path. But the reasoning was wrong, and a right
 answer for the wrong reason does not survive the next person who reads the evidence. Full account, including
 the conversion tool that was written and then deleted, in kernel-brief §13.
+
+## 15. Correction: "already on the int8 SDOT path" was never actually verified against the shipped binary - and `scripts/build_android.sh` could not have built cleanly from a fresh checkout
+
+§12/§14 assert the dotprod path was active because the weight type dispatches to it. Nobody had checked
+whether the *compiler* actually emitted it. It hadn't: `echo | clang++ --target=aarch64-linux-android33 -dM
+-E -` on this NDK shows no `__ARM_FEATURE_DOTPROD`, and `llvm-objdump -d` on the tracked build's
+`libaudiocpp.so`/`nemo-x-asr-diarizer` found zero `sdot` instructions. `ggml-cpu/arch/arm/quants.c` guards its
+SDOT-using Q8_0/Q5_0 kernels behind `#if defined(__ARM_FEATURE_DOTPROD)` - undefined, so every dot product on
+the phone was falling back to the scalar path, on both engines, this whole session.
+
+**Why this went unnoticed: `scripts/build_android.sh`, run from a truly clean checkout (`rm -rf
+ref/*/build-android`), does not build at all.** Four independent breaks, each masked by a stale
+`CMakeCache.txt` left in `ref/*/build-android/` from some earlier, undocumented manual configure (the phone's
+`/data/local/tmp/nemo_x` still holds ~40 debug binaries from past ad hoc experiments - this project has never
+actually rebuilt from zero before now):
+
+1. `ref/audiocpp/CMakeLists.txt` forces `GGML_NATIVE` from `ENGINE_ENABLE_NATIVE_CPU`, which defaults ON
+   *regardless of cross-compiling* - overriding ggml's own (correct) cross-compile default of OFF. With it
+   on, ggml's `-mcpu=native` autodetection runs the NDK clang through `-mcpu=native -E -v -`, gets nothing
+   usable back, and falls back to the literal string `-mcpu=native` - which clang (unlike gcc) rejects
+   outright: `unsupported argument 'native' to option '-mcpu='`.
+2. CrispASR's Android cmake invocation never passed `-DBUILD_SHARED_LIBS=OFF`. Cross-compiled fresh, ggml's
+   own default produced `.so` files where the composite's final link line expects `.a` archives at fixed
+   paths - `clang-17: error: no such file or directory: '.../libggml.a'`.
+3. `GGML_OPENMP` (ggml's own option, independent of audiocpp's higher-level `ENGINE_ENABLE_OPENMP`) defaults
+   ON in both vendored ggmls, pulling `libomp.so` into `libaudiocpp.so`'s `NEEDED` list. The device has no
+   `libomp.so` and the composite's link line never adds `-fopenmp`, so a fresh build runs, links, and then
+   fails at process start with `CANNOT LINK EXECUTABLE ... library "libomp.so" not found`.
+4. No `-march`/`-mcpu` of any kind was ever passed for the ARM target, so `ARCH_FLAGS` in
+   `ggml-cpu/CMakeLists.txt` stayed empty and the compiler used the NDK's baseline (plain `armv8-a`, no
+   dotprod, no i8mm) - which is how issue (0) above happened.
+
+Fixed all four in `scripts/build_android.sh`: `-DENGINE_ENABLE_NATIVE_CPU=OFF -DGGML_OPENMP=OFF` on both
+subprojects, `-DBUILD_SHARED_LIBS=OFF` added to CrispASR's config, and an explicit
+`-DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod` (the phone's own `/proc/cpuinfo` lists `asimddp` but not `i8mm` -
+Cortex-A78 has dotprod, not matmul-int8 - so `+i8mm` would build kernels that SIGILL on this exact chip;
+`ARM_ARCH=` is overridable for a different device). The build is now reproducible from `rm -rf
+ref/*/build-android build-android && bash scripts/build_android.sh` with no leftover state required.
+
+**Measured, on-device, two independent back-to-back pairs (`taskset C0`, armed, `.auto/measure.sh`,
+chat69.wav + gate_ms_v2.wav):**
+
+| build | phone_rtf | diar_s | asr_s | transcript HASH |
+|---|---|---|---|---|
+| clean, no ISA tuning (the four fixes above only) | 0.3124 / 0.3315 | 22.76 / 23.72 | 36.3 / 38.1 | `d64b8863ba8d` (both) |
+| + `-march=armv8.2-a+dotprod` | 0.2617 / 0.2914 | 14.97 / 16.57 | 36.7 / 41.1 | `d64b8863ba8d` (both) |
+
+Dotprod cuts composite RTF **12-16%**, almost entirely from the diar leg (**-30% to -34%**) - the ASR leg is
+flat within noise, consistent with it already being more memory-bandwidth- than dot-product-bound (§9). All
+four runs hash **identical** to each other: int8 SDOT sums the same int32 accumulator a scalar loop does, it
+is not a reordering like the f16-accumulation changes elsewhere in this doc, so this clears the byte-identity
+gate by construction - no WER re-validation needed, unlike quantisation or geometry changes.
+
+**What this does and doesn't settle.** It doesn't reopen the "weight format" lever closed in §12/§14: Q8_0 is
+still the fastest available type, and this change makes that claim actually true of the shipped binary for
+the first time rather than assumed. It also does not explain, and this document does not claim to explain,
+why the historical baseline this whole session was built on (§12: composite RTF 0.2659, `phone_rtf` in
+`.auto/log.jsonl`) sits inside this dotprod-build's range rather than the newly-discovered clean-baseline
+range - the most likely explanation is that whatever binary produced that number was *also* built against a
+stale cache that happened to carry dotprod (or an equivalent flag) from some earlier manual configure, since
+this project had never verified `scripts/build_android.sh` builds clean before this session. That is a
+plausible reconciliation, not a verified one - flagged here rather than asserted.

@@ -24,6 +24,10 @@ ABI=${ABI:-arm64-v8a}
 API=${API:-33}
 C=${CRISPASR:-$ROOT/../ref/crispasr}
 A=${AUDIOCPP:-$ROOT/../ref/audiocpp}
+# Device /proc/cpuinfo (Oppo, MT6877V/ZA) shows `asimddp` (ARMv8.2 dotprod) but NOT `i8mm` - so
+# armv8.2-a+dotprod, not +i8mm (that would build kernels that SIGILL on this chip). Override with
+# ARM_ARCH= for a different device.
+ARM_ARCH=${ARM_ARCH:-armv8.2-a+dotprod}
 OUT=$ROOT/build-android
 CLANG=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++
 STRIP=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip
@@ -35,10 +39,18 @@ echo "== audio.cpp C API for Android (shared, ggml hidden inside)"
 # audiocpp_cli. That is how this branch's first audio.cpp Android build looked.
 # -llog: the C-API target calls __android_log_write and does not link liblog, so the link fails with
 # "undefined symbol: __android_log_write" unless CMAKE_SHARED_LINKER_FLAGS carries it.
+# ENGINE_ENABLE_NATIVE_CPU=OFF is not cosmetic: audiocpp's own CMakeLists forces GGML_NATIVE from this
+# option, which defaults ON regardless of cross-compiling - overriding ggml's own (correct) cross-compile
+# default of OFF. Left unset, this script fails a clean build with "unsupported argument 'native' to
+# option '-mcpu='" (clang, unlike gcc, does not resolve -mcpu=native itself, and the NDK toolchain's own
+# `-mcpu=native -E -v -` probe returns nothing usable). It only ever "worked" here because an existing
+# build-android/ dir carried a stale cached override from an earlier configure - a clean checkout could
+# not have built this. Passing GGML_CPU_ARM_ARCH explicitly instead is what actually enables dotprod.
 cmake -S "$A" -B "$A/build-android" \
   -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
   -DANDROID_ABI=$ABI -DANDROID_PLATFORM=android-$API -DCMAKE_BUILD_TYPE=Release \
   -DBUILD_SHARED_LIBS=OFF -DAUDIOCPP_BUILD_C_API=ON \
+  -DENGINE_ENABLE_NATIVE_CPU=OFF -DGGML_CPU_ARM_ARCH=$ARM_ARCH -DENGINE_ENABLE_OPENMP=OFF -DGGML_OPENMP=OFF \
   -DCMAKE_SHARED_LINKER_FLAGS="-llog" >/dev/null
 cmake --build "$A/build-android" --target audiocpp -j"$(nproc)" > /tmp/ar_audiocpp_build.log 2>&1 || {
   echo "audiocpp build FAILED (a stale library would be linked and measured as if it were the change):"
@@ -56,7 +68,8 @@ echo "== CrispASR x-asr for Android (static)"
 # composite needs and check the token-times symbol actually exists in the arm64 archive.
 cmake -S "$C" -B "$C/build-android" \
   -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
-  -DANDROID_ABI=$ABI -DANDROID_PLATFORM=android-$API -DCMAKE_BUILD_TYPE=Release >/dev/null
+  -DANDROID_ABI=$ABI -DANDROID_PLATFORM=android-$API -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_SHARED_LIBS=OFF -DGGML_CPU_ARM_ARCH=$ARM_ARCH -DGGML_OPENMP=OFF >/dev/null
 if [ -f "$ROOT/patches/crispasr-token-times.patch" ] &&
    git -C "$C" apply --check "$ROOT/patches/crispasr-token-times.patch" 2>/dev/null; then
   git -C "$C" apply "$ROOT/patches/crispasr-token-times.patch" && echo "   applied token-times patch"

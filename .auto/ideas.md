@@ -17,6 +17,29 @@ the numbers; this file is the queue.
 
 Plus one merged GGUF (`--models-bundle`), measured neutral by design.
 
+## 2026-09-26: `scripts/build_android.sh` did not build from a clean checkout - fixed, and it was hiding a real ISA win
+
+Discovered while profiling the one-runtime-merge performance gap (candidate (a), docs/one-runtime-merge.md
+§16): `echo | clang++ --target=aarch64-linux-android33 -dM -E -` on this NDK shows no
+`__ARM_FEATURE_DOTPROD`, and the tracked build's binaries had zero `sdot` instructions (`llvm-objdump -d`).
+Every quantised dot product on the phone was running the scalar fallback, both engines, despite §12/§14 of
+pipeline-design.md asserting the int8 SDOT path was already active - that claim was never checked against the
+actual compiled binary. `rm -rf ref/*/build-android && bash scripts/build_android.sh` from a clean checkout
+does not build at all: 4 independent breaks (GGML_NATIVE forced ON overriding the correct cross-compile
+default and crashing on `-mcpu=native`; CrispASR's cmake missing `-DBUILD_SHARED_LIBS=OFF`, producing `.so`
+where the link step wants `.a`; GGML_OPENMP defaulting ON and pulling in a `libomp.so` the device does not
+have; no `-march`/`-mcpu` at all, hence no dotprod), every one masked for who knows how long by a stale
+`CMakeCache.txt` nobody had reconfigured from zero. Fixed all four, plus added explicit
+`-DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod` (confirmed via the phone's own `/proc/cpuinfo`: `asimddp` present,
+`i8mm` absent - Cortex-A78 has dotprod, not matmul-int8). Two independent on-device A/B pairs (measure.sh,
+armed, chat69+gate_ms_v2): clean/no-tuning phone_rtf 0.3124/0.3315 -> with dotprod 0.2617/0.2914 (**-12% to
+-16%**, almost all of it the diar leg: **-30% to -34%**), and the transcript HASH is **byte-identical across
+all four runs** (`d64b8863ba8d`) - SDOT sums the same int32 accumulator a scalar loop does, so this clears the
+project's own byte-identity gate by construction, no WER re-check needed. Unresolved: the historical 0.269
+composite baseline this whole session cites sits inside the dotprod range, not the newly-discovered clean
+range - most likely that number's build was *also* riding a stale cache with dotprod already on by accident,
+but this is not verified, only flagged. Full writeup: docs/pipeline-design.md §15.
+
 ## Open, ranked
 
 - **q8_0 joint weights.** f16 took the joint from 3.87 s to 1.11 s per 69 s clip; the phase is now small
