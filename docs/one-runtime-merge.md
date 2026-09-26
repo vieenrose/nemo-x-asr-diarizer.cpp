@@ -682,3 +682,49 @@ diar-precision-gap-shaped, not a new failure mode.
 **Updated next step:** item (1) is closed. Move to item (2) - profile the three performance candidates in
 SS16 (tuning flags, per-call context churn, thread/affinity) instead of guessing among them - before
 considering flipping `--diar-native`'s default.
+
+## 18. Item (2), candidate (a) closed (docs/pipeline-design.md SS15): dotprod was never compiled in, at all -
+fixed generally, but it does not close the `--diar-native` gap, and a real 4x memory finding surfaced instead
+
+Candidate (a) - missing `-mcpu=cortex-a78`-class tuning - turned out to be real and much bigger than
+"kernel codegen might be worse": neither vendored ggml had ARM dotprod compiled in at all (confirmed via
+`__ARM_FEATURE_DOTPROD` absent from the NDK's default defines and zero `sdot` instructions in the shipped
+binaries), because `scripts/build_android.sh` could not build from a clean checkout in the first place - four
+stale-cache-masked breaks, fixed generally for the whole composite. Full account: docs/pipeline-design.md
+SS15. As predicted there, this is a composite-wide fix, not a `--diar-native`-specific one, so it does **not**
+close the gap this section is about: re-measured on the dotprod-enabled build, `gate_ms_v2.wav`, `taskset
+C0` - default diar leg 3.41 s, `--diar-native` 3.78 s, **~11% slower**, the same gap as SS16 measured before
+dotprod existed. Both paths dot through the same kernel, so this is the expected (negative) result, not a new
+finding - candidate (a) is closed as "fixed, but not the differentiator."
+
+**A second, more concrete number surfaced while re-measuring: `--diar-native` peak RSS is 1568 MB on this 45 s
+clip, against 396 MB for the default path - 4x, not the small constant overhead SS16's fix (persistent
+weights vs. rebuild-everything) was believed to have left behind.** Reading `src/diar_crispasr.cpp::encode()`
+again with this number in hand found a real ordering bug: the per-shape activation `Graph` is rebuilt on
+(almost) every call (SS16: packed frame counts almost never repeat), and the OLD `unique_ptr<Graph>` was only
+released by `m.graph = std::move(g)` *after* the NEW graph's buffer was already allocated - so for the
+duration of every rebuild, both the old and the new per-call activation buffer (a 31-layer flash-attention
+graph, not the "~10 small tensors" the code's own comment undersold it as) were resident at once. Fixed:
+`m.graph.reset()` immediately before building the replacement, so at most one per-call buffer exists at any
+time. Verified WER-neutral on host (`--diar-native` on `gate_ms_v2.wav`: WER 0.1765 before and after,
+matching the default path's WER on the same rebuilt binary) and re-measured on device.
+
+**The fix did not move peak RSS at all: 1568 MB, identical to three significant figures, before and after,
+across three separate runs of two different binaries.** That is itself informative: an allocation-order bug
+whose fix has zero effect on measured RSS is evidence the *order* was never the actual constraint - the
+number is most likely a single large, deterministic allocation (the largest packed frame count this clip
+ever reaches) that glibc's allocator retains after `free()` rather than returning to the OS via `munmap`, so
+`ggml_backend_buffer_free` releasing it logically does not lower the process's resident set at all. The
+double-buffering read of the code was real (and the reordering is still correct to keep), but it is not what
+peak RSS is measuring here. Kept the fix - it is strictly better and free - but the doc is not claiming a WIN
+it cannot show a number for.
+
+**What this actually points at, unresolved:** the real fix implied by this is the one SS16's candidate (b)
+already named - a single fixed-max-capacity activation graph, sized once for the largest frame count this
+config can produce and reused via masking/views across every call, the same trade audio.cpp's own no-padding
+design explicitly rejected for itself (SS-prior, `ideas.md` "measured out") but which would suit
+`DiarCrispASR` specifically, since it is the one rebuilding a graph on nearly every call. That is a real
+redesign, not a one-line fix, and is where item (2) should resume: it would address the RTF gap (SS16, still
+~11%) and this memory gap in one change, or show they are unrelated if it fixes one but not the other. Not
+attempted this session - `--diar-native` remains default-off and this is scoped, measured information for
+whoever picks it up next, not a blocker on anything currently shipped.

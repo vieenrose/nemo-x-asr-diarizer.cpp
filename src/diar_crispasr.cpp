@@ -335,6 +335,14 @@ std::vector<float> DiarCrispASR::encode(
         // (Re)build the ACTIVATION graph for this frame count. Cheap regardless of how often it happens -
         // ~10 small tensors plus the compute-node graph, referencing the persistent weight tensors above by
         // pointer. No weight is created, fed, or touched here.
+        //
+        // Free the OLD graph's buffer before allocating the new one, not after: since packed frame counts
+        // almost never repeat (audio.cpp's own no-padding optimisation), this rebuild runs on nearly every
+        // call, and the two buffers are large enough (a 31-layer flash-attention activation graph, not the
+        // "~10 small tensors" of just the leaves) that holding both alive during the swap - the previous
+        // order, where the new buffer was allocated before `m.graph` released the old one - measured a
+        // reproducible 1568 MB peak RSS on a 45 s clip versus audio.cpp's own 396 MB for the same clip.
+        m.graph.reset();
         auto g = std::make_unique<Impl::Graph>();
         g->frames = T;
         const size_t arena_bytes =

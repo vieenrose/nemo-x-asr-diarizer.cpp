@@ -40,6 +40,19 @@ composite baseline this whole session cites sits inside the dotprod range, not t
 range - most likely that number's build was *also* riding a stale cache with dotprod already on by accident,
 but this is not verified, only flagged. Full writeup: docs/pipeline-design.md §15.
 
+Re-measured `--diar-native` (docs/one-runtime-merge.md §16-17) on the dotprod build: the RTF gap is unchanged
+(~11% slower diar leg, same as before dotprod existed - both paths share the same kernel, so this closes
+candidate (a) as "real bug, fixed, but not the `--diar-native` differentiator"). Re-measuring surfaced a new
+number instead: `--diar-native` peak RSS is 1568 MB vs the default path's 396 MB on a 45 s clip. Found and
+fixed a real bug behind it (`src/diar_crispasr.cpp::encode()` allocated the new per-shape activation buffer
+before releasing the old one, so both were resident during every rebuild - packed frame counts almost never
+repeat, so this was nearly every call) - WER-neutral, verified. **The fix did not move peak RSS at all**
+(1568 MB, unchanged, 3 runs across 2 binaries) - meaning the order was not the actual constraint; most likely
+a single large deterministic allocation that glibc's allocator retains after `free()` rather than returning
+to the OS. Kept the fix (free and strictly correct) but the memory gap is open, unresolved, and points at the
+redesign candidate (b) already named in §16 (a fixed-max-capacity graph reused via views instead of rebuilt)
+as the next real step. `--diar-native` stays default-off. Full writeup: docs/one-runtime-merge.md §18.
+
 ## Open, ranked
 
 - **q8_0 joint weights.** f16 took the joint from 3.87 s to 1.11 s per 69 s clip; the phase is now small
