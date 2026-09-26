@@ -373,11 +373,26 @@ std::vector<float> DiarCrispASR::encode(
             const auto & w = m.layers[static_cast<size_t>(i)];
             ggml_tensor * n1 = ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, x, m.eps), w.n1w), w.n1b);
             ggml_tensor * qkv = ggml_cont(ctx, ggml_mul_mat(ctx, w.w_qkv, n1));
+            // Q materialises a contiguous copy (cont -> reshape -> permute), same as ref/audiocpp's own
+            // GroupedQueryAttentionModule does for its query tensor unconditionally (encoder.cpp:
+            // `ensure_backend_addressable_layout(ctx, q_heads)`, called regardless of lowering variant).
             const auto heads_fn = [&](int64_t off) {
                 ggml_tensor * sl = ggml_view_2d(ctx, qkv, H, T, qkv->nb[1], (size_t) off * ggml_element_size(qkv));
                 return ggml_permute(ctx, ggml_reshape_4d(ctx, ggml_cont(ctx, sl), HD, HEADS, T, 1), 0, 2, 1, 3);
             };
-            ggml_tensor * q0 = heads_fn(0), * k0 = heads_fn(H), * v = heads_fn(2 * H);
+            // K and V skip that copy: a single strided ggml_view_4d directly on qkv reproduces the exact same
+            // [HD, T, HEADS, 1] logical tensor heads_fn builds via cont+reshape+permute, with zero elements
+            // copied. This mirrors ref/audiocpp's own FlashGroupedViewKV lowering (view_kv=true - K/V pass
+            // straight through, only Q gets materialised) - found by diffing this port against that file
+            // while chasing the residual ~5% --diar-native gap (docs/one-runtime-merge.md SS19-20). Must
+            // produce byte-identical results to the cont-based form since it is the same memory, viewed
+            // differently, not a numerical change - verified below, not assumed.
+            const auto heads_view_fn = [&](int64_t off) {
+                return ggml_view_4d(ctx, qkv, HD, T, HEADS, 1,
+                                     qkv->nb[1], (size_t) HD * qkv->nb[0], (size_t) HD * qkv->nb[0] * HEADS,
+                                     (size_t) off * ggml_element_size(qkv));
+            };
+            ggml_tensor * q0 = heads_fn(0), * k0 = heads_view_fn(H), * v = heads_view_fn(2 * H);
             const auto rope_fn = [&](ggml_tensor * t) {
                 ggml_tensor * x1 = ggml_view_4d(ctx, t, HALF, T, HEADS, 1, t->nb[1], t->nb[2], t->nb[3], 0);
                 ggml_tensor * x2 = ggml_view_4d(ctx, t, HALF, T, HEADS, 1, t->nb[1], t->nb[2], t->nb[3], HALF * t->nb[0]);

@@ -77,6 +77,16 @@ materially more accurate number for anyone deciding whether closing it is worth 
 and the two new permanent diagnostics (`DIARCRISPASR_PROF`, `ENGINE_DIAR_PUSH_PROF`) kept for next time:
 docs/one-runtime-merge.md §19.
 
+**Continued, same thread:** diffed this port's attention block against `ref/audiocpp`'s own
+`GroupedQueryAttentionModule` and found a real, fixable difference - audio.cpp's `FlashGroupedViewKV`
+lowering skips materialising K/V into contiguous memory before flash attention (only Q gets copied); this
+port copied all three. Fixed (K/V now a single strided `ggml_view_4d`, zero copies), verified byte-identical
+on host and device before measuring anything. Peak RSS dropped a real 47 MB (1564 -> 1517 MB) but wall time
+did not move outside noise (~5.3% slower, same as SS19's figure) - a correct, worthwhile fix that is not
+where the gap comes from. Four candidates now addressed (ISA tuning, graph churn, thread contention, this
+copy), the gap held every time - it's diffuse, not one fixable thing findable without a real op-level
+profiler. Stopped here. Full writeup: docs/one-runtime-merge.md §20.
+
 ## Open, ranked
 
 - **One-runtime merge** (port the diar encoder into crispasr's ggml so one scheduler, one pool, one arena

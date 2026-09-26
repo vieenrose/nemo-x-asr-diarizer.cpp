@@ -805,3 +805,42 @@ Kept as permanent, env-gated diagnostics rather than reverted: `DIARCRISPASR_PRO
 no-engine timing of `DiarCrispASR::encode()` against synthetic input) - the tool that finally settled whether
 this session's numbers were measuring real compute or an artifact, so it stays for the next person who needs
 to ask that question again.
+
+## 20. A real, verified fix to a genuine inefficiency in the port - and it does not close the gap either
+
+Diffed this port's attention block against `ref/audiocpp`'s own `GroupedQueryAttentionModule` (encoder.cpp)
+looking for a structural difference worth fixing, rather than continuing to guess at "kernel differences" in
+the abstract. Found one: audio.cpp's own lowering (`FlashGroupedViewKV`) explicitly skips materialising K and
+V into contiguous memory before `ggml_flash_attn_ext` - only Q gets `ensure_backend_addressable_layout`
+(`build_flash_grouped`, `view_kv` parameter). This port's `heads_fn`, by contrast, called `ggml_cont()` for
+all three of Q, K, and V unconditionally - two extra, avoidable full-tensor copies per layer, every call (62
+per encode() call across 31 layers).
+
+**Fixed**: K and V now come from a single `ggml_view_4d` directly on the QKV projection output - the exact
+same `[HD, T, HEADS, 1]` logical tensor `heads_fn`'s cont+reshape+permute chain produced, computed by hand
+from `qkv`'s own strides, with zero elements copied. Q is unchanged (still materialised), matching
+audio.cpp's own asymmetry exactly, not just its intent.
+
+**Verified byte-identical before measuring anything**, the same discipline as every other numerics-adjacent
+change this session: host build, `--diar-native` on `gate_ms_v2.wav`, diffed byte-for-byte against the
+pre-change output - identical. Same check repeated on-device - identical. This is a memory-layout change, not
+a numerical one, and the byte-identity gate is exactly the right bar for it (no WER re-check needed, unlike
+SS17's Q8_0 joint).
+
+**Performance: real but small, and does not close the gap.** Peak RSS dropped 1564 MB -> 1517 MB (the two
+saved copies, ~47 MB), consistent with expectation. Wall time on `gate_ms_v2.wav`, three runs: 19.79s /
+19.77s / 19.74s - against a freshly re-measured default baseline of 18.78s, that is **~5.3% slower, the same
+gap SS19 found**, not narrower. The extra copies were real and worth removing (lower peak memory is its own
+small win, and it is simply more correct code - no reason to keep an avoidable copy once found), but they
+were not where the ~5% actually comes from.
+
+**Kept the fix regardless of it not moving the number** - correct, byte-identical, strictly less work done,
+free to keep. The remaining ~5% gap is now more precisely NOT explained by: (a) missing ISA tuning (SS15,
+shared by both paths, ruled out), (b) graph-rebuild/allocation churn (SS18, premise falsified), (c)
+thread/affinity contention (SS16, ruled out via identical `cores_used`), or (d) unnecessary Q/K/V
+materialisation (this section, fixed, no effect). Four candidates addressed, four times the gap held. At this
+point the honest conclusion is that whatever remains is diffuse rather than a single fixable mechanism - the
+kind of gap that needs a proper op-level profiler comparing the two ggml call sequences instruction-by-
+instruction, not another structural guess. Not pursued further this session: `--diar-native` stays
+default-off, correct, WER-neutral, and now understood as precisely as this project's tools can measure it
+without building a new one.

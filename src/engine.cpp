@@ -491,7 +491,7 @@ bool Engine::run(const std::function<void(const Segment&)>& on_segment, std::str
                 // (confirmed: the default/audiocpp-native path shows the identical one-big-delta pattern) -
                 // but see SS19 for why it matters to how SS16-18's numbers should be read.
                 if (getenv("ENGINE_DIAR_PUSH_PROF") != nullptr && delta > 0.05)
-                    std::fprintf(stderr, "ENGINE_DIAR_PUSH delta_s=%.3f off=%lld n=%d running_total=%.3f\n",
+                    std::fprintf(stderr, "ENGINE_DIAR_PUSH delta_s=%.3f off=%lld n=%zu running_total=%.3f\n",
                                  delta, (long long) off, n, stats_.diar_compute_s + delta);
                 stats_.diar_compute_s += delta;
             }
