@@ -1,0 +1,45 @@
+From d68b663e964b0c466d56e26ef3bc6e1535ba86ba Mon Sep 17 00:00:00 2001
+From: autoresearch <agent@localhost>
+Date: Fri, 25 Sep 2026 06:14:21 +0000
+Subject: [PATCH 5/8] diar: per-window encode timing under AUDIOCPP_PROF
+
+Two measurements do not fit a linear cost model: a 508-frame window costs ~2.2 s and a 350-frame drain ~1.9 s,
+which implies ~1.2 s fixed per window and only ~1.9 ms per frame. Before designing anything around that - the
+obvious candidate is caching the carried speaker state's per-layer K/V, which the causal attention mask makes
+mathematically valid and which would remove a third of the frames from every window - it is worth knowing
+whether the fixed part is real and what it is. Per-window timings separate a cold-weight first-touch cost
+from steady-state per-frame work.
+---
+ src/models/nemotron_3_diar/session.cpp | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/src/models/nemotron_3_diar/session.cpp b/src/models/nemotron_3_diar/session.cpp
+index 52356c1..9a977ae 100644
+--- a/src/models/nemotron_3_diar/session.cpp
++++ b/src/models/nemotron_3_diar/session.cpp
+@@ -65,6 +65,9 @@ inline void dump() {
+                  "features %.3f s  pre_encode %.3f s  encode %.3f s (build %.3f)  aos %.3f s\n",
+                  (long long) a.windows, (double) a.nodes / a.windows, (double) a.elements / a.windows,
+                  a.features_s, a.pre_encode_s, a.encode_s, a.encode_build_s, a.aos_s);
++    std::fprintf(stderr, "[diar-prof] per-window encode s:");
++    for (double w : a.window_s) std::fprintf(stderr, " %.3f", w);
++    std::fprintf(stderr, "   (first vs rest separates cold-weight/first-touch cost from per-frame work)\n");
+     std::vector<std::pair<int, int64_t>> rows(a.op_nodes.begin(), a.op_nodes.end());
+     std::sort(rows.begin(), rows.end(), [](auto& l, auto& r) { return l.second > r.second; });
+     for (auto& r : rows) {
+@@ -204,8 +207,11 @@ std::vector<float> Session::encode(
+         throw std::runtime_error("Nemotron 3 diarization encoder graph failed");
+     }
+     if (prof) {
+-        diar_prof::get().encode_s += std::chrono::duration<double>(
++        const double dt = std::chrono::duration<double>(
+             std::chrono::steady_clock::now() - t0).count();
++        diar_prof::get().encode_s += dt;
++        diar_prof::get().window_s.push_back(std::chrono::duration<double>(
++            std::chrono::steady_clock::now() - t_before_compute).count());
+     }
+     std::vector<float> probabilities;
+     core::read_tensor_f32_into(encoder_graph_->probabilities.tensor, probabilities);
+-- 
+2.53.0
+

@@ -1,0 +1,166 @@
+From a3170b559e6869bb49c50821c196f0ce437ec27c Mon Sep 17 00:00:00 2001
+From: autoresearch <agent@localhost>
+Date: Fri, 25 Sep 2026 05:33:13 +0000
+Subject: [PATCH 06/15] x-asr: keep the transducer joint matrix in f16 on
+ AArch64 (3.5x on that phase)
+
+The joint is a [5000 x 512] matvec per encoder frame: 10.2 MB of f32 streamed for every frame with exactly
+one use per element, measured at 3.87 s per 69 s clip - 31% of the ASR leg, in plain host C++ that the ggml
+op profile cannot see. Vectorising the arithmetic did nothing (four independent NEON accumulators, 3.84 s),
+which is what identified bytes rather than instructions as the lever. Storing the matrix as f16 and widening
+each group to f32 before the FMA (single accumulator, ascending j, so the arithmetic shape is unchanged)
+takes the phase to 1.11 s.
+
+The weight rounding is a real numerical change, so it was held to the full evidence: the four gate clips stay
+BYTE-IDENTICAL (hash 192184ebcd54977e, WER 0.1765/0.2364/0.0791, attribution 0.0779 of 77, DER-lite 23.28%),
+and all eleven validation clips keep the reference WER exactly (0.2371/0.2165/0.2062/0.1765/0.0422/0.2364/
+0.2500/0.0791/0.0433/0.0662/0.0641). Seven of the eleven raw transcripts do move, but only in where a segment
+splits and which speaker tag it carries: after stripping labels and segment joins the text is character-
+identical on the four Chinese clips, and the English clips differ by one space at a segment boundary. No
+recognised word changes anywhere.
+
+Also fixes the phase-split accounting (it subtracted the process-wide decoder_out total on every frame, which
+drove 'logits' negative) and adds that split: decoder_out is 0.089 s per clip, i.e. negligible - the logits
+loop is the whole cost.
+
+And a harness bug worth naming: scripts/build_android.sh and build_host.sh piped cmake to /dev/null without
+checking the exit status, so a compile error in a dependency was swallowed and the STALE archive got linked,
+measured and reported as if it were the change. That is how the first f16 attempt and the NEON experiment both
+produced confident, meaningless numbers. Both scripts now fail loudly, with the compiler's errors, before
+anything can be measured.
+---
+ src/xasr.cpp | 67 ++++++++++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 63 insertions(+), 4 deletions(-)
+
+diff --git a/src/xasr.cpp b/src/xasr.cpp
+index 5bdf681..312082a 100644
+--- a/src/xasr.cpp
++++ b/src/xasr.cpp
+@@ -79,6 +79,11 @@ struct xasr_model {
+     ggml_tensor *enc_proj_w, *enc_proj_b;
+     // host copies: decoder + joiner
+     std::vector<float> dec_emb, dec_conv, dec_proj_w, dec_proj_b, join_out_w, join_out_b;
++    // Half-precision mirror of the joint output matrix, used on AArch64. The joint is a [5000 x 512] matvec
++    // per encoder frame: 10.2 MB of f32 streamed for every frame at ~4.5 GB/s, with exactly one use per
++    // element, and it measures 3.87 s per 69 s clip - 31% of the ASR leg. Vectorising the arithmetic did not
++    // help (3.84 s), so the lever is bytes, not instructions. This halves them.
++    std::vector<ggml_fp16_t> join_out_w_f16;
+ };
+ 
+ // Chunk geometry, fixed per context.
+@@ -104,7 +109,7 @@ struct acc {
+     // rebuilds, positional-encoding tables, input/output copies, the fbank), which is where the mel
+     // filterbank surprise lived on the diar side.
+     double fbank_s = 0, build_s = 0, alloc_s = 0, pe_s = 0, inputs_s = 0, compute_s = 0, outputs_s = 0;
+-    double greedy_s = 0;
++    double greedy_s = 0, decout_s = 0, logits_s = 0;
+     int64_t build_calls = 0, steps = 0;
+     int64_t total_us = 0;
+     int64_t nodes = 0;
+@@ -167,15 +172,15 @@ inline void dump() {
+     std::fprintf(stderr,
+                  "[xasr-prof] host phases: fbank %.3f s | build %.3f s (%lld calls) alloc %.3f s | "
+                  "pos-enc %.3f s | inputs %.3f s | compute %.3f s (%lld steps) | outputs %.3f s | "
+-                 "greedy/joint %.3f s\n",
++                 "greedy/joint %.3f s (logits %.3f, decoder_out %.3f)\n",
+                  a.fbank_s, a.build_s, (long long) a.build_calls, a.alloc_s, a.pe_s,
+-                 a.inputs_s, a.compute_s, (long long) a.steps, a.outputs_s, a.greedy_s);
++                 a.inputs_s, a.compute_s, (long long) a.steps, a.outputs_s, a.greedy_s, a.logits_s, a.decout_s);
+     a.us.clear();
+     a.calls.clear();
+     a.bytes.clear();
+     a.total_us = 0;
+     a.nodes = 0;
+-    a.fbank_s = a.build_s = a.alloc_s = a.pe_s = a.inputs_s = a.compute_s = a.outputs_s = a.greedy_s = 0.0;
++    a.fbank_s = a.build_s = a.alloc_s = a.pe_s = a.inputs_s = a.compute_s = a.outputs_s = a.greedy_s = a.decout_s = a.logits_s = 0.0;
+     a.build_calls = 0;
+     a.steps = 0;
+ }
+@@ -370,6 +375,15 @@ bool load(xasr_model& m, const char* path, ggml_backend_t backend) {
+     m.dec_proj_w = to_f32(req(m, "join.decoder_proj.weight"));
+     m.dec_proj_b = to_f32(req(m, "join.decoder_proj.bias"));
+     m.join_out_w = to_f32(req(m, "join.output_linear.weight"));
++#if defined(__ARM_NEON) || defined(__aarch64__)
++    {
++        // Keep the f32 copy too: it is the reference path, and the f16 one is a precision change that has to
++        // stand on its own accuracy evidence rather than on this file's byte-identity gate.
++        m.join_out_w_f16.resize(m.join_out_w.size());
++        for (size_t i = 0; i < m.join_out_w.size(); i++)
++            m.join_out_w_f16[i] = ggml_fp32_to_fp16(m.join_out_w[i]);
++    }
++#endif
+     m.join_out_b = to_f32(req(m, "join.output_linear.bias"));
+     return true;
+ }
+@@ -914,6 +928,9 @@ void greedy_run(const xasr_model& m, greedy_state& gs, const float* enc, int n_e
+     const auto& hp = m.hp;
+     const int J = hp.joiner_dim, V = hp.vocab;
+     std::vector<float> t((size_t)J), logits((size_t)V);
++    const bool prof_g = xasr_prof::get().on;
++    double decout_here = 0.0;
++    const auto tl0 = prof_g ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+     for (int f = 0; f < n_enc; f++, gs.frame_pos++) {
+         const float* e = enc + (size_t)f * J;
+         for (int j = 0; j < J; j++)
+@@ -940,6 +957,35 @@ void greedy_run(const xasr_model& m, greedy_state& gs, const float* enc, int n_e
+             // should cut this phase by up to 2x/4x. Both change the logits, so they need the paired
+             // validation (.auto/validate.sh) and a deliberate re-bless - not this file's byte-identity gate.
+             float acc = m.join_out_b[(size_t)v];
++#if defined(__ARM_NEON) || defined(__aarch64__)
++            if (!m.join_out_w_f16.empty()) {
++                // One accumulator, ascending j, widening each f16 group to f32 before the FMA: the only
++                // difference from the f32 path is that the WEIGHTS are rounded to 10 mantissa bits, which is a
++                // real numerical change and is why this needs .auto/validate.sh rather than this gate.
++                // ggml_fp16_t is a uint16_t, while the NDK's arm_neon.h spells the vector type __fp16 -
++                // load as u16 and reinterpret, which is the same bits with no conversion.
++                const ggml_fp16_t* w = m.join_out_w_f16.data() + (size_t)v * J;
++                const float* tp = t.data();
++                float32x4_t a = vdupq_n_f32(acc);
++                int j = 0;
++                for (; j + 7 < J; j += 8) {
++                    const float16x8_t wh = vreinterpretq_f16_u16(vld1q_u16(w + j));
++                    a = vfmaq_f32(a, vcvt_f32_f16(vget_low_f16(wh)), vld1q_f32(tp + j));
++                    a = vfmaq_f32(a, vcvt_f32_f16(vget_high_f16(wh)), vld1q_f32(tp + j + 4));
++                }
++                for (; j + 3 < J; j += 4) {
++                    const float16x4_t wh = vreinterpret_f16_u16(vld1_u16(w + j));
++                    a = vfmaq_f32(a, vcvt_f32_f16(wh), vld1q_f32(tp + j));
++                }
++                acc = vaddvq_f32(a);
++                for (; j < J; j++)
++                    acc += ggml_fp16_to_fp32(w[j]) * tp[j];
++                logits[(size_t)v] = acc;
++                if (acc > logits[(size_t)best])
++                    best = v;
++                continue;
++            }
++#endif
+             const float* w = m.join_out_w.data() + (size_t)v * J;
+             for (int j = 0; j < J; j++)
+                 acc += w[j] * t[(size_t)j];
+@@ -954,9 +1000,22 @@ void greedy_run(const xasr_model& m, greedy_state& gs, const float* enc, int n_e
+             gs.toks.push_back(best);
+             gs.frames.push_back(gs.frame_pos);
+             gs.hyp.push_back(best);
++            const auto td0 = prof_g ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+             gs.d = decoder_out(m, gs.hyp);
++            if (prof_g) {
++                const double dt = std::chrono::duration<double>(
++                    std::chrono::steady_clock::now() - td0).count();
++                xasr_prof::get().decout_s += dt;
++                decout_here += dt;
++            }
+         }
+     }
++    if (prof_g) {
++        // Subtract only what THIS call spent in decoder_out; the accumulator is process-wide, so using it
++        // here double-counts and drives the split negative.
++        xasr_prof::get().logits_s += std::chrono::duration<double>(
++            std::chrono::steady_clock::now() - tl0).count() - decout_here;
++    }
+ }
+ 
+ // sherpa-onnx text-utils: IsCJK / IsPunct (code-point ranges) for RemoveSpaceBetweenCjk.
+-- 
+2.53.0
+

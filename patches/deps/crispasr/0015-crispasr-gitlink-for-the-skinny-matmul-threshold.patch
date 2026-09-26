@@ -1,0 +1,19 @@
+From 714f457e8fb97c8c89d61bd190ad8f9ae488f261 Mon Sep 17 00:00:00 2001
+From: autoresearch <agent@localhost>
+Date: Fri, 25 Sep 2026 07:19:17 +0000
+Subject: [PATCH 15/15] crispasr: gitlink for the skinny-matmul threshold
+
+---
+ ggml | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/ggml b/ggml
+index 66fb373..512a020 160000
+--- a/ggml
++++ b/ggml
+@@ -1 +1 @@
+-Subproject commit 66fb373e9f5dd9de7b52245e3d6aff72f5946701
++Subproject commit 512a02064901a280f8781c5f6aeafa519360e29f
+-- 
+2.53.0
+

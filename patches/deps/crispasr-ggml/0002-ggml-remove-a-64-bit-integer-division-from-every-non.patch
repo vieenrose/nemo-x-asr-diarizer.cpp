@@ -1,0 +1,54 @@
+From 32d6394369582d550a278c036588cb374baf1e0c Mon Sep 17 00:00:00 2001
+From: autoresearch <agent@localhost>
+Date: Fri, 25 Sep 2026 04:08:00 +0000
+Subject: [PATCH 2/5] ggml: remove a 64-bit integer division from every
+ non-contiguous elementwise op
+
+vec_binary_op_non_contiguous computed the src1 row index as i % ne10 on every element. ne10 is int64_t, so
+that is a 64-bit division - roughly 20-30 cycles on an A78 - to index a tensor. The x-asr graph hits this
+path constantly (every add/mul whose src1 is a broadcast or a strided view), and the profile showed exactly
+the signature: ADD at 56 us for a 17 KB tensor is ~31 cycles/element, while a same-size contiguous SCALE ran
+at 1.4 cycles/element.
+
+An incrementing counter that wraps at ne10 selects the identical element in the identical order, so results
+are bit-identical - confirmed by the host gate (transcript hash, all three WERs, attribution, DER-lite
+unchanged). Host ASR leg on gate_ms_v2: 9.8 s -> 4.1 s, with the same 115 tokens.
+
+Also tried and rejected in the same pass: a fast path for ne10 == 1 (a [1,T] broadcast) that replaced the
+one-element-at-a-time loop with a single contiguous loop. Logically equivalent, and it did make the graph
+~2x faster again, but it emitted ZERO tokens - so that shape is load-bearing somewhere I could not see from
+this file, and it is not in the tree. Do not re-add it without a bisect that explains the zero tokens.
+---
+ src/ggml-cpu/binary-ops.cpp | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/src/ggml-cpu/binary-ops.cpp b/src/ggml-cpu/binary-ops.cpp
+index 75e3829..f30ed8d 100644
+--- a/src/ggml-cpu/binary-ops.cpp
++++ b/src/ggml-cpu/binary-ops.cpp
+@@ -39,10 +39,13 @@ static inline void vec_binary_op_non_contiguous(const int64_t n, const int64_t n
+     constexpr auto src1_to_f32 = type_conversion_table<src1_t>::to_f32;
+     constexpr auto f32_to_dst  = type_conversion_table<dst_t >::from_f32;
+ 
++    // Counter instead of i % ne10: the modulo is an integer division per element, and on a phone-sized
++    // elementwise op that division costs more than the add. Same elements, same order, same result.
++    int64_t i10 = 0;
+     for (int i = 0; i < n; i++) {
+-        int i10 = i % ne10;
+         const src1_t * y_ptr = (const src1_t *)((const char *)y + i10*nb10);
+         z[i] = f32_to_dst(op(src0_to_f32(x[i]), src1_to_f32(*y_ptr)));
++        if (++i10 == ne10) i10 = 0;
+     }
+ }
+ 
+@@ -93,7 +96,6 @@ static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * ds
+         if (is_src1_contiguous_rows) {
+             // src1 is broadcastable across src0 and dst in i1, i2, i3
+             const int64_t nr0 = ne00 / ne10;
+-
+             for (int64_t r = 0; r < nr0; ++r) {
+ #ifdef GGML_USE_ACCELERATE
+                 if constexpr (std::is_same_v<src0_t, float> && std::is_same_v<src1_t, float> && std::is_same_v<dst_t, float>) {
+-- 
+2.53.0
+

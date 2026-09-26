@@ -1,0 +1,250 @@
+From 8b10aaaa6f4e2c603ac32c691a7442861a0d5086 Mon Sep 17 00:00:00 2001
+From: autoresearch <agent@localhost>
+Date: Fri, 25 Sep 2026 04:52:47 +0000
+Subject: [PATCH 3/8] mel filterbank: skip the 98.5% of weights that are
+ exactly zero
+
+MelFilterbank::compute_custom walked all n_mels x freq_bins weights for every frame, and accumulated in
+long double - which on ARM64 is IEEE quad precision, so each term is a libgcc call rather than an FPU op.
+The Nemotron-3 diarizer's own bank has 504 nonzero weights out of 32,896 (1.5%, 2.0 bins per mel), so the
+loop spent ~4.4 s per 69 s clip computing sums that are almost entirely zeros: about 19% of the composite's
+wall time, found by the new AUDIOCPP_PROF phase timers (features 4.52 s vs encode 6.61 s per chat69).
+
+The sparse path visits only the nonzero weights, in the same ascending-frequency order, so the surviving
+terms accumulate exactly as before. Skipping an exact zero is not an approximation: adding +0 to a finite
+partial sum is exact, and the only case that could differ is a sum of exactly zero, where the result is -0.0
+or +0.0 and both feed the same log(x + 2^-24). The dense path is kept for banks that are actually dense, so
+no other model is pessimised.
+
+Measured on the phone, armed: mel frontend 4.518 s -> 0.249 s (chat69) and 2.920 s -> 0.153 s (gate_ms_v2),
+an 18-19x speedup on that phase, with the host gate byte-identical (transcript hash 192184ebcd54977e, all
+three WERs, attribution and DER-lite unchanged).
+
+Also adds AUDIOCPP_PROF phase accounting (features / pre_encode / encode / AOS) and a structural op
+histogram of the encoder graph, since audiocpp computes a planned graph on a bare backend and has no
+eval-callback hook to borrow the way x-asr does.
+---
+ src/framework/audio/dsp.cpp            | 42 ++++++++++--
+ src/models/nemotron_3_diar/session.cpp | 92 ++++++++++++++++++++++++++
+ 2 files changed, 130 insertions(+), 4 deletions(-)
+
+diff --git a/src/framework/audio/dsp.cpp b/src/framework/audio/dsp.cpp
+index 0397642..7b5aad8 100644
+--- a/src/framework/audio/dsp.cpp
++++ b/src/framework/audio/dsp.cpp
+@@ -648,16 +648,50 @@ AudioTensor MelFilterbank::compute_custom(
+     AudioTensor result;
+     result.shape = {batch, n_mels, frames};
+     result.values.assign(static_cast<size_t>(checked_product({batch, n_mels, frames})), 0.0f);
++
++    // Mel filterbanks are triangular: almost every weight is exactly zero. The dense loop spends a
++    // software-emulated 128-bit multiply-add on every one of them - and on ARM64 `long double` IS quad
++    // precision, so each is a libgcc call, not an FPU instruction. Measured on the phone with the
++    // Nemotron-3 diarizer's own bank: 504 nonzero weights out of 32,896 (1.5%, 2.0 bins per mel), and this
++    // loop was ~4.4 s of a 69 s clip - about 19% of the whole composite's wall time - computing sums that are
++    // 98.5% zeros.
++    //
++    // Skipping an exactly-zero weight is bit-identical rather than approximate: adding +0 to a finite partial
++    // sum is exact, the surviving terms accumulate in the same ascending-frequency order as before, and the
++    // only divergence possible is a sum that is exactly zero, where the result is -0.0 or +0.0 and both give
++    // the same log(x + 2^-24) downstream. The dense path is kept for banks that really are dense, so this
++    // cannot pessimise another model.
++    std::vector<std::vector<std::pair<int64_t, float>>> sparse(static_cast<size_t>(n_mels));
++    int64_t nonzero = 0;
++    for (int64_t m = 0; m < n_mels; ++m) {
++        for (int64_t f = 0; f < freq_bins; ++f) {
++            const float w = filterbank.values[static_cast<size_t>(m * freq_bins + f)];
++            if (w != 0.0f) {
++                sparse[static_cast<size_t>(m)].emplace_back(f, w);
++                ++nonzero;
++            }
++        }
++    }
++    const bool use_sparse = nonzero * 2 < n_mels * freq_bins;
+ #ifdef _OPENMP
+-    #pragma omp parallel for collapse(3) if(batch * n_mels * frames >= 4096)
++    #pragma omp parallel for collapse(2) if(batch * n_mels * frames >= 4096)
+ #endif
+     for (int64_t b = 0; b < batch; ++b) {
+         for (int64_t m = 0; m < n_mels; ++m) {
++            const auto & terms = sparse[static_cast<size_t>(m)];
+             for (int64_t t = 0; t < frames; ++t) {
+                 long double sum = 0.0;
+-                for (int64_t f = 0; f < freq_bins; ++f) {
+-                    sum += static_cast<long double>(filterbank.values[static_cast<size_t>(m * freq_bins + f)]) *
+-                           static_cast<long double>(power_spec[static_cast<size_t>(((b * freq_bins) + f) * frames + t)]);
++                if (use_sparse) {
++                    for (const auto & term : terms) {
++                        sum += static_cast<long double>(term.second) *
++                               static_cast<long double>(power_spec[static_cast<size_t>(
++                                   ((b * freq_bins) + term.first) * frames + t)]);
++                    }
++                } else {
++                    for (int64_t f = 0; f < freq_bins; ++f) {
++                        sum += static_cast<long double>(filterbank.values[static_cast<size_t>(m * freq_bins + f)]) *
++                               static_cast<long double>(power_spec[static_cast<size_t>(((b * freq_bins) + f) * frames + t)]);
++                    }
+                 }
+                 result.values[static_cast<size_t>(((b * n_mels) + m) * frames + t)] = static_cast<float>(sum);
+             }
+diff --git a/src/models/nemotron_3_diar/session.cpp b/src/models/nemotron_3_diar/session.cpp
+index 3f864fa..52356c1 100644
+--- a/src/models/nemotron_3_diar/session.cpp
++++ b/src/models/nemotron_3_diar/session.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include <algorithm>
+ #include <chrono>
++#include <map>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <numeric>
+@@ -13,6 +14,70 @@
+ #include <utility>
+ 
+ namespace engine::models::nemotron_3_diar {
++
++// Diagnostic phase accounting for the diar encoder, off unless AUDIOCPP_PROF is set. audiocpp computes a
++// PLANNED graph on a bare ggml backend (no ggml_backend_sched), so there is no eval-callback hook to borrow
++// the way the x-asr leg has one; what is measurable here without distorting the run is phase-level time plus
++// a structural op histogram. That is what a one-runtime port needs anyway: which phase the window's cost is
++// actually in (mel frontend, conv subsample, transformer encoder, AOS state update), and which ops dominate
++// the graph it would have to rebuild.
++namespace diar_prof {
++
++struct acc {
++    double features_s = 0, pre_encode_s = 0, encode_s = 0, aos_s = 0, encode_build_s = 0;
++    int64_t windows = 0, nodes = 0, elements = 0;
++    std::map<int, int64_t> op_nodes, op_elems;
++    bool on = false;
++};
++
++inline acc& get() {
++    static acc a;
++    return a;
++}
++
++inline bool on() {
++    acc& a = get();
++    if (!a.on) {
++        a.on = std::getenv("AUDIOCPP_PROF") != nullptr;
++    }
++    return a.on;
++}
++
++inline void note_graph(ggml_cgraph * gf) {
++    acc& a = get();
++    if (!a.on || gf == nullptr) return;
++    a.windows++;
++    for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
++        const ggml_tensor * t = ggml_graph_node(gf, i);
++        const int64_t ne = ggml_nelements(t);
++        a.nodes++;
++        a.elements += ne;
++        a.op_nodes[(int) t->op] += 1;
++        a.op_elems[(int) t->op] += ne;
++    }
++}
++
++inline void dump() {
++    acc& a = get();
++    if (!a.on || a.windows == 0) return;
++    std::fprintf(stderr,
++                 "[diar-prof] windows=%lld graph_nodes/window=%.0f elems/window=%.0f | "
++                 "features %.3f s  pre_encode %.3f s  encode %.3f s (build %.3f)  aos %.3f s\n",
++                 (long long) a.windows, (double) a.nodes / a.windows, (double) a.elements / a.windows,
++                 a.features_s, a.pre_encode_s, a.encode_s, a.encode_build_s, a.aos_s);
++    std::vector<std::pair<int, int64_t>> rows(a.op_nodes.begin(), a.op_nodes.end());
++    std::sort(rows.begin(), rows.end(), [](auto& l, auto& r) { return l.second > r.second; });
++    for (auto& r : rows) {
++        const char* n = ggml_op_name((ggml_op) r.first);
++        std::fprintf(stderr, "[diar-prof]   %-22s %7lld nodes/window  %10.0f elems/window\n",
++                     n ? n : "?", (long long)(r.second / a.windows), (double) a.op_elems[r.first] / a.windows);
++    }
++    a = acc();
++    a.on = true;
++}
++
++} // namespace diar_prof
++
+ namespace {
+ 
+ constexpr const char * kFamily = "nemotron_3_diar";
+@@ -94,6 +159,8 @@ Session::DecodeConfig Session::decode_config(
+ }
+ 
+ std::vector<float> Session::pre_encode(const FeatureBatch & features) {
++    const bool prof_p = diar_prof::on();
++    const auto tp0 = prof_p ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+     ensure_pre_encode_graph(
+         pre_encode_graph_, execution_context(), *assets_, *weights_, graph_arena_bytes_,
+         features.batch, features.encoder_frames);
+@@ -105,6 +172,10 @@ std::vector<float> Session::pre_encode(const FeatureBatch & features) {
+     }
+     std::vector<float> embeddings;
+     core::read_tensor_f32_into(pre_encode_graph_->output.tensor, embeddings);
++    if (prof_p) {
++        diar_prof::get().pre_encode_s += std::chrono::duration<double>(
++            std::chrono::steady_clock::now() - tp0).count();
++    }
+     return embeddings;
+ }
+ 
+@@ -113,6 +184,8 @@ std::vector<float> Session::encode(
+     int64_t batch,
+     int64_t frames,
+     const std::vector<int64_t> & valid_frames) {
++    const bool prof = diar_prof::on();
++    const auto t0 = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+     ensure_encoder_graph(
+         encoder_graph_, execution_context(), *assets_, *weights_, graph_arena_bytes_,
+         batch, frames);
+@@ -121,10 +194,19 @@ std::vector<float> Session::encode(
+         encoder_graph_->attention_mask,
+         attention_mask(valid_frames, frames));
+     core::set_backend_threads(execution_context().backend(), encoder_graph_->threads);
++    if (prof) {
++        diar_prof::note_graph(encoder_graph_->graph);
++        diar_prof::get().encode_build_s += std::chrono::duration<double>(
++            std::chrono::steady_clock::now() - t0).count();
++    }
+     if (core::compute_backend_graph(
+             execution_context().backend(), encoder_graph_->graph, encoder_graph_->plan) != GGML_STATUS_SUCCESS) {
+         throw std::runtime_error("Nemotron 3 diarization encoder graph failed");
+     }
++    if (prof) {
++        diar_prof::get().encode_s += std::chrono::duration<double>(
++            std::chrono::steady_clock::now() - t0).count();
++    }
+     std::vector<float> probabilities;
+     core::read_tensor_f32_into(encoder_graph_->probabilities.tensor, probabilities);
+     return probabilities;
+@@ -138,8 +220,14 @@ void Session::process_window_batch(
+     if (windows.size() != states.size() || windows.size() != timelines.size()) {
+         throw std::runtime_error("Nemotron 3 diarization streaming batch shape mismatch");
+     }
++    const bool prof_w = diar_prof::on();
++    const auto tf0 = prof_w ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+     auto features = compute_stream_features(
+         windows, *assets_, execution_context().config().threads);
++    if (prof_w) {
++        diar_prof::get().features_s += std::chrono::duration<double>(
++            std::chrono::steady_clock::now() - tf0).count();
++    }
+     if (task_.mode == runtime::RunMode::Streaming) {
+         if (windows.size() != 1) {
+             throw std::runtime_error("Nemotron 3 diarization streaming requires a single graph row");
+@@ -531,6 +619,10 @@ runtime::TaskResult Session::finalize() {
+                      std::chrono::duration<double>(t1 - t0).count(),
+                      std::chrono::duration<double>(t2 - t1).count(), (long long)frames);
+     }
++    if (prof) {
++        diar_prof::get().aos_s += std::chrono::duration<double>(t2 - t1).count();
++        diar_prof::dump();
++    }
+     stream_started_ = false;
+     return result;
+ }
+-- 
+2.53.0
+

@@ -1,0 +1,27 @@
+From f8bfb70a309a07d2038c5b39f667c5e0d2e762eb Mon Sep 17 00:00:00 2001
+From: autoresearch <agent@localhost>
+Date: Fri, 25 Sep 2026 06:58:43 +0000
+Subject: [PATCH 14/15] xasr: the merged profiler view is not const - the shape
+ table indexes its maps
+
+---
+ src/xasr.cpp | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/xasr.cpp b/src/xasr.cpp
+index 10c5adb..bf8a817 100644
+--- a/src/xasr.cpp
++++ b/src/xasr.cpp
+@@ -209,7 +209,8 @@ inline void dump() {
+     }
+     if (!any)
+         return;
+-    const acc& a = merged;
++    // non-const: the shape table below indexes the maps, and operator[] is not const-qualified
++    acc& a = merged;
+     std::vector<std::pair<int, int64_t>> rows(a.us.begin(), a.us.end());
+     std::sort(rows.begin(), rows.end(), [](auto& l, auto& r) { return l.second > r.second; });
+     std::fprintf(stderr,
+-- 
+2.53.0
+

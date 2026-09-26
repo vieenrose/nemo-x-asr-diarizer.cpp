@@ -1,0 +1,19 @@
+From c81fdddb8a0f6dac86001f4df3fac5a3798074c1 Mon Sep 17 00:00:00 2001
+From: autoresearch <agent@localhost>
+Date: Fri, 25 Sep 2026 06:53:01 +0000
+Subject: [PATCH 12/15] crispasr: gitlink for the quantisation-volume counter
+
+---
+ ggml | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/ggml b/ggml
+index e2d5b30..66fb373 160000
+--- a/ggml
++++ b/ggml
+@@ -1 +1 @@
+-Subproject commit e2d5b30badae7387bfed11761408766bbd41fe1b
++Subproject commit 66fb373e9f5dd9de7b52245e3d6aff72f5946701
+-- 
+2.53.0
+

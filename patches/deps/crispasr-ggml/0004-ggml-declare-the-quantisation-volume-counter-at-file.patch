@@ -1,0 +1,46 @@
+From 66fb373e9f5dd9de7b52245e3d6aff72f5946701 Mon Sep 17 00:00:00 2001
+From: autoresearch <agent@localhost>
+Date: Fri, 25 Sep 2026 06:53:01 +0000
+Subject: [PATCH 4/5] ggml: declare the quantisation-volume counter at file
+ scope
+
+The increment landed in an earlier commit but the DECLARATION did not: that edit's script raised on a later
+anchor before writing the file, so the counter was referenced and never defined, and the commit message for it
+described work that was not in the tree. Fifth quiet no-op of this session, and the one that actually shipped a
+false commit message - which is the strongest argument yet for asserting on every edit instead of assuming it
+applied. Declared after the includes, with the enable flag cached, so the hot path pays nothing unless
+GGML_COUNT_QUANT is set.
+---
+ src/ggml-cpu/ggml-cpu.c | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index 722f049..14c06a9 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -49,6 +49,22 @@
+ 
+ #ifdef GGML_USE_LLAMAFILE
+ #include "llamafile/sgemm.h"
++
++// Diagnostic: activation elements quantised by mul_mat. Every mul_mat converts its F32 src1 to the vec_dot
++// type - Q8_0 for every quantised weight type - and a transformer block feeds the SAME activation tensor to
++// three or four matmuls, so the same elements are converted repeatedly. Whether memoising that conversion is
++// worth building depends entirely on the volume, so it is counted rather than guessed. Off unless
++// GGML_COUNT_QUANT is set; even then it is one relaxed atomic per matmul, and only from thread 0.
++uint64_t g_ggml_quant_elems = 0;
++
++static int g_ggml_count_quant = -1;
++
++static inline int ggml_count_quant_enabled(void) {
++    if (g_ggml_count_quant < 0) {
++        g_ggml_count_quant = getenv("GGML_COUNT_QUANT") != NULL;
++    }
++    return g_ggml_count_quant;
++}
+ #endif
+ 
+ #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
+-- 
+2.53.0
+

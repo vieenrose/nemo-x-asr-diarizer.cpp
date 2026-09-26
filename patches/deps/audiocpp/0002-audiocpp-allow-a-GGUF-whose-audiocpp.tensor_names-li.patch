@@ -1,0 +1,88 @@
+From e2ba2e05208328ea378733427d2bc4377a5995bb Mon Sep 17 00:00:00 2001
+From: autoresearch <agent@localhost>
+Date: Fri, 25 Sep 2026 04:40:50 +0000
+Subject: [PATCH 2/8] audiocpp: allow a GGUF whose audiocpp.tensor_names list
+ is a prefix of its tensors
+
+A merged bundle (nemo-x-asr-diarizer's tools/merge_gguf.py) carries another model's tensors in the same
+file. This source addresses tensors by logical name, so unmapped entries are simply not ours; the check that
+actually matters is kept, namely that the list may not claim more names than the file has tensors.
+---
+ src/framework/assets/tensor_source.cpp | 15 +++++++++++++--
+ src/models/nemotron_3_diar/session.cpp | 13 +++++++++++++
+ 2 files changed, 26 insertions(+), 2 deletions(-)
+
+diff --git a/src/framework/assets/tensor_source.cpp b/src/framework/assets/tensor_source.cpp
+index 1bcbd7b..9c4c04f 100644
+--- a/src/framework/assets/tensor_source.cpp
++++ b/src/framework/assets/tensor_source.cpp
+@@ -739,13 +739,24 @@ public:
+         try {
+             data_begin_ = gguf_get_data_offset(gguf);
+             const int64_t logical_names_key = gguf_find_key(gguf, "audiocpp.tensor_names");
++            const int64_t tensor_count = gguf_get_n_tensors(gguf);
++            // BUNDLE SUPPORT: the logical-name list may be a PREFIX of the file's tensors, not necessarily
++            // all of them. A merged GGUF (tools/merge_gguf.py) carries another model's tensors in the same
++            // file, and those are simply not ours - we address tensors by logical name, so unmapped entries
++            // are invisible to this source. The invariant that actually matters is preserved: the list may
++            // not claim MORE names than the file has tensors, which would make a lookup point past the end.
++            const int64_t logical_count = logical_names_key >= 0
++                ? static_cast<int64_t>(gguf_get_arr_n(gguf, logical_names_key))
++                : tensor_count;
+             if (logical_names_key >= 0 &&
+                 (gguf_get_kv_type(gguf, logical_names_key) != GGUF_TYPE_ARRAY ||
+                  gguf_get_arr_type(gguf, logical_names_key) != GGUF_TYPE_STRING ||
+-                 gguf_get_arr_n(gguf, logical_names_key) != static_cast<size_t>(gguf_get_n_tensors(gguf)))) {
++                 logical_count > tensor_count)) {
+                 throw std::runtime_error("GGUF audiocpp.tensor_names metadata is invalid");
+             }
+-            const int64_t count = gguf_get_n_tensors(gguf);
++            const int64_t count = logical_names_key >= 0
++                ? std::min(tensor_count, logical_count)
++                : tensor_count;
+             const int64_t ranks_key = gguf_find_key(gguf, "audiocpp.tensor_ranks");
+             const int64_t shapes_key = gguf_find_key(gguf, "audiocpp.tensor_shapes");
+             const bool has_exact_shapes = ranks_key >= 0 && shapes_key >= 0;
+diff --git a/src/models/nemotron_3_diar/session.cpp b/src/models/nemotron_3_diar/session.cpp
+index 9a06ea2..3f864fa 100644
+--- a/src/models/nemotron_3_diar/session.cpp
++++ b/src/models/nemotron_3_diar/session.cpp
+@@ -5,7 +5,9 @@
+ #include "engine/framework/runtime/spec_backed_model.h"
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cstdio>
++#include <cstdlib>
+ #include <numeric>
+ #include <stdexcept>
+ #include <utility>
+@@ -509,7 +511,12 @@ runtime::StreamEvent Session::process_audio_chunk(const runtime::AudioChunk & ch
+ runtime::TaskResult Session::finalize() {
+     require_prepared("Nemotron 3 diarization finalize()");
+     if (!stream_started_) throw std::runtime_error("Nemotron 3 diarization has no active stream");
++    // Diagnostic split of the drain, which shows up as unattributed "other" seconds in the composite loop
++    // (the per-piece timers only cover audiocpp_stream_push). Off unless AUDIOCPP_PROF is set.
++    const bool prof = std::getenv("AUDIOCPP_PROF") != nullptr;
++    const auto t0 = std::chrono::steady_clock::now();
+     process_stream_windows(stream_scheduler_->finalize());
++    const auto t1 = std::chrono::steady_clock::now();
+     const int64_t speakers = assets_->model_config.num_speakers;
+     const int64_t expected_frames = (stream_samples_ + kOutputHopSamples - 1) / kOutputHopSamples;
+     const int64_t frames = std::min<int64_t>(
+@@ -518,6 +525,12 @@ runtime::TaskResult Session::finalize() {
+     runtime::TaskResult result;
+     result.speaker_turns = decode_turns(
+         stream_probabilities_, frames, decode_config(stream_request_.options), true);
++    const auto t2 = std::chrono::steady_clock::now();
++    if (prof) {
++        std::fprintf(stderr, "[audiocpp-prof] finalize: final_window %.3f s  decode_turns %.3f s  (frames=%lld)\n",
++                     std::chrono::duration<double>(t1 - t0).count(),
++                     std::chrono::duration<double>(t2 - t1).count(), (long long)frames);
++    }
+     stream_started_ = false;
+     return result;
+ }
+-- 
+2.53.0
+

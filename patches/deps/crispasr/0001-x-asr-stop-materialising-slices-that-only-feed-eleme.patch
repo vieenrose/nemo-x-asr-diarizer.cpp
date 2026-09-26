@@ -1,0 +1,229 @@
+From e2446919069e99356530acaac49007e9fa5c17a2 Mon Sep 17 00:00:00 2001
+From: autoresearch <agent@localhost>
+Date: Fri, 25 Sep 2026 03:52:14 +0000
+Subject: [PATCH 01/15] x-asr: stop materialising slices that only feed
+ elementwise ops
+
+Profiling the phone (XASR_PROF=1, new eval-callback hook) shows the ASR leg is only 31% MUL_MAT: ADD 22%,
+CONT 22%, MUL 4.6%, PAD 1.5%. The CONT nodes are mostly ggml_cont around a strided view whose consumer is
+tanh/mul/sigmoid/add - ops that already honour nb strides. rows_view() keeps the view for exactly those
+sites (NonlinAttention gate/value, conv chunk gate, the attention score bias), and the score bias is now
+added straight from its strided view. Every one of those was a per-layer, per-step memcpy the consumer
+never needed; values and accumulation order are untouched, so the output is byte-identical (transcript hash,
+WER, attribution, DER-lite all unchanged).
+
+The hook stays: XASR_PROF=1 prints the per-op time mix on xasr_free, which is how the next kernel decision
+should be made instead of by guessing.
+---
+ src/xasr.cpp | 111 ++++++++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 105 insertions(+), 6 deletions(-)
+
+diff --git a/src/xasr.cpp b/src/xasr.cpp
+index e77b5c0..3d9c5b6 100644
+--- a/src/xasr.cpp
++++ b/src/xasr.cpp
+@@ -26,6 +26,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <string>
++#include <unordered_map>
+ #include <vector>
+ 
+ namespace {
+@@ -83,6 +84,73 @@ struct geom {
+ 
+ } // namespace
+ 
++// Diagnostic per-op time accumulator for the x-asr chunk graph. Off unless XASR_PROF is set, and purely an
++// observer: the eval callback only reads tensor->op and timestamps, so the numbers and the output are
++// identical with it on. The point is to stop guessing where the ASR leg's arithmetic goes before deciding
++// which kernel is worth writing - the leg is weight-format insensitive (q4_k ties q5_0), so the only lever
++// left is the op mix itself.
++namespace xasr_prof {
++
++struct acc {
++    std::unordered_map<ggml_tensor*, int64_t> start;
++    std::unordered_map<int, int64_t> us;
++    int64_t total_us = 0;
++    int64_t nodes = 0;
++    bool on = false;
++};
++
++inline acc& get() {
++    static acc a;
++    return a;
++}
++
++inline const char* op_name(int op) {
++    const char* n = ggml_op_name((ggml_op)op);
++    return n ? n : "?";
++}
++
++inline bool callback(ggml_tensor* t, bool ask, void*) {
++    acc& a = get();
++    if (ask) {
++        a.start[t] = ggml_time_us();
++        return true;
++    }
++    auto it = a.start.find(t);
++    if (it == a.start.end())
++        return true;
++    const int64_t dt = ggml_time_us() - it->second;
++    a.start.erase(it);
++    a.us[(int)t->op] += dt;
++    a.total_us += dt;
++    a.nodes++;
++    return true;
++}
++
++inline void install(ggml_backend_sched_t sched) {
++    acc& a = get();
++    a.on = true;
++    ggml_backend_sched_set_eval_callback(sched, callback, nullptr);
++}
++
++inline void dump() {
++    acc& a = get();
++    if (!a.on || a.total_us <= 0)
++        return;
++    std::vector<std::pair<int, int64_t>> rows(a.us.begin(), a.us.end());
++    std::sort(rows.begin(), rows.end(), [](auto& l, auto& r) { return l.second > r.second; });
++    std::fprintf(stderr, "[xasr-prof] nodes=%lld accounted=%.3f s\n",
++                 (long long)a.nodes, a.total_us / 1e6);
++    for (auto& r : rows) {
++        std::fprintf(stderr, "[xasr-prof]   %-24s %8.3f s  %5.1f%%\n",
++                     op_name(r.first), r.second / 1e6, 100.0 * r.second / a.total_us);
++    }
++    a.us.clear();
++    a.total_us = 0;
++    a.nodes = 0;
++}
++
++} // namespace xasr_prof
++
+ struct xasr_context {
+     xasr_context_params params;
+     xasr_model model;
+@@ -314,6 +382,15 @@ ggml_tensor* rows(ggml_context* g, ggml_tensor* x, int r0, int n) {
+     return ggml_cont(g, ggml_view_2d(g, x, n, x->ne[1], x->nb[1], (size_t)r0 * ggml_element_size(x)));
+ }
+ 
++// Same slice as rows(), but keeps the strided view instead of materialising it. Valid ONLY for elementwise
++// consumers (tanh/mul/sigmoid/add), which honour nb strides - never feed the result to reshape/permute/mul_mat,
++// which assume contiguity and would silently copy it back. On the phone the x-asr leg spent 22% of its time
++// in GGML_OP_CONT, and most of those nodes were exactly this: a per-layer, per-step memcpy feeding an
++// elementwise op that never needed contiguous memory.
++ggml_tensor* rows_view(ggml_context* g, ggml_tensor* x, int r0, int n) {
++    return ggml_view_2d(g, x, n, x->ne[1], x->nb[1], (size_t)r0 * ggml_element_size(x));
++}
++
+ // CompactRelPositionalEncoding rows for relative positions -(seq+left-1) .. seq-1.
+ std::vector<float> compact_pe(int pos_dim, int seq, int left) {
+     const int L2 = left + 2 * seq - 1;
+@@ -377,7 +454,7 @@ ggml_tensor* zipformer_layer(ggml_context* g, ggml_cgraph* gf, const xasr_hparam
+     // rel -> abs: out[j, t] = ps[j + seq-1-t, t] (icefall's as_strided)
+     ggml_tensor* shifted =
+         ggml_view_3d(g, ps, Tk, seq, H, ps->nb[1] - ps->nb[0], ps->nb[2], (size_t)(seq - 1) * ps->nb[0]);
+-    sc = ggml_add(g, sc, ggml_cont(g, shifted));
++    sc = ggml_add(g, sc, shifted);
+     sc = ggml_add(g, sc, mask);            // (Tk) broadcast: -inf on not-yet-filled left context
+     ggml_tensor* W = ggml_soft_max(g, sc); // (Tk, seq, H)
+ 
+@@ -387,9 +464,9 @@ ggml_tensor* zipformer_layer(ggml_context* g, ggml_cgraph* gf, const xasr_hparam
+     // 3. NonlinAttention with head 0's weights
+     {
+         ggml_tensor* t = lin(g, x, L.na_in_w, L.na_in_b); // (3*hid, seq)
+-        ggml_tensor* sgate = ggml_tanh(g, rows(g, t, 0, hid));
+-        ggml_tensor* xx = ggml_mul(g, rows(g, t, hid, hid), sgate);
+-        ggml_tensor* y = rows(g, t, 2 * hid, hid);
++        ggml_tensor* sgate = ggml_tanh(g, rows_view(g, t, 0, hid));
++        ggml_tensor* xx = ggml_mul(g, rows_view(g, t, hid, hid), sgate);
++        ggml_tensor* y = rows_view(g, t, 2 * hid, hid);
+         ggml_tensor* cn = ggml_new_tensor_2d(g, GGML_TYPE_F32, hid, left);
+         in_tensor(cn, lname("cn", li));
+         ggml_tensor* xp = ggml_concat(g, cn, xx, 1); // (hid, Tk)
+@@ -414,7 +491,7 @@ ggml_tensor* zipformer_layer(ggml_context* g, ggml_cgraph* gf, const xasr_hparam
+ 
+     auto conv = [&](ggml_tensor* xin, const conv_mod& C, const char* cname) {
+         ggml_tensor* t = lin(g, xin, C.in_w, C.in_b); // (2d, seq)
+-        ggml_tensor* xg = ggml_mul(g, rows(g, t, 0, d), ggml_sigmoid(g, rows(g, t, d, d)));
++        ggml_tensor* xg = ggml_mul(g, rows_view(g, t, 0, d), ggml_sigmoid(g, rows_view(g, t, d, d)));
+         ggml_tensor* cc = ggml_new_tensor_2d(g, GGML_TYPE_F32, d, pad);
+         in_tensor(cc, lname(cname, li));
+         ggml_tensor* xc = ggml_concat(g, cc, xg, 1); // (d, pad+seq)
+@@ -560,6 +637,8 @@ bool ensure_sched(xasr_context* c) {
+         return true;
+     ggml_backend_t be[2] = {c->backend, c->backend_cpu};
+     c->sched = ggml_backend_sched_new(be, nullptr, c->backend != c->backend_cpu ? 2 : 1, kGraphNodes, false, false);
++    if (c->sched && getenv("XASR_PROF"))
++        xasr_prof::install(c->sched);
+     return c->sched != nullptr;
+ }
+ 
+@@ -723,6 +802,11 @@ struct greedy_state {
+     std::vector<int> hyp;
+     std::vector<float> d; // decoder_proj output for the current context
+     std::vector<int32_t> toks;
++    // Encoder frame each token was emitted at. The greedy loop consumes one encoder frame per step and
++    // emits at most one symbol, so a token's time is a loop counter - no alignment model, no DTW, and it
++    // cannot disagree with the text because it comes from the same pass that produced it.
++    std::vector<int64_t> frames;
++    int64_t frame_pos = 0;   // global across chunk calls; greedy_run is called once per chunk
+     bool first = true;
+ };
+ 
+@@ -731,6 +815,8 @@ void greedy_init(const xasr_model& m, greedy_state& gs) {
+     gs.hyp.back() = m.hp.blank_id;
+     gs.d = decoder_out(m, gs.hyp);
+     gs.toks.clear();
++    gs.frames.clear();
++    gs.frame_pos = 0;
+     gs.first = true;
+ }
+ 
+@@ -738,7 +824,7 @@ void greedy_run(const xasr_model& m, greedy_state& gs, const float* enc, int n_e
+     const auto& hp = m.hp;
+     const int J = hp.joiner_dim, V = hp.vocab;
+     std::vector<float> t((size_t)J), logits((size_t)V);
+-    for (int f = 0; f < n_enc; f++) {
++    for (int f = 0; f < n_enc; f++, gs.frame_pos++) {
+         const float* e = enc + (size_t)f * J;
+         for (int j = 0; j < J; j++)
+             t[(size_t)j] = std::tanh(e[j] + gs.d[(size_t)j]);
+@@ -757,6 +843,7 @@ void greedy_run(const xasr_model& m, greedy_state& gs, const float* enc, int n_e
+         gs.first = false;
+         if (best != hp.blank_id && best != hp.unk_id) {
+             gs.toks.push_back(best);
++            gs.frames.push_back(gs.frame_pos);
+             gs.hyp.push_back(best);
+             gs.d = decoder_out(m, gs.hyp);
+         }
+@@ -899,6 +986,8 @@ extern "C" struct xasr_context* xasr_init_from_file(const char* path, struct xas
+ extern "C" void xasr_free(struct xasr_context* c) {
+     if (!c)
+         return;
++    if (getenv("XASR_PROF"))
++        xasr_prof::dump();
+     if (c->sched)
+         ggml_backend_sched_free(c->sched);
+     if (c->model.buf)
+@@ -1052,6 +1141,16 @@ extern "C" char* xasr_stream_accept(struct xasr_stream* s, const float* samples,
+     return dup_str(stream_text(s));
+ }
+ 
++extern "C" int xasr_stream_token_times(struct xasr_stream* s, const int32_t** out_ids,
++                                       const int64_t** out_frames, int* out_n) {
++    if (!s) return -1;
++    *out_ids = s->gs.toks.empty() ? nullptr : s->gs.toks.data();
++    *out_frames = s->gs.frames.empty() ? nullptr : s->gs.frames.data();
++    *out_n = (int)s->gs.frames.size();
++    if ((int)s->gs.toks.size() != *out_n) return -1;   // ids and times must describe the same pass
++    return 0;
++}
++
+ extern "C" void xasr_stream_reset(struct xasr_stream* s) {
+     stream_reset(s);
+ }
+-- 
+2.53.0
+

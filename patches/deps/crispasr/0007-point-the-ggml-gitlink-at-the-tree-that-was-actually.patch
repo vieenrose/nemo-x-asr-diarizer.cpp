@@ -1,0 +1,24 @@
+From 6b93fc111a75ed7b44aea22193d5bef24577301c Mon Sep 17 00:00:00 2001
+From: autoresearch <agent@localhost>
+Date: Fri, 25 Sep 2026 05:48:15 +0000
+Subject: [PATCH 07/15] point the ggml gitlink at the tree that was actually
+ measured
+
+The submodule pointer still named the pre-session ggml commit while the worktree carried the two bit-identical
+CPU fixes, so crispasr reported itself dirty and any checkout or submodule update here would have silently
+reverted them. deps.lock in the composite project now records all three dependency heads and the build refuses
+to run against anything else.
+---
+ ggml | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/ggml b/ggml
+index 2f5a80d..32d6394 160000
+--- a/ggml
++++ b/ggml
+@@ -1 +1 @@
+-Subproject commit 2f5a80d258c46e6ac8eee95f1328c0f58376d7ee
++Subproject commit 32d6394369582d550a278c036588cb374baf1e0c
+-- 
+2.53.0
+

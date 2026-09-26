@@ -1,0 +1,239 @@
+From 5c933c5107e172fc08a5444ef9d018287826b9e4 Mon Sep 17 00:00:00 2001
+From: autoresearch <agent@localhost>
+Date: Fri, 25 Sep 2026 05:00:11 +0000
+Subject: [PATCH 04/15] x-asr: build the chunk graph once and own its context
+ (fixes a latent use-after-free)
+
+Two things were wrong in the same place. First, build_chunk_graph() returned a ggml_cgraph whose
+ggml_context it had already freed - ggml allocates mem_buffer even with no_alloc=true, so the graph struct
+lived in freed memory. It only worked because the next ggml_init happened to reuse that block before anyone
+touched the graph again. Second, the whole ~4,000-node graph was rebuilt and re-allocated on every decode
+step (143 builds for 145 steps on a 69 s clip), costing 0.196 s of construction plus 0.349 s of
+reset+alloc.
+
+Now the context owns the graph: build once, ggml_backend_sched_reset + alloc_graph once, then per step only
+write the inputs and compute again - the same graph-reuse pattern llama.cpp uses across tokens of a
+streaming model. The positional-encoding tables are built once for the same reason (they are pure functions
+of the geometry). xasr_free frees the scheduler before the graph context, since the scheduler's allocations
+point into it.
+
+Numerically this is a no-op: the same nodes, in the same order, with the same inputs. The host gate confirms
+it - transcript hash 192184ebcd54977e, all three WERs, attribution and DER-lite unchanged.
+
+Also adds host-phase timers to XASR_PROF (fbank / build / alloc / pos-enc / inputs / compute / outputs),
+which is how the split was measured: the ASR leg is ~93% ggml compute (19.2 s compute vs 1.3 s of host work
+per 69 s clip), i.e. the opposite of the diar leg, where 40% was signal processing.
+---
+ src/xasr.cpp | 103 +++++++++++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 92 insertions(+), 11 deletions(-)
+
+diff --git a/src/xasr.cpp b/src/xasr.cpp
+index c615c40..75695b8 100644
+--- a/src/xasr.cpp
++++ b/src/xasr.cpp
+@@ -21,6 +21,7 @@
+ #include "gguf.h"
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -96,6 +97,11 @@ struct acc {
+     std::unordered_map<int, int64_t> us;
+     std::unordered_map<int, int64_t> calls;
+     std::unordered_map<int, int64_t> bytes;
++    // Host-side phase timers. The op mix only sees ggml nodes; these see the work around them (graph
++    // rebuilds, positional-encoding tables, input/output copies, the fbank), which is where the mel
++    // filterbank surprise lived on the diar side.
++    double fbank_s = 0, build_s = 0, alloc_s = 0, pe_s = 0, inputs_s = 0, compute_s = 0, outputs_s = 0;
++    int64_t build_calls = 0, steps = 0;
+     int64_t total_us = 0;
+     int64_t nodes = 0;
+     bool on = false;
+@@ -154,11 +160,19 @@ inline void dump() {
+                      (long long)nc, nc ? r.second / (double)nc : 0.0,
+                      nb / 1048576.0, nc ? nb / 1024.0 / (double)nc : 0.0);
+     }
++    std::fprintf(stderr,
++                 "[xasr-prof] host phases: fbank %.3f s | build %.3f s (%lld calls) alloc %.3f s | "
++                 "pos-enc %.3f s | inputs %.3f s | compute %.3f s (%lld steps) | outputs %.3f s\n",
++                 a.fbank_s, a.build_s, (long long) a.build_calls, a.alloc_s, a.pe_s,
++                 a.inputs_s, a.compute_s, (long long) a.steps, a.outputs_s);
+     a.us.clear();
+     a.calls.clear();
+     a.bytes.clear();
+     a.total_us = 0;
+     a.nodes = 0;
++    a.fbank_s = a.build_s = a.alloc_s = a.pe_s = a.inputs_s = a.compute_s = a.outputs_s = 0.0;
++    a.build_calls = 0;
++    a.steps = 0;
+ }
+ 
+ } // namespace xasr_prof
+@@ -170,6 +184,16 @@ struct xasr_context {
+     ggml_backend_t backend = nullptr, backend_cpu = nullptr;
+     ggml_backend_sched_t sched = nullptr;
+     std::vector<uint8_t> compute_meta;
++    // The chunk graph is built ONCE and reused for every decode step, the way llama.cpp reuses a graph
++    // across tokens of a recurrent/streaming model: allocate once, then write new data into the same input
++    // tensors and compute again. Rebuilding it per step cost 0.196 s + 0.349 s of alloc per 69 s clip, and
++    // the previous code had a latent use-after-free doing it - build_chunk_graph returned a graph whose
++    // ggml context it had already freed (ggml always allocates mem_buffer, even with no_alloc), which only
++    // worked because the next allocation happened to land on the freed block. Owning the context here makes
++    // both the reuse and the lifetime correct.
++    ggml_cgraph* chunk_gf = nullptr;
++    ggml_context* chunk_ctx = nullptr;
++    std::vector<std::vector<float>> pes_cache;
+ };
+ 
+ namespace {
+@@ -555,13 +579,15 @@ ggml_tensor* simple_downsample(ggml_context* g, ggml_tensor* x, const std::vecto
+     return acc;
+ }
+ 
+-ggml_cgraph* build_chunk_graph(xasr_context* c, std::vector<uint8_t>& meta, bool dump) {
++ggml_cgraph* build_chunk_graph(xasr_context* c, std::vector<uint8_t>& meta, bool dump,
++                                ggml_context** out_ctx) {
+     auto& m = c->model;
+     const auto& hp = m.hp;
+     const geom& G = c->g;
+     ggml_init_params ip = {meta.size(), meta.data(), true};
+     ggml_context* g = ggml_init(ip);
+     ggml_cgraph* gf = ggml_new_graph_custom(g, kGraphNodes, false);
++    *out_ctx = g;   // the graph lives in this context; the caller owns both
+ 
+     ggml_tensor* feats = ggml_new_tensor_4d(g, GGML_TYPE_F32, hp.feature_dim, G.T, 1, 1);
+     in_tensor(feats, "feats");
+@@ -642,7 +668,6 @@ ggml_cgraph* build_chunk_graph(xasr_context* c, std::vector<uint8_t>& meta, bool
+     if (dump)
+         out_tensor(gf, ggml_cont(g, full), "d_enc_full");
+     out_tensor(gf, lin(g, full, m.enc_proj_w, m.enc_proj_b), "enc_out");
+-    ggml_free(g);
+     return gf;
+ }
+ 
+@@ -708,9 +733,16 @@ core_kaldi::FbankParams fbank_params(const xasr_context* c) {
+ }
+ 
+ std::vector<float> fbank_of(xasr_context* c, const float* samples, int n, int& T) {
++    const bool prof = xasr_prof::get().on;
++    const auto t0 = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+     std::vector<float> pcm(samples, samples + n);
+     pcm.resize((size_t)n + (size_t)c->g.tail_pad_ms * 16, 0.0f);
+-    return core_kaldi::compute_fbank(pcm.data(), (int)pcm.size(), fbank_params(c), T);
++    auto out = core_kaldi::compute_fbank(pcm.data(), (int)pcm.size(), fbank_params(c), T);
++    if (prof) {
++        xasr_prof::get().fbank_s += std::chrono::duration<double>(
++            std::chrono::steady_clock::now() - t0).count();
++    }
++    return out;
+ }
+ 
+ // The chunk loop over feature rows [*pos, n_rows): sherpa's window of T frames
+@@ -724,22 +756,48 @@ bool run_chunks(xasr_context* c, std::vector<uint8_t>& meta, enc_state& st, cons
+     if (*pos + G.T >= n_rows)
+         return true;
+     const bool dump = dumps != nullptr;
+-    ggml_cgraph* gf = build_chunk_graph(c, meta, dump);
++    const bool prof = xasr_prof::get().on;
++    const auto tb0 = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+     if (!ensure_sched(c))
+         return false;
+-    ggml_backend_sched_reset(c->sched);
+-    if (!ggml_backend_sched_alloc_graph(c->sched, gf)) {
+-        fprintf(stderr, "xasr: chunk graph alloc failed\n");
+-        return false;
++    // Build + allocate only when there is no graph yet (or when dumping, which wants its own copy).
++    const bool build_now = c->chunk_gf == nullptr || dump;
++    if (build_now) {
++        if (c->chunk_ctx) {
++            ggml_free(c->chunk_ctx);
++            c->chunk_ctx = nullptr;
++            c->chunk_gf = nullptr;
++            c->pes_cache.clear();
++        }
++        c->chunk_gf = build_chunk_graph(c, meta, dump, &c->chunk_ctx);
++        if (!c->chunk_gf)
++            return false;
++        ggml_backend_sched_reset(c->sched);
++        if (!ggml_backend_sched_alloc_graph(c->sched, c->chunk_gf)) {
++            fprintf(stderr, "xasr: chunk graph alloc failed\n");
++            return false;
++        }
+     }
++    ggml_cgraph* gf = c->chunk_gf;
+     if (st.caches.empty())
+         init_caches(c, gf, st);
+-    std::vector<std::vector<float>> pes((size_t)S);
+-    for (int s = 0; s < S; s++)
+-        pes[(size_t)s] = compact_pe(hp.pos_dim, G.chunk / hp.downsample[s], G.left / hp.downsample[s]);
++    const auto tp0 = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
++    if (build_now) {
++        c->pes_cache.assign((size_t)S, {});
++        for (int s = 0; s < S; s++)
++            c->pes_cache[(size_t)s] = compact_pe(hp.pos_dim, G.chunk / hp.downsample[s], G.left / hp.downsample[s]);
++    }
++    std::vector<std::vector<float>>& pes = c->pes_cache;
++    if (prof) {
++        auto& a = xasr_prof::get();
++        a.build_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - tb0).count();
++        a.pe_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
++        a.build_calls++;
++    }
+     if (dump && dumps->size() != (size_t)S + 2)
+         dumps->assign((size_t)S + 2, {});
+     for (; *pos + G.T < n_rows; *pos += G.decode_chunk_len) {
++        const auto ti0 = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+         set_input(gf, "feats", feats + (size_t)*pos * hp.feature_dim, (size_t)G.T * hp.feature_dim);
+         for (auto& kv : st.caches)
+             set_input(gf, kv.first, kv.second);
+@@ -752,15 +810,28 @@ bool run_chunks(xasr_context* c, std::vector<uint8_t>& meta, enc_state& st, cons
+                     mask[(size_t)j] = -INFINITY;
+             set_input(gf, "mask_" + std::to_string(s), mask);
+         }
++        const auto tc0 = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
++        if (prof) {
++            xasr_prof::get().inputs_s += std::chrono::duration<double>(tc0 - ti0).count();
++            xasr_prof::get().steps++;
++        }
+         if (ggml_backend_sched_graph_compute(c->sched, gf) != GGML_STATUS_SUCCESS) {
+             fprintf(stderr, "xasr: chunk compute failed\n");
+             return false;
+         }
++        const auto to0 = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
++        if (prof) {
++            xasr_prof::get().compute_s += std::chrono::duration<double>(to0 - tc0).count();
++        }
+         for (auto& kv : st.caches)
+             kv.second = get_output(gf, "o_" + kv.first);
+         st.processed += G.chunk;
+         const auto e = get_output(gf, "enc_out");
+         enc_out.insert(enc_out.end(), e.begin(), e.end());
++        if (prof) {
++            xasr_prof::get().outputs_s += std::chrono::duration<double>(
++                std::chrono::steady_clock::now() - to0).count();
++        }
+         if (dump) {
+             auto app = [&](size_t slot, const char* name) {
+                 const auto v = get_output(gf, name);
+@@ -1002,6 +1073,16 @@ extern "C" void xasr_free(struct xasr_context* c) {
+         return;
+     if (getenv("XASR_PROF"))
+         xasr_prof::dump();
++    if (c->chunk_gf && c->chunk_ctx) {
++        // Free the scheduler BEFORE the graph's context: the scheduler's allocations refer to tensors that
++        // live in this context, and the reverse order would leave it holding freed pointers.
++        if (c->sched)
++            ggml_backend_sched_free(c->sched);
++        c->sched = nullptr;
++        ggml_free(c->chunk_ctx);
++        c->chunk_ctx = nullptr;
++        c->chunk_gf = nullptr;
++    }
+     if (c->sched)
+         ggml_backend_sched_free(c->sched);
+     if (c->model.buf)
+-- 
+2.53.0
+

@@ -1,0 +1,176 @@
+From 403fa74a90b78dc59a585c7c9e0e9276c5d2f4ab Mon Sep 17 00:00:00 2001
+From: autoresearch <agent@localhost>
+Date: Fri, 25 Sep 2026 06:58:18 +0000
+Subject: [PATCH 13/15] XASR_PROF: per-thread accumulators, and a MUL_MAT shape
+ histogram
+
+The profiler was a data race. The eval callback runs on both worker threads and every field of the single
+shared accumulator - start, us, calls, bytes - was mutated with no lock, which is undefined behaviour and
+inflated the leg roughly 2x while making small ops look far more expensive than they are. It found real
+problems (the per-element division among them) but it cannot be used to decide whether a new kernel helped, and
+the kernel brief lists fixing it as a prerequisite.
+
+Each thread now owns a thread_local accumulator and dump() merges them under a short lock at print time - a
+mutex around every node would serialise the thing being measured, and a lock only at merge time is free
+because the accumulators are private until then.
+
+Added what the profiler was actually being installed for: a MUL_MAT histogram by (ne0 x ne1) with time and
+call counts. The open question is why the encoders reach only 13-20% of int8 peak; if the time is concentrated
+at small N, the remedy is a kernel shaped for those N, and that is now visible instead of inferable.
+---
+ src/xasr.cpp | 92 +++++++++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 81 insertions(+), 11 deletions(-)
+
+diff --git a/src/xasr.cpp b/src/xasr.cpp
+index de93b31..10c5adb 100644
+--- a/src/xasr.cpp
++++ b/src/xasr.cpp
+@@ -31,6 +31,8 @@
+ #include <cstring>
+ #include <string>
+ #include <unordered_map>
++#include <map>
++#include <mutex>
+ #include <vector>
+ 
+ namespace {
+@@ -107,6 +109,11 @@ struct acc {
+     std::unordered_map<int, int64_t> us;
+     std::unordered_map<int, int64_t> calls;
+     std::unordered_map<int, int64_t> bytes;
++    // MUL_MAT shapes (ne0 x ne1) with their time. The kernel brief's open question is why the encoders reach
++    // only 13-20% of int8 peak; if the cost is concentrated at small N (few columns per call) then the
++    // remedy is a kernel shaped for those N, and that is visible here rather than inferable.
++    std::map<std::pair<int64_t, int64_t>, int64_t> mm_shape_us;
++    std::map<std::pair<int64_t, int64_t>, int64_t> mm_shape_calls;
+     // Host-side phase timers. The op mix only sees ggml nodes; these see the work around them (graph
+     // rebuilds, positional-encoding tables, input/output copies, the fbank), which is where the mel
+     // filterbank surprise lived on the diar side.
+@@ -118,18 +125,40 @@ struct acc {
+     bool on = false;
+ };
+ 
++// Per-THREAD accumulators. The previous version had one shared acc: the eval callback runs on both worker
++// threads, so `start`, `us`, `calls` and `bytes` were mutated concurrently with no lock - undefined behaviour
++// that inflated the leg roughly 2x and made small ops look far more expensive than they are. A profiler used
++// to decide whether a kernel helped has to be correct before it is trusted with that question, so each thread
++// now owns its accumulator and dump() merges them. thread_local because the alternative (a mutex around
++// every node) would serialise the very thing being measured.
+ inline acc& get() {
+-    static acc a;
++    static thread_local acc a;
+     return a;
+ }
+ 
++inline std::vector<acc*>& all_accs() {
++    static std::vector<acc*> v;
++    return v;
++}
++
++inline void register_acc(acc* a) {
++    static std::mutex m;
++    std::lock_guard<std::mutex> lock(m);
++    all_accs().push_back(a);
++}
++
+ inline const char* op_name(int op) {
+     const char* n = ggml_op_name((ggml_op)op);
+     return n ? n : "?";
+ }
+ 
+ inline bool callback(ggml_tensor* t, bool ask, void*) {
++    static thread_local bool registered = false;
+     acc& a = get();
++    if (!registered) {
++        registered = true;
++        register_acc(&a);
++    }
+     if (ask) {
+         a.start[t] = ggml_time_us();
+         return true;
+@@ -142,6 +171,10 @@ inline bool callback(ggml_tensor* t, bool ask, void*) {
+     a.us[(int)t->op] += dt;
+     a.calls[(int)t->op] += 1;
+     a.bytes[(int)t->op] += (int64_t)ggml_nelements(t) * (int64_t)ggml_element_size(t);
++    if (t->op == GGML_OP_MUL_MAT) {
++        a.mm_shape_us[{t->ne[0], t->ne[1]}] += dt;
++        a.mm_shape_calls[{t->ne[0], t->ne[1]}] += 1;
++    }
+     a.total_us += dt;
+     a.nodes++;
+     return true;
+@@ -154,9 +187,29 @@ inline void install(ggml_backend_sched_t sched) {
+ }
+ 
+ inline void dump() {
+-    acc& a = get();
+-    if (!a.on || a.total_us <= 0)
++    // Merge every registered thread's accumulator. A single shared one was a data race; the merged view is
++    // what the numbers below have always claimed to be.
++    acc merged;
++    merged.on = true;
++    bool any = false;
++    for (acc* p : all_accs()) {
++        if (p->total_us <= 0)
++            continue;
++        any = true;
++        for (const auto& kv : p->us)      merged.us[kv.first] += kv.second;
++        for (const auto& kv : p->calls)   merged.calls[kv.first] += kv.second;
++        for (const auto& kv : p->bytes)   merged.bytes[kv.first] += kv.second;
++        for (const auto& kv : p->mm_shape_us)    merged.mm_shape_us[kv.first] += kv.second;
++        for (const auto& kv : p->mm_shape_calls) merged.mm_shape_calls[kv.first] += kv.second;
++        merged.fbank_s += p->fbank_s; merged.build_s += p->build_s; merged.alloc_s += p->alloc_s;
++        merged.pe_s += p->pe_s; merged.inputs_s += p->inputs_s; merged.compute_s += p->compute_s;
++        merged.outputs_s += p->outputs_s; merged.greedy_s += p->greedy_s; merged.decout_s += p->decout_s;
++        merged.logits_s += p->logits_s; merged.build_calls += p->build_calls; merged.steps += p->steps;
++        merged.total_us += p->total_us; merged.nodes += p->nodes;
++    }
++    if (!any)
+         return;
++    const acc& a = merged;
+     std::vector<std::pair<int, int64_t>> rows(a.us.begin(), a.us.end());
+     std::sort(rows.begin(), rows.end(), [](auto& l, auto& r) { return l.second > r.second; });
+     std::fprintf(stderr,
+@@ -183,14 +236,31 @@ inline void dump() {
+                  "greedy/joint %.3f s (logits %.3f, decoder_out %.3f)\n",
+                  a.fbank_s, a.build_s, (long long) a.build_calls, a.alloc_s, a.pe_s,
+                  a.inputs_s, a.compute_s, (long long) a.steps, a.outputs_s, a.greedy_s, a.logits_s, a.decout_s);
+-    a.us.clear();
+-    a.calls.clear();
+-    a.bytes.clear();
+-    a.total_us = 0;
+-    a.nodes = 0;
+-    a.fbank_s = a.build_s = a.alloc_s = a.pe_s = a.inputs_s = a.compute_s = a.outputs_s = a.greedy_s = a.decout_s = a.logits_s = 0.0;
+-    a.build_calls = 0;
+-    a.steps = 0;
++    if (!a.mm_shape_us.empty()) {
++        std::vector<std::pair<std::pair<int64_t, int64_t>, int64_t>> shapes(a.mm_shape_us.begin(), a.mm_shape_us.end());
++        std::sort(shapes.begin(), shapes.end(), [](auto& l, auto& r) { return l.second > r.second; });
++        double shown = 0.0;
++        std::fprintf(stderr, "[xasr-prof] MUL_MAT shapes (k x n, time, calls, %% of matmul time):\n");
++        for (size_t i = 0; i < shapes.size() && i < 12; ++i) {
++            const auto& sh = shapes[i];
++            const int64_t calls = a.mm_shape_calls[sh.first];
++            shown += sh.second;
++            std::fprintf(stderr, "[xasr-prof]   k=%-6lld n=%-5lld %8.3f s  %8lld calls  %5.1f%%  %6.2f us/call\n",
++                         (long long) sh.first.first, (long long) sh.first.second, sh.second / 1e6,
++                         (long long) calls, 100.0 * sh.second / a.total_us,
++                         calls ? sh.second / (double) calls : 0.0);
++        }
++        std::fprintf(stderr, "[xasr-prof]   (top 12 of %zu distinct shapes cover %.1f%% of accounted time)\n",
++                     shapes.size(), a.total_us ? 100.0 * shown / a.total_us : 0.0);
++    }
++    for (acc* p : all_accs()) {
++        p->us.clear(); p->calls.clear(); p->bytes.clear();
++        p->mm_shape_us.clear(); p->mm_shape_calls.clear(); p->start.clear();
++        p->total_us = 0; p->nodes = 0;
++        p->fbank_s = p->build_s = p->alloc_s = p->pe_s = p->inputs_s = p->compute_s = p->outputs_s = 0.0;
++        p->greedy_s = p->decout_s = p->logits_s = 0.0;
++        p->build_calls = 0; p->steps = 0;
++    }
+ }
+ 
+ } // namespace xasr_prof
+-- 
+2.53.0
+

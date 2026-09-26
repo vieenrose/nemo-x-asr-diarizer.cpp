@@ -1,0 +1,64 @@
+From 1bfe07f6650f01dba271fb3bbb28a28d8c5e43f0 Mon Sep 17 00:00:00 2001
+From: autoresearch <agent@localhost>
+Date: Fri, 25 Sep 2026 03:59:14 +0000
+Subject: [PATCH 02/15] x-asr profiler: report call counts and bytes per op,
+ not just the time mix
+
+A percentage of total time is not actionable on its own: 22% CONT could be twenty huge tensors (fix the
+layout) or two hundred thousand tiny ones (fix the dispatch tax) and those need opposite changes. The hook
+now prints calls, average us/call, total MB and KB/call, which is what turned 'CONT is 18%' into 'CONT is
+82,636 calls at 24.7 KB each' - and that is what found the thread-partition bug in ggml_get_n_tasks.
+---
+ src/xasr.cpp | 18 +++++++++++++++---
+ 1 file changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/src/xasr.cpp b/src/xasr.cpp
+index 3d9c5b6..f6bfe01 100644
+--- a/src/xasr.cpp
++++ b/src/xasr.cpp
+@@ -94,6 +94,8 @@ namespace xasr_prof {
+ struct acc {
+     std::unordered_map<ggml_tensor*, int64_t> start;
+     std::unordered_map<int, int64_t> us;
++    std::unordered_map<int, int64_t> calls;
++    std::unordered_map<int, int64_t> bytes;
+     int64_t total_us = 0;
+     int64_t nodes = 0;
+     bool on = false;
+@@ -121,6 +123,8 @@ inline bool callback(ggml_tensor* t, bool ask, void*) {
+     const int64_t dt = ggml_time_us() - it->second;
+     a.start.erase(it);
+     a.us[(int)t->op] += dt;
++    a.calls[(int)t->op] += 1;
++    a.bytes[(int)t->op] += (int64_t)ggml_nelements(t) * (int64_t)ggml_element_size(t);
+     a.total_us += dt;
+     a.nodes++;
+     return true;
+@@ -138,13 +142,21 @@ inline void dump() {
+         return;
+     std::vector<std::pair<int, int64_t>> rows(a.us.begin(), a.us.end());
+     std::sort(rows.begin(), rows.end(), [](auto& l, auto& r) { return l.second > r.second; });
+-    std::fprintf(stderr, "[xasr-prof] nodes=%lld accounted=%.3f s\n",
++    std::fprintf(stderr,
++                 "[xasr-prof] nodes=%lld accounted=%.3f s   (call counts and bytes are what separate "
++                 "'a few huge copies' from 'many tiny nodes')\n",
+                  (long long)a.nodes, a.total_us / 1e6);
+     for (auto& r : rows) {
+-        std::fprintf(stderr, "[xasr-prof]   %-24s %8.3f s  %5.1f%%\n",
+-                     op_name(r.first), r.second / 1e6, 100.0 * r.second / a.total_us);
++        const int64_t nc = a.calls[r.first], nb = a.bytes[r.first];
++        std::fprintf(stderr,
++                     "[xasr-prof]   %-24s %8.3f s %5.1f%%  calls=%-9lld avg=%7.1f us  %7.1f MB  %6.1f KB/call\n",
++                     op_name(r.first), r.second / 1e6, 100.0 * r.second / a.total_us,
++                     (long long)nc, nc ? r.second / (double)nc : 0.0,
++                     nb / 1048576.0, nc ? nb / 1024.0 / (double)nc : 0.0);
+     }
+     a.us.clear();
++    a.calls.clear();
++    a.bytes.clear();
+     a.total_us = 0;
+     a.nodes = 0;
+ }
+-- 
+2.53.0
+

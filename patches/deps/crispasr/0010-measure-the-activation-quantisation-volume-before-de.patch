@@ -1,0 +1,48 @@
+From 49f23c5a403c4433b77eb2ed803bc9cb445fcd84 Mon Sep 17 00:00:00 2001
+From: autoresearch <agent@localhost>
+Date: Fri, 25 Sep 2026 06:51:01 +0000
+Subject: [PATCH 10/15] measure the activation-quantisation volume before
+ deciding to memoise it
+
+Every mul_mat converts its F32 src1 to the vec_dot type - Q8_0 for every quantised weight type - and a
+transformer block feeds the SAME activation tensor to three or four matmuls (q/k/v, the FFN's two projections,
+attention output), so the same elements are converted again and again. The kernel brief lists memoising that
+conversion as the first thing to try because it is bit-identical and needs no new kernel, but whether it is
+worth building depends entirely on the volume, and guessing it would be exactly the mistake of writing a
+converter before checking that f16 was the faster path.
+
+So: count it. g_ggml_quant_elems accumulates ne10*ne11 at the live quantisation site, behind GGML_COUNT_QUANT
+so the hot path pays one relaxed atomic per matmul only when asked, and x-asr's profiler prints the total.
+---
+ src/xasr.cpp | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/src/xasr.cpp b/src/xasr.cpp
+index 017edda..de93b31 100644
+--- a/src/xasr.cpp
++++ b/src/xasr.cpp
+@@ -98,6 +98,8 @@ struct geom {
+ // identical with it on. The point is to stop guessing where the ASR leg's arithmetic goes before deciding
+ // which kernel is worth writing - the leg is weight-format insensitive (q4_k ties q5_0), so the only lever
+ // left is the op mix itself.
++extern "C" uint64_t g_ggml_quant_elems;   // diagnostic counter, see ggml-cpu.c (GGML_COUNT_QUANT)
++
+ namespace xasr_prof {
+ 
+ struct acc {
+@@ -169,6 +171,12 @@ inline void dump() {
+                      (long long)nc, nc ? r.second / (double)nc : 0.0,
+                      nb / 1048576.0, nc ? nb / 1024.0 / (double)nc : 0.0);
+     }
++    if (getenv("GGML_COUNT_QUANT")) {
++        std::fprintf(stderr,
++                     "[xasr-prof] activation elements quantised by mul_mat: %.1f M  (%.1f B blocks of 4 B read; "
++                     "at ~1-2 cycles/element this is the prize for memoising the conversion)\n",
++                     g_ggml_quant_elems / 1e6, g_ggml_quant_elems * 4 / 1e9);
++    }
+     std::fprintf(stderr,
+                  "[xasr-prof] host phases: fbank %.3f s | build %.3f s (%lld calls) alloc %.3f s | "
+                  "pos-enc %.3f s | inputs %.3f s | compute %.3f s (%lld steps) | outputs %.3f s | "
+-- 
+2.53.0
+

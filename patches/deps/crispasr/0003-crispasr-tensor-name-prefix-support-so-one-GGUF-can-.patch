@@ -1,0 +1,257 @@
+From c8064a55f0ca8dff5700546798764e8cc15b1762 Mon Sep 17 00:00:00 2001
+From: autoresearch <agent@localhost>
+Date: Fri, 25 Sep 2026 04:40:50 +0000
+Subject: [PATCH 03/15] crispasr: tensor-name prefix support so one GGUF can
+ hold several models
+
+core_gguf::try_get retries '<prefix><name>' (prefix from CRISPASR_GGUF_PREFIX or set_name_prefix), and the
+new find_key() does the same for metadata. Every metadata accessor (kv_u32, kv_str, kv_str_array, ...) now
+goes through it: a helper that quietly returns its default on a miss makes a namespace mistake look like a
+corrupt model, which is how the first bundle attempt died with 'inconsistent hyper-parameters' (vocab_size
+resolved to 0 because only the tensor lookup was prefix-aware). xasr's hparams reader uses find_key too.
+---
+ src/core/gguf_loader.cpp | 79 ++++++++++++++++++++++++++++++++++------
+ src/core/gguf_loader.h   | 21 +++++++++++
+ src/xasr.cpp             |  4 +-
+ src/xasr.h               |  6 +++
+ 4 files changed, 98 insertions(+), 12 deletions(-)
+
+diff --git a/src/core/gguf_loader.cpp b/src/core/gguf_loader.cpp
+index b4b197f..0942ccd 100644
+--- a/src/core/gguf_loader.cpp
++++ b/src/core/gguf_loader.cpp
+@@ -4,6 +4,7 @@
+ #include "gguf_loader.h"
+ 
+ #include "ggml-backend-impl.h"
++#include "gguf.h"  // full gguf_context: find_key() dereferences it
+ #include "ggml-cpu.h"
+ #ifdef GGML_USE_METAL
+ #include "ggml-metal.h"
+@@ -17,6 +18,13 @@
+ #include <limits>
+ #include <map>
+ #include <mutex>
++
++// Defined at the bottom with the tensor lookup helpers; declared here because the metadata accessors below
++// are prefix-aware too (a GGUF bundle stores one model's keys under "<prefix>...", and a helper that quietly
++// returned its default instead would look like a corrupt model, not like a missing prefix).
++namespace core_gguf {
++int64_t find_key(const struct gguf_context * ctx, const char * key);
++}
+ #include <tuple>
+ 
+ // core_cpu_backend:: is used unconditionally below (the zero-copy CPU mmap
+@@ -65,7 +73,7 @@ void free_metadata(gguf_context* gctx) {
+ // helpers in each model.
+ 
+ uint32_t kv_u32(gguf_context* gctx, const char* key, uint32_t default_val) {
+-    const int k = gguf_find_key(gctx, key);
++    const int k = find_key(gctx, key);
+     if (k < 0)
+         return default_val;
+     const gguf_type t = gguf_get_kv_type(gctx, k);
+@@ -92,7 +100,7 @@ uint32_t kv_u32(gguf_context* gctx, const char* key, uint32_t default_val) {
+ }
+ 
+ int32_t kv_i32(gguf_context* gctx, const char* key, int32_t default_val) {
+-    const int k = gguf_find_key(gctx, key);
++    const int k = find_key(gctx, key);
+     if (k < 0)
+         return default_val;
+     const gguf_type t = gguf_get_kv_type(gctx, k);
+@@ -111,7 +119,7 @@ int32_t kv_i32(gguf_context* gctx, const char* key, int32_t default_val) {
+ }
+ 
+ float kv_f32(gguf_context* gctx, const char* key, float default_val) {
+-    const int k = gguf_find_key(gctx, key);
++    const int k = find_key(gctx, key);
+     if (k < 0)
+         return default_val;
+     const gguf_type t = gguf_get_kv_type(gctx, k);
+@@ -123,7 +131,7 @@ float kv_f32(gguf_context* gctx, const char* key, float default_val) {
+ }
+ 
+ bool kv_bool(gguf_context* gctx, const char* key, bool default_val) {
+-    const int k = gguf_find_key(gctx, key);
++    const int k = find_key(gctx, key);
+     if (k < 0)
+         return default_val;
+     if (gguf_get_kv_type(gctx, k) != GGUF_TYPE_BOOL)
+@@ -132,7 +140,7 @@ bool kv_bool(gguf_context* gctx, const char* key, bool default_val) {
+ }
+ 
+ std::string kv_str(gguf_context* gctx, const char* key, const char* default_val) {
+-    const int k = gguf_find_key(gctx, key);
++    const int k = find_key(gctx, key);
+     if (k < 0)
+         return default_val ? default_val : "";
+     if (gguf_get_kv_type(gctx, k) != GGUF_TYPE_STRING)
+@@ -143,7 +151,7 @@ std::string kv_str(gguf_context* gctx, const char* key, const char* default_val)
+ 
+ std::vector<std::string> kv_str_array(gguf_context* gctx, const char* key) {
+     std::vector<std::string> out;
+-    const int k = gguf_find_key(gctx, key);
++    const int k = find_key(gctx, key);
+     if (k < 0)
+         return out;
+     if (gguf_get_kv_type(gctx, k) != GGUF_TYPE_ARRAY)
+@@ -160,7 +168,7 @@ std::vector<std::string> kv_str_array(gguf_context* gctx, const char* key) {
+ 
+ std::vector<float> kv_f32_array(gguf_context* gctx, const char* key) {
+     std::vector<float> out;
+-    const int k = gguf_find_key(gctx, key);
++    const int k = find_key(gctx, key);
+     if (k < 0)
+         return out;
+     if (gguf_get_kv_type(gctx, k) != GGUF_TYPE_ARRAY)
+@@ -1575,18 +1583,67 @@ void mmap_advise_random(ggml_backend_buffer_t buf) {
+ // ---------------------------------------------------------------------------
+ 
+ // Signatures use `core_gguf::tensor_map` (see gguf_loader.h cross-repo contract).
++//
++// BUNDLE SUPPORT. set_name_prefix() lets one GGUF hold several models: every lookup is retried as
++// "<prefix><name>" before the bare name, so a single-model file keeps working with a prefix set and a
++// bundle can hand each model its own namespace. The prefix is read once from CRISPASR_GGUF_PREFIX; it is a
++// lookup detail only, so a bundle produces bit-identical weights and therefore bit-identical output - this
++// is a deployment change (one file, one mmap), not a numerical one.
+ ggml_tensor* try_get(const tensor_map& tensors, const char* name) {
+     auto it = tensors.find(name);
+-    return it != tensors.end() ? it->second : nullptr;
++    if (it != tensors.end()) {
++        return it->second;
++    }
++    const std::string & p = name_prefix();
++    if (!p.empty()) {
++        it = tensors.find(p + name);
++        if (it != tensors.end()) {
++            return it->second;
++        }
++    }
++    return nullptr;
++}
++
++std::string & prefix_storage() {
++    static std::string prefix = [] {
++        const char * env = std::getenv("CRISPASR_GGUF_PREFIX");
++        return env ? std::string(env) : std::string();
++    }();
++    return prefix;
++}
++
++const std::string & name_prefix() {
++    return prefix_storage();
++}
++
++void set_name_prefix(const char * prefix) {
++    std::lock_guard<std::mutex> lock(prefix_mutex());
++    prefix_storage() = prefix ? prefix : "";
++}
++
++std::mutex & prefix_mutex() {
++    static std::mutex m;
++    return m;
++}
++
++int64_t find_key(const struct gguf_context * ctx, const char * key) {
++    int64_t id = gguf_find_key(ctx, key);
++    if (id < 0) {
++        const std::string & p = name_prefix();
++        if (!p.empty()) {
++            id = gguf_find_key(ctx, (p + key).c_str());
++        }
++    }
++    return id;
+ }
+ 
+ ggml_tensor* require(const tensor_map& tensors, const char* name, const char* model_tag) {
+-    auto it = tensors.find(name);
+-    if (it == tensors.end()) {
++    ggml_tensor * t = try_get(tensors, name);
++    if (!t) {
+         fprintf(stderr, "%s: required tensor '%s' not found in GGUF\n", model_tag ? model_tag : "core_gguf", name);
+         return nullptr;
+     }
+-    return it->second;
++    return t;
+ }
+ 
+ std::string format_layer_name(const char* fmt, int i) {
+diff --git a/src/core/gguf_loader.h b/src/core/gguf_loader.h
+index 3e3f0f2..5a376cc 100755
+--- a/src/core/gguf_loader.h
++++ b/src/core/gguf_loader.h
+@@ -55,8 +55,11 @@
+ #include <cstdint>
+ #include <map>
+ #include <string>
++#include <mutex>
+ #include <vector>
+ 
++struct gguf_context;  // global scope: a declaration inside core_gguf would be a DIFFERENT type
++
+ namespace core_gguf {
+ 
+ // ---------------------------------------------------------------------------
+@@ -316,8 +319,26 @@ void mmap_advise_random(ggml_backend_buffer_t buf);
+ // Look up a tensor by name. Returns nullptr (silently) if missing.
+ // Uses `tensor_map` (see the cross-repo contract note above) so the signature
+ // tracks the per-repo map choice automatically.
++// If a name prefix is configured (CRISPASR_GGUF_PREFIX, or set_name_prefix()), the prefixed name is tried
++// as well: that is what lets one GGUF bundle hold several models.
+ ggml_tensor* try_get(const tensor_map& tensors, const char* name);
+ 
++// Active tensor-name prefix ("" when unset). Read once from CRISPASR_GGUF_PREFIX; the internal accessor
++// is exposed for the prefix-aware key lookup below, not for callers to mutate.
++const std::string& name_prefix();
++
++// Override the prefix programmatically (takes precedence over the environment). Thread-safe.
++void set_name_prefix(const char* prefix);
++
++// Internal: mutable storage behind name_prefix(), plus the mutex that guards it against a concurrent
++// set_name_prefix(). Declared here only so the implementation can order its definitions; not part of the
++// contract.
++std::string& prefix_storage();
++std::mutex& prefix_mutex();
++
++// Prefix-aware metadata lookup: tries `key`, then "<prefix><key>". Returns the ggml key id or -1.
++int64_t find_key(const struct gguf_context* ctx, const char* key);
++
+ // Look up a tensor by name. Prints an error to stderr if missing but
+ // still returns nullptr — the caller decides whether a missing tensor
+ // is fatal.
+diff --git a/src/xasr.cpp b/src/xasr.cpp
+index f6bfe01..c615c40 100644
+--- a/src/xasr.cpp
++++ b/src/xasr.cpp
+@@ -192,7 +192,9 @@ std::vector<float> to_f32(ggml_tensor* t) {
+ 
+ std::vector<int> kv_int_array(gguf_context* g, const char* key) {
+     std::vector<int> out;
+-    const int64_t id = gguf_find_key(g, key);
++    // Prefix-aware: in a GGUF bundle this model's metadata lives under "<prefix>xasr.*", and falling back
++    // to the bare key is what keeps single-model files working unchanged.
++    const int64_t id = core_gguf::find_key(g, key);
+     if (id < 0 || gguf_get_kv_type(g, id) != GGUF_TYPE_ARRAY)
+         return out;
+     const size_t n = gguf_get_arr_n(g, id);
+diff --git a/src/xasr.h b/src/xasr.h
+index 647d0e4..81b9b80 100644
+--- a/src/xasr.h
++++ b/src/xasr.h
+@@ -43,6 +43,12 @@ char* xasr_stream_accept(struct xasr_stream* s, const float* samples, int n_samp
+ void xasr_stream_reset(struct xasr_stream* s);
+ void xasr_stream_free(struct xasr_stream* s);
+ 
++// Token timestamps: (ids, encoder-frame indices) for everything decoded so far. Borrowed pointers,
++// valid until the next accept/reset/free. Frame k starts at k * 40 ms of audio (10 ms fbank hop,
++// encoder downsampling of 4). Returns 0 with *out_n == 0 if nothing has been decoded.
++int xasr_stream_token_times(struct xasr_stream* s, const int32_t** out_ids,
++                            const int64_t** out_frames, int* out_n);
++
+ // ---- diff-harness hooks (crispasr-diff xasr) -----------------------------
+ // Kaldi fbank of samples + the configured tail padding: (T, 80) row-major, malloc'd.
+ float* xasr_compute_fbank(struct xasr_context* ctx, const float* samples, int n_samples, int* out_T);
+-- 
+2.53.0
+

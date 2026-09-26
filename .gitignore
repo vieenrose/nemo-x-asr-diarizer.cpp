@@ -4,6 +4,9 @@ build-*/
 *.so
 models/*.gguf
 deps/
+# ...but the dependency PATCHES are part of the project: without them a clone cannot build,
+# because every performance change lives in the dependency worktrees that deps.lock points at.
+!patches/deps/
 __pycache__/
 .auto/hash_last
 /tmp/ar_*
