@@ -39,8 +39,13 @@ Plus one merged GGUF (`--models-bundle`), measured neutral by design.
   byte-identical to audio.cpp**, verified on 3 windows (339 and 679 frames). Stage 2 of the one-runtime merge
   is done. Full writeup: docs/one-runtime-merge.md §13. Generalized the dump/port tools to any layer index
   (audiocpp `deps.lock` now 0babdf9, `PORT_LAYER_INDEX` in layer0_port.cpp) and spot-checked layers 0, 15, 30
-  (first/middle/last of 31) - all byte-identical with their own real weights. Next: loop over all 31 layers
-  for real (now closer to plumbing than risk), then the AOS state machine, then remeasure the ~10% ceiling.
+  (first/middle/last of 31) - all byte-identical with their own real weights.
+  Then closed it out for real: `run_encoder_isolated` (audiocpp `deps.lock` now be2af81) chains all 31 layers
+  as a sound whole-stack oracle, and new `tools/encoder_port.cpp` loops the proven per-layer sequence over
+  every real layer (auto-detects layer count from the GGUF). **`ENCODER PORT (31 layers): BYTE-IDENTICAL to
+  audio.cpp`** on two independent clips (339 and 527 frames) - the entire encoder, not a spot check. Stage 2
+  is fully done: docs/one-runtime-merge.md §14. Next: the AOS state machine, then wiring the ported encoder
+  into an actual merged runtime, then remeasuring the ~10% ceiling.
 - **KleidiAI** (`GGML_CPU_KLEIDIAI=ON`): the only untried kernel-level lever; needs a network fetch for the
   `arm_llama` kernels. Expect accumulation-order changes -> validation.
 - **ggml-native streaming caches** on the ASR side: 114 cache tensors per step currently go

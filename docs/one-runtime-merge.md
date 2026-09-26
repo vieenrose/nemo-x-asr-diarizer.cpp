@@ -460,3 +460,40 @@ weights instead of always layer 0's. Layers **0, 15, and 30** - first, middle, a
 all 31 (item 2), but three spread-out real data points passing is a much stronger prior than the structural
 argument alone, and the remaining work on (2) is now closer to plumbing (looping the port's own graph
 construction over a weight array per layer, chaining outputs to inputs) than to risk of a new bug.
+
+## 14. Item (2) done: the whole 31-layer encoder stack ports byte-exact
+
+Two additions closed this out completely, same session.
+
+**A sound oracle for the whole stack, not just one layer.** `run_encoder_isolated` (`ref/audiocpp`, deps.lock
+`audiocpp=be2af81`) is `run_layer0_isolated`'s idea applied to every layer: chains all `weights.layers.size()`
+layers in one isolated graph (same real weights, same `build_encoder_layer`, nothing else present to alias
+memory across layers - the exact failure mode `run_layer0_isolated`'s own docstring names). `EncoderGraph`
+gained `encoder_out`, capturing production's own real stack output (after all layers, before `final_norm`/the
+head) the same way `layer0_in`/`layer0_out` already captured one layer's boundary. `AUDIOCPP_ENCODER_ISOLATED`
+triggers the isolated rebuild. **Verified byte-identical to production on two independent clips**
+(`bilingual_multispk_57s.wav` at 339 frames, `gate_ms_v2.wav` at 527 frames).
+
+**`tools/encoder_port.cpp`: the whole encoder, ported.** New tool (not a rewrite of `layer0_port.cpp`, which
+stays as the single-layer/spot-check tool) that loops the exact same per-layer op sequence `layer0_port.cpp`
+proved byte-exact - unchanged, just parametrised by a per-layer weight set instead of one fixed layer's
+tensors - over every layer the GGUF actually contains (auto-detected by probing
+`encoder.layers.<i>.norm1.weight` until one is missing; 31 for this model), chaining each layer's output into
+the next's input in a single ggml graph. Compared against `iso_encoder_out.f32` (preferred) or `encoder_out.f32`.
+
+**Result, on both clips tested:**
+```
+ENCODER PORT (31 layers): BYTE-IDENTICAL to audio.cpp (173568 floats)   # bilingual_multispk_57s.wav, 339 frames
+ENCODER PORT (31 layers): BYTE-IDENTICAL to audio.cpp (269824 floats)   # gate_ms_v2.wav, 527 frames
+```
+
+**Stage 2 of the one-runtime merge (docs §9-10: "rebuild the diar encoder in CrispASR's ggml, byte-exact
+against audio.cpp") is complete for the whole encoder, not just a spot-checked layer.** What's left of the
+merge, in order: (1) `07_oproj`/`11_ffn_out` aliasing in `run_layer0_isolated` - still open, still not
+blocking (every acceptance test that matters, single-layer and whole-stack, reads the true final output, not
+those two stages). (2) The AOS state machine (streaming speaker-cache bookkeeping across windows) - plain
+C++, unaffected by which runtime draws the graph, and the one piece of the diarizer this session hasn't
+touched at all. (3) Wire the ported encoder into an actual merged runtime (one scheduler, one ggml, one
+arena, replacing the two-pool container-merge form already measured dead at 37-47% slower) - the reason this
+whole port exists. (4) Remeasure the ~10% ceiling (§8) on the real merged build; it hasn't been re-priced
+since §7's kernel-brief numbers and the prize was never going to grow while the port got more accurate.

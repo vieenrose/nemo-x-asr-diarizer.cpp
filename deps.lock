@@ -31,6 +31,10 @@
 #   audiocpp   0babdf9  AUDIOCPP_DUMP_LAYER_INDEX: dump/isolate any layer (default 0, same as before). Used to
 #                     confirm the byte-exact port result generalises - layers 0, 15, and 30 (first, middle,
 #                     last of 31) all port byte-identical with their own real weights.
+#   audiocpp   be2af81  run_encoder_isolated(): sound oracle for the WHOLE encoder stack (all layers chained
+#                     in one graph), not just one layer. encoder_out captures production's own real
+#                     31-layer output; AUDIOCPP_ENCODER_ISOLATED writes the isolated rebuild's
+#                     iso_encoder_out.f32 for comparison. Verified byte-identical to production on two clips.
 crispasr=714f457
 crispasr_ggml=512a020
-audiocpp=0babdf9
+audiocpp=be2af81
