@@ -451,3 +451,12 @@ bit-for-bit per the parity tests in §7). (3) The AOS state machine (streaming s
 which is plain C++ and unaffected by which runtime draws the graph. (4) Only then remeasure the ~10% ceiling
 this merge was chasing (§8) - the prize was never going to grow while the port got more accurate, and it
 hasn't been re-priced since §7's kernel-brief numbers.
+
+**Update, same session: (2) is de-risked empirically, not just by argument.** `AUDIOCPP_DUMP_LAYER_INDEX`
+(deps.lock `audiocpp=0babdf9`) generalises the dump/isolate machinery to any layer (default 0, unchanged
+behaviour), and `tools/layer0_port.cpp` takes a matching `PORT_LAYER_INDEX` to load that layer's own real
+weights instead of always layer 0's. Layers **0, 15, and 30** - first, middle, and last of the 31-layer stack
+- all port **byte-identical** with their own weights and activations. This doesn't replace actually looping
+all 31 (item 2), but three spread-out real data points passing is a much stronger prior than the structural
+argument alone, and the remaining work on (2) is now closer to plumbing (looping the port's own graph
+construction over a weight array per layer, chaining outputs to inputs) than to risk of a new bug.

@@ -134,15 +134,24 @@ int main(int argc, char ** argv) {
     printf("hidden=%lld frames=%lld head_dim=%lld heads=%lld (head config read from the trace)\n",
            (long long) H, (long long) T, (long long) HD, (long long) HEADS);
 
+    // Which layer's weights to load - must match AUDIOCPP_DUMP_LAYER_INDEX used to produce `dir`'s dump.
+    // The op sequence has no layer-number-dependent branching (build_encoder_layer takes only weights), so
+    // this is here to get an empirical second (third, ...) data point on a DIFFERENT layer's real weights,
+    // not because the code path differs.
+    int layer_index = 0;
+    if (const char * li = std::getenv("PORT_LAYER_INDEX")) layer_index = atoi(li);
+    const std::string lp = "encoder.layers." + std::to_string(layer_index) + ".";
     struct Loaded { std::vector<uint8_t> raw; std::vector<float> f32; int64_t ne[4]; bool bf16; };
-    const char * q8_names[] = { "encoder.layers.0.attn.w_qkv.weight",
-                                "encoder.layers.0.attn.out_proj.weight",
-                                "encoder.layers.0.ffn.net.0.weight",   // ffn_in : hidden -> inter
-                                "encoder.layers.0.ffn.net.3.weight" }; // ffn_out: inter  -> hidden
-    const char * f1_names[] = { "encoder.layers.0.norm1.weight", "encoder.layers.0.norm1.bias",
-                                "encoder.layers.0.norm2.weight", "encoder.layers.0.norm2.bias",
-                                "encoder.layers.0.attn.out_proj.bias",
-                                "encoder.layers.0.ffn.net.0.bias", "encoder.layers.0.ffn.net.3.bias" };
+    const std::string q8_names_s[] = { lp + "attn.w_qkv.weight",
+                                lp + "attn.out_proj.weight",
+                                lp + "ffn.net.0.weight",   // ffn_in : hidden -> inter
+                                lp + "ffn.net.3.weight" }; // ffn_out: inter  -> hidden
+    const std::string f1_names_s[] = { lp + "norm1.weight", lp + "norm1.bias",
+                                lp + "norm2.weight", lp + "norm2.bias",
+                                lp + "attn.out_proj.bias",
+                                lp + "ffn.net.0.bias", lp + "ffn.net.3.bias" };
+    const char * q8_names[4]; for (int i = 0; i < 4; i++) q8_names[i] = q8_names_s[i].c_str();
+    const char * f1_names[7]; for (int i = 0; i < 7; i++) f1_names[i] = f1_names_s[i].c_str();
     Loaded W[11];
     for (int i = 0; i < 4; i++) {
         if (!gguf_tensor(model, q8_names[i], W[i].raw, W[i].ne)) { printf("missing %s\n", q8_names[i]); return 1; }

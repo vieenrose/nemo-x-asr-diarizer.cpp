@@ -37,8 +37,10 @@ Plus one merged GGUF (`--models-bundle`), measured neutral by design.
   ~0.1% elements matching) - `tools/layer0_port.cpp`'s RoPE cos/sin feed applied an unnecessary reindex loop;
   the dump's own `.ne` file already showed the target layout. Deleted the loop: **layer 0 port is now
   byte-identical to audio.cpp**, verified on 3 windows (339 and 679 frames). Stage 2 of the one-runtime merge
-  is done. Full writeup: docs/one-runtime-merge.md §13. Next: loop over the remaining 31 layers, then the AOS
-  state machine, then remeasure the ~10% ceiling.
+  is done. Full writeup: docs/one-runtime-merge.md §13. Generalized the dump/port tools to any layer index
+  (audiocpp `deps.lock` now 0babdf9, `PORT_LAYER_INDEX` in layer0_port.cpp) and spot-checked layers 0, 15, 30
+  (first/middle/last of 31) - all byte-identical with their own real weights. Next: loop over all 31 layers
+  for real (now closer to plumbing than risk), then the AOS state machine, then remeasure the ~10% ceiling.
 - **KleidiAI** (`GGML_CPU_KLEIDIAI=ON`): the only untried kernel-level lever; needs a network fetch for the
   `arm_llama` kernels. Expect accumulation-order changes -> validation.
 - **ggml-native streaming caches** on the ASR side: 114 cache tensors per step currently go

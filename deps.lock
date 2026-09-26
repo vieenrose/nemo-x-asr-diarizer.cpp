@@ -23,6 +23,14 @@
 #                     unconditional first attempt measurably moved production confidence scores in the
 #                     5th/6th decimal (turn boundaries/speaker labels unchanged) - verified byte-identical to
 #                     the pre-fix parent commit when the env var is unset.
+#   audiocpp   3d3d2e1  adds run_layer0_isolated(): rebuilds encoder layer 0 alone, in its own graph, as a
+#                     sound oracle for the port (the running 32-layer graph's ggml_set_output stages are not
+#                     sound - a later layer's tensor can land on the same gallocr slot). Verified byte-
+#                     identical final output to production, 7/12 stages now match the production trace
+#                     exactly (up from 0). Opt-in via AUDIOCPP_LAYER0_ISOLATED; production path untouched.
+#   audiocpp   0babdf9  AUDIOCPP_DUMP_LAYER_INDEX: dump/isolate any layer (default 0, same as before). Used to
+#                     confirm the byte-exact port result generalises - layers 0, 15, and 30 (first, middle,
+#                     last of 31) all port byte-identical with their own real weights.
 crispasr=714f457
 crispasr_ggml=512a020
-audiocpp=58e8496
+audiocpp=0babdf9
