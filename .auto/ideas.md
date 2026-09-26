@@ -120,8 +120,6 @@ difference, not overhead from graph churn. Caught before spending the redesign e
   exist for these clips, so this is a WER-neutral finding, not a DER-neutral one; the label-churn column
   remains the only (proxy) diarization-accuracy signal, and it stayed bounded. Full writeup:
   docs/one-runtime-merge.md §17. Next: item (2), profile the 3 performance candidates instead of guessing.
-- **KleidiAI** (`GGML_CPU_KLEIDIAI=ON`): the only untried kernel-level lever; needs a network fetch for the
-  `arm_llama` kernels. Expect accumulation-order changes -> validation.
 - **ggml-native streaming caches** on the ASR side: 114 cache tensors per step currently go
   graph -> host vector -> graph (outputs 0.563 s + inputs 0.278 s per 69 s clip). Bit-identical in principle;
   every other host-side phase has been partly hidden under the matmuls, so measure before believing it.
@@ -135,7 +133,8 @@ difference, not overhead from graph churn. Caught before spending the redesign e
   came from cutting bytes streamed per frame, not from faster arithmetic), so a purely-arithmetic lever like
   dotprod has less to work with there. Not confirmed with a phase-level profile (the XASR_PROF callback is
   itself ~2x-distorting per this file's own method notes) - flagged as the honest next step if anyone wants
-  a real answer rather than a leg-level proxy. Only KleidiAI remains as an untried kernel-level lever.
+  a real answer rather than a leg-level proxy. No untried kernel-level lever remains (KleidiAI tried and
+  closed below, measured worse).
 - **DONE, and the answer is no:** the diar encoder's carried speaker state cannot be cached across windows.
   Its attention mask is indexed by VALIDITY, not POSITION (it masks only keys past the valid length, and
   `build_encoder_layer` passes that tensor and nothing else), so attention over [state | fifo | chunk] is
@@ -144,8 +143,7 @@ difference, not overhead from graph churn. Caught before spending the redesign e
   this file claimed the opposite, from misreading the same mask; the correction is in docs/pipeline-design.md
   §11. The encoder is linear in packed frames (4.85-5.46 ms/frame measured at 380/548/351 frames), so the
   state term is only reducible by a smaller `spkcache_len`, which moves speaker decisions.
-- **KleidiAI** is the only remaining kernel-level lever and needs a network fetch. Everything else measured
-  out below.
+- No open kernel-level lever remains - see KleidiAI in "Measured out" below. Everything else measured out too.
 
 ## Measured out — do not retry without a changed assumption
 
@@ -157,8 +155,9 @@ difference, not overhead from graph churn. Caught before spending the redesign e
   fastest) explains why nothing above Q4_0 can help. Every quantised type declares `vec_dot_type = Q8_0`, so the dot is
   int8 SDOT whatever the weights are; on A78 (2x128-bit NEON, ARMv8.2) int8 is ~4x fp32 and fp16 FMLA ~2x,
   so both models already sit on the fastest arithmetic the core has. f16 weights would move the diar encoder
-  from the 4x path to the 2x path and roughly double its matmul time. Fewer FLOPs (different model) or a
-  better int8 GEMM (KleidiAI) are the only remaining arithmetic levers.
+  from the 4x path to the 2x path and roughly double its matmul time. Fewer FLOPs (different model) is the
+  only remaining arithmetic lever - KleidiAI (a better int8 GEMM) was tried 2026-09-26 and measured worse,
+  see below.
 - F16 weights for the ASR: crispasr deliberately patches F16 to an f32 dot (upstream's f32->f16 cast
   saturates above 65504 and produced NaN matmuls). The A78's fp16 pipe is unreachable without solving that.
 - ASR `chunk_ms` 960: ~12% faster on the leg, but WER +5.9 pts on gate_ms_v2 and past the holdout_en ceiling.
@@ -172,8 +171,15 @@ difference, not overhead from graph churn. Caught before spending the redesign e
   run-to-run variance, and 64 is slower (more compression passes). 128 stays.
 - Attribution / window assembly: timed at 0.00 s. `other_s` is the final encoder window, instrumented.
 - Prefault, graph arena / weight context sizing, piece cadence, thread counts, dotprod/build flags.
-- KleidiAI without kernels; one shared ggml between the two engines (dies at
-  `GGML_ASSERT(*cur_backend_id != -1)`).
+- KleidiAI without kernels (an earlier attempt, before the network was re-checked - did nothing, unsurprisingly).
+- **KleidiAI, actually tried, 2026-09-26.** The "verified network-blocked" premise was stale: `curl` to
+  github.com's release asset succeeds in this environment, and `-DGGML_CPU_KLEIDIAI=ON` fetches, configures,
+  and builds cleanly for both vendored ggmls, `aarch64-linux-android33`. Ran on-device: no crash (self-selects
+  the DOTPROD-only kernel variant, correctly skipping `i8mm` this chip lacks), transcript byte-identical to
+  the dotprod-only baseline. Performance: **diar leg ~62% SLOWER** (3.39s -> 5.49s/5.50s, reproduced twice,
+  same clip/mask), ASR leg flat. Full writeup: docs/pipeline-design.md §16. Not wired into
+  `scripts/build_android.sh` - closed, not an open lever.
+- One shared ggml between the two engines (dies at `GGML_ASSERT(*cur_backend_id != -1)`).
 
 ## Method notes worth keeping
 

@@ -441,3 +441,42 @@ range - the most likely explanation is that whatever binary produced that number
 stale cache that happened to carry dotprod (or an equivalent flag) from some earlier manual configure, since
 this project had never verified `scripts/build_android.sh` builds clean before this session. That is a
 plausible reconciliation, not a verified one - flagged here rather than asserted.
+
+## 16. Correction: KleidiAI was never actually network-blocked in this environment - tried it, and it is measurably worse, not better
+
+§12's "closed levers" list and `ideas.md` both carried "KleidiAI... verified network-blocked" as the reason
+it was never tried. That was never re-checked this session until now: `curl` to
+`github.com/ARM-software/kleidiai`'s release asset succeeds from this shell, and `-DGGML_CPU_KLEIDIAI=ON`'s
+`FetchContent` step fetches and configures cleanly for both vendored ggmls, cross-compiled for
+`aarch64-linux-android33`. Built and linked a full composite (CrispASR side: `xasr`/`ggml-cpu`/`kleidiai.a`;
+audiocpp side: `libaudiocpp.so`, confirmed zero leaked `ggml`/`gguf` dynamic symbols, same as every other
+build here) and ran it on-device. It does not crash - KleidiAI's own runtime log confirms it self-selected
+the DOTPROD-only kernel variant (`kleidiai: primary q8 kernel feature DOTPROD`), correctly avoiding the
+`i8mm` kernels this chip does not have (some `f32`/`q4` shapes log "no compatible kernel found for CPU
+features mask 0/33" and fall back to plain ggml - expected, not every shape has a KleidiAI kernel).
+
+**Correctness: byte-identical.** `gate_ms_v2.wav` through the KleidiAI build matches the dotprod-only
+baseline's transcript exactly, byte for byte - unsurprising for the same reason as §15's dotprod result (int8
+accumulation is exact, not a reordering), but confirmed rather than assumed.
+
+**Performance: measurably worse, not better, and by a lot.** Same clip, same mask, two runs:
+
+| build | phone wall (44.98s audio) | diar_s | asr_s |
+|---|---|---|---|
+| dotprod-only (§15 baseline) | 18.83 s | 3.39 s | 11.83 s |
+| + KleidiAI | 23.05 s / 23.07 s | 5.49 s / 5.50 s | 11.86 s / 11.87 s |
+
+The diar leg got **~62% slower**, reproduced identically to two decimal places across two runs - not noise.
+The ASR leg is flat, consistent with §15's own finding that its dominant cost is bandwidth- rather than
+dot-product-bound, so a kernel-dispatch change wouldn't move it either way. Not profiled further (the
+mechanism is very likely KleidiAI's own kernel-selection/packing overhead losing to plain ggml's simpler
+dispatch for this model's specific matmul shapes - KleidiAI's micro-kernels target larger-batch GEMM than a
+single streaming diarization window presents), and not worth profiling further: the result is unambiguous
+enough to close the lever without needing the mechanism.
+
+**Correction applied:** `ideas.md`'s "KleidiAI... needs a network fetch" was wrong twice over - the fetch
+works, and having tried it, it is a measured regression, not an untried opportunity. Moved from "Open,
+ranked" to "Measured out." No config in this repository enables it; `GGML_CPU_KLEIDIAI=ON` was never wired
+into `scripts/build_android.sh` and should not be. Test artifacts (build dirs, device directory) were
+throwaway and have been removed - this environment is disk-constrained (a shared machine, ~94-97% full
+independent of this session's own usage) and the test needed no permanent trace to be conclusive.
