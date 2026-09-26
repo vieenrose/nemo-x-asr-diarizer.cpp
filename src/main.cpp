@@ -121,6 +121,7 @@ int main(int argc, char** argv) {
         }
         else if (a == "--no-asr") cfg.skip_asr = true;
         else if (a == "--no-diar") cfg.skip_diar = true;
+        else if (a == "--diar-native") cfg.diar_native = true;
         else if (a == "--live") live = true;
         else if (a == "--json") json = true;
         else if (a == "--turns-out") { turns_path = next("--turns-out"); turns_out = true; }

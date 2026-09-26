@@ -24,6 +24,31 @@
 
 namespace nemo {
 
+// Trampoline for audiocpp_nemotron3_diar_set_external_encoder's C function-pointer contract (see
+// diar_crispasr.h / docs/one-runtime-merge.md): user_data is the DiarCrispASR instance this Engine owns.
+// Ownership rule from audiocpp.h's own doc comment on this typedef: malloc() the return buffer, audio.cpp
+// frees it after copying.
+static int diar_native_encode(
+    void* user_data,
+    const float* embeddings, int64_t batch, int64_t frames, int64_t hidden,
+    const int64_t* valid_frames,
+    float** out_probabilities, int64_t* out_len) {
+    auto* diar = static_cast<DiarCrispASR*>(user_data);
+    try {
+        std::vector<float> emb(embeddings, embeddings + batch * frames * hidden);
+        std::vector<int64_t> vf(valid_frames, valid_frames + batch);
+        auto probs = diar->encode(emb, batch, frames, vf);
+        float* buf = static_cast<float*>(std::malloc(probs.size() * sizeof(float)));
+        if (!buf) return 1;
+        std::memcpy(buf, probs.data(), probs.size() * sizeof(float));
+        *out_probabilities = buf;
+        *out_len = static_cast<int64_t>(probs.size());
+        return 0;
+    } catch (...) {
+        return 1;
+    }
+}
+
 double now_s() {
     timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -174,6 +199,20 @@ bool Engine::init(std::string& err) {
         if (sopts) audiocpp_options_free(sopts);   // the API copies the map into the session
     if (dbg_thr) std::fprintf(stderr, "[threads] after session_create: %d\n", nthr());
         if (st != AUDIOCPP_OK) { err = std::string("diar session (streaming): ") + audiocpp_last_error(); return false; }
+        if (cfg_.diar_native) {
+            try {
+                diar_crispasr_ = std::make_unique<DiarCrispASR>(cfg_.diar_model, cfg_.threads);
+            } catch (const std::exception& e) {
+                err = std::string("diar_native: DiarCrispASR load failed: ") + e.what();
+                return false;
+            }
+            st = audiocpp_nemotron3_diar_set_external_encoder(
+                (audiocpp_session*)session_, &diar_native_encode, diar_crispasr_.get());
+            if (st != AUDIOCPP_OK) {
+                err = std::string("diar_native: set_external_encoder: ") + audiocpp_last_error();
+                return false;
+            }
+        }
         // The decode knobs live on the REQUEST (session.cpp reads decode_config(stream_request_.options)),
         // so build one instead of passing NULL. It stays alive for the run: freeing it after stream_start
         // would leave the family reading a dangling map, or quietly fall back to the defaults, and a

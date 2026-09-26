@@ -1,0 +1,202 @@
+From 4d3de79696469e898dc4461b8cb5c64c561bb5e6 Mon Sep 17 00:00:00 2001
+From: autoresearch <agent@localhost>
+Date: Sat, 26 Sep 2026 07:03:41 +0000
+Subject: [PATCH] diar: external-encoder hook - let a caller redirect encode()
+ to a different ggml runtime
+
+docs/one-runtime-merge.md's remaining work item: wire the now-byte-exact CrispASR port of the
+encoder+head (previous four commits) into an actual merged runtime, without reimplementing the surrounding
+orchestration (mel frontend, streaming window scheduling, arrival-order speaker-cache state, turn decoding),
+which is intricate, numerically fragile in places (compress()'s score/threshold logic), and already proven
+correct by this project's own history. That orchestration has no ggml dependency in its bookkeeping - only
+encode() itself (encoder+head) touches ggml.
+
+Added Session::set_external_encoder() (nemotron_3_diar): an optional std::function matching encode()'s own
+signature (packed [speaker_cache|fifo|chunk] embeddings in, per-frame probabilities out). encode()'s first
+line delegates to it when set; every other line, and everything upstream of encode() in the class, is
+byte-for-byte unchanged when it is not. Exposed via a new C API function,
+audiocpp_nemotron3_diar_set_external_encoder (nemotron_3_diar only - the one narrow, documented exception to
+this file's own "no family-specific includes" rule), so a host process can plug in a callback that runs the
+compute on a different ggml backend - e.g. one already shared with another model in the same process -
+without linking against this library's internal types.
+
+Verified: ggml symbol visibility unaffected (llvm-readelf --dyn-syms libaudiocpp.so | grep -c ' (ggml|gguf)_'
+still 0); the new symbol is exported (matched by the existing audiocpp_* wildcard in audiocpp.map, no map
+changes needed). Behavioural verification (hook unset == today's output, hook set to a CrispASR-side
+implementation == correct turns) is the next step, in the composite project.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QJVEwbN82WXJr6Us6kowEX
+---
+ include/audiocpp.h                            | 28 ++++++++++
+ .../engine/models/nemotron_3_diar/session.h   | 15 ++++++
+ src/capi/audiocpp.cpp                         | 51 +++++++++++++++++++
+ src/models/nemotron_3_diar/session.cpp        |  1 +
+ 4 files changed, 95 insertions(+)
+
+diff --git a/include/audiocpp.h b/include/audiocpp.h
+index 76cfe6b..c14e046 100644
+--- a/include/audiocpp.h
++++ b/include/audiocpp.h
+@@ -255,6 +255,34 @@ AUDIOCPP_API void            audiocpp_session_free(audiocpp_session * session);
+ 
+ AUDIOCPP_API const char * audiocpp_session_family(const audiocpp_session * session);
+ 
++/* Nemotron 3 Diarization only (fails AUDIOCPP_ERR_INVALID_ARGUMENT on any other family's session).
++ *
++ * docs/one-runtime-merge.md: redirects JUST the encoder+head compute to a caller-supplied ggml runtime -
++ * e.g. one that shares a scheduler with another model already running in the same process - while every
++ * other piece of the family (the mel frontend, streaming window scheduling, the arrival-order speaker-cache
++ * state, turn decoding) keeps running this library's own code, unmodified.
++ *
++ * `fn` receives the SAME packed-embeddings-in/probabilities-out contract the family's own internal encode()
++ * uses: `embeddings` is `batch * frames * hidden` packed [speaker_cache | fifo | chunk] frames, row-major;
++ * `valid_frames` has `batch` entries, one valid length per row (<= frames; anything past it is masked
++ * padding, not meaningful audio). `fn` must set `*out_probabilities` to a buffer of exactly
++ * `batch * frames * num_speakers` floats ALLOCATED WITH malloc() (audio.cpp frees it after copying - the one
++ * ownership rule for this hook) and `*out_len` to that count, then return 0. A nonzero return (or a null
++ * `*out_probabilities`) fails the encode() call with AUDIOCPP_ERR_RUNTIME.
++ *
++ * Pass fn == NULL to remove a previously-set hook and restore the library's own compute.
++ */
++typedef int (*audiocpp_nemotron3_diar_encode_fn)(
++    void * user_data,
++    const float * embeddings, int64_t batch, int64_t frames, int64_t hidden,
++    const int64_t * valid_frames,
++    float ** out_probabilities, int64_t * out_len);
++
++AUDIOCPP_API audiocpp_status audiocpp_nemotron3_diar_set_external_encoder(
++    audiocpp_session * session,
++    audiocpp_nemotron3_diar_encode_fn fn,
++    void * user_data);
++
+ /* Optional. audiocpp_session_run() and audiocpp_stream_start() always prepare
+  * with the request they are about to run -- preparation carries the input
+  * length, so a session prepared for one request must not run another. Call this
+diff --git a/include/engine/models/nemotron_3_diar/session.h b/include/engine/models/nemotron_3_diar/session.h
+index 7713310..fea9e13 100644
+--- a/include/engine/models/nemotron_3_diar/session.h
++++ b/include/engine/models/nemotron_3_diar/session.h
+@@ -6,6 +6,7 @@
+ #include "engine/framework/model_spec/metadata.h"
+ #include "engine/framework/runtime/session_base.h"
+ 
++#include <functional>
+ #include <memory>
+ #include <set>
+ #include <tuple>
+@@ -28,6 +29,19 @@ public:
+         std::shared_ptr<const model_spec::ModelContract> contract);
+     ~Session() override;
+ 
++    // docs/one-runtime-merge.md (nemo-x-asr-diarizer.cpp, the composite this family was built for): lets a
++    // caller redirect JUST the encoder+head compute - encode()'s own signature, packed
++    // [speaker_cache | fifo | chunk] embeddings in, per-frame speaker probabilities out - to a DIFFERENT ggml
++    // runtime that shares one scheduler with another model in the same process, while every other piece of
++    // this class (the mel frontend, streaming window scheduling, the arrival-order speaker-cache state, turn
++    // decoding) keeps running exactly this code, unmodified. Unset (the default) leaves encode() byte-for-
++    // byte the same as before this hook existed - checked by encode()'s own first line, nothing upstream of
++    // it changes at all.
++    using ExternalEncoder = std::function<std::vector<float>(
++        const std::vector<float> & embeddings, int64_t batch, int64_t frames,
++        const std::vector<int64_t> & valid_frames)>;
++    void set_external_encoder(ExternalEncoder fn) { external_encoder_ = std::move(fn); }
++
+     std::string family() const override;
+     runtime::VoiceTaskKind task_kind() const override;
+     runtime::RunMode run_mode() const override;
+@@ -97,6 +111,7 @@ private:
+     bool stream_started_ = false;
+     size_t graph_arena_bytes_ = 1024ull * 1024ull * 1024ull;
+     size_t weight_context_bytes_ = 1024ull * 1024ull * 1024ull;
++    ExternalEncoder external_encoder_;
+ };
+ 
+ }  // namespace engine::models::nemotron_3_diar
+diff --git a/src/capi/audiocpp.cpp b/src/capi/audiocpp.cpp
+index 1582084..d1039d3 100644
+--- a/src/capi/audiocpp.cpp
++++ b/src/capi/audiocpp.cpp
+@@ -20,9 +20,15 @@
+ #include "engine/framework/runtime/model.h"
+ #include "engine/framework/runtime/registry.h"
+ #include "engine/framework/runtime/session.h"
++// One narrow, deliberate exception to "never a family-specific include" (see the file banner): the external-
++// encoder hook (docs/one-runtime-merge.md) is nemotron_3_diar-specific by nature - it redirects THAT
++// family's encoder+head compute to a caller-supplied ggml runtime while leaving everything else about the
++// family (mel frontend, streaming state, turn decoding) untouched. No other function in this file touches it.
++#include "engine/models/nemotron_3_diar/session.h"
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <cstdlib>
+ #include <exception>
+ #include <filesystem>
+ #include <iterator>
+@@ -529,6 +535,51 @@ void audiocpp_session_free(audiocpp_session * session) {
+     delete session;
+ }
+ 
++audiocpp_status audiocpp_nemotron3_diar_set_external_encoder(
++    audiocpp_session * session,
++    audiocpp_nemotron3_diar_encode_fn fn,
++    void * user_data) {
++    if (session == nullptr) return fail(AUDIOCPP_ERR_INVALID_ARGUMENT, "session must be non-null");
++    if (session->family != "nemotron_3_diar") {
++        return fail(AUDIOCPP_ERR_INVALID_ARGUMENT,
++                    "audiocpp_nemotron3_diar_set_external_encoder requires a nemotron_3_diar session");
++    }
++    return guard([&] {
++        auto * diar = dynamic_cast<engine::models::nemotron_3_diar::Session *>(session->session.get());
++        if (diar == nullptr) {
++            throw std::runtime_error("nemotron_3_diar session did not downcast to its own Session type");
++        }
++        if (fn == nullptr) {
++            diar->set_external_encoder(nullptr);
++            return AUDIOCPP_OK;
++        }
++        // The callback allocates its return buffer with malloc(); this lambda copies it into the
++        // std::vector<float> encode() actually returns and frees the malloc'd buffer - the ONE ownership
++        // rule for this hook, documented on the typedef in audiocpp.h.
++        diar->set_external_encoder(
++            [fn, user_data](
++                const std::vector<float> & embeddings, int64_t batch, int64_t frames,
++                const std::vector<int64_t> & valid_frames) -> std::vector<float> {
++                float * out = nullptr;
++                int64_t out_len = 0;
++                const int64_t hidden =
++                    frames > 0 && batch > 0
++                        ? static_cast<int64_t>(embeddings.size()) / (batch * frames)
++                        : 0;
++                const int rc = fn(
++                    user_data, embeddings.data(), batch, frames, hidden,
++                    valid_frames.data(), &out, &out_len);
++                if (rc != 0 || out == nullptr) {
++                    throw std::runtime_error("nemotron_3_diar external encoder callback failed");
++                }
++                std::vector<float> result(out, out + out_len);
++                std::free(out);
++                return result;
++            });
++        return AUDIOCPP_OK;
++    });
++}
++
+ const char * audiocpp_session_family(const audiocpp_session * session) {
+     if (session == nullptr) return kEmptyString;
+     return session->family.c_str();
+diff --git a/src/models/nemotron_3_diar/session.cpp b/src/models/nemotron_3_diar/session.cpp
+index d0c1213..20eb469 100644
+--- a/src/models/nemotron_3_diar/session.cpp
++++ b/src/models/nemotron_3_diar/session.cpp
+@@ -225,6 +225,7 @@ std::vector<float> Session::encode(
+     int64_t batch,
+     int64_t frames,
+     const std::vector<int64_t> & valid_frames) {
++    if (external_encoder_) return external_encoder_(embeddings, batch, frames, valid_frames);
+     const bool prof = diar_prof::on();
+     const auto t0 = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+     ensure_encoder_graph(
+-- 
+2.53.0
+

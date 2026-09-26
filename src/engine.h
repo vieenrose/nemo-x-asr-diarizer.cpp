@@ -12,9 +12,11 @@
 #pragma once
 #include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
+#include "diar_crispasr.h"
 #include "fusion.h"
 
 namespace nemo {
@@ -112,6 +114,13 @@ struct Config {
     bool live_provisional = false;  // re-attribute on every turn update, print revisions to stderr
     bool skip_asr     = false;
     bool skip_diar    = false;
+    // docs/one-runtime-merge.md: run the diar encoder+head on CrispASR's own ggml (DiarCrispASR,
+    // src/diar_crispasr.h) via audiocpp_nemotron3_diar_set_external_encoder, instead of audio.cpp's own
+    // internal graph. Every other piece of the diar family (mel frontend, streaming window scheduling, the
+    // arrival-order speaker-cache state, turn decoding) is audio.cpp's own code either way - this flag picks
+    // which runtime does JUST the matmul-heavy compute. Default false (audio.cpp's own ggml, today's
+    // behaviour, unchanged) until this is validated end to end and measured, not assumed, faster.
+    bool diar_native  = false;
 };
 
 struct Segment {
@@ -189,6 +198,7 @@ private:
     void* session_ = nullptr;
     void* diar_request_ = nullptr;
     std::vector<double> piece_ms_;
+    std::unique_ptr<DiarCrispASR> diar_crispasr_;   // set only when cfg_.diar_native
 };
 
 double rss_mb();      // VmHWM, peak resident set of this process

@@ -555,3 +555,80 @@ a sigmoid pre-threshold value, three orders of magnitude below the `pred_score_t
 `sil_threshold`/boost-rate knobs `AoscState` actually thresholds against (§ StreamingConfig, `streaming.cpp`),
 it is very unlikely to flip a speaker decision - but "unlikely" is a hypothesis, not the byte-identity gate
 this whole project holds everything else to, and it should be checked before the merged runtime is trusted.
+
+## 16. The merge runs end to end. It is correct, close, and NOT YET faster - measured, not assumed.
+
+Item 3 (wire it into an actual merged runtime) is done as a working, opt-in path, not yet as the default.
+
+**Design.** `Session::set_external_encoder()` (`ref/audiocpp`, deps.lock `audiocpp=4d3de79`) lets a caller
+redirect JUST `encode()` (encoder+head) to a different ggml runtime, exposed via a new C API function
+(`audiocpp_nemotron3_diar_set_external_encoder`) that is `nemotron_3_diar`-only - the one narrow, documented
+exception to `audiocpp.cpp`'s own "no family-specific includes" rule. Everything else about the family (the
+mel frontend, `StreamScheduler`, `AoscState`, `decode_turns`) is unmodified audio.cpp code, reached the normal
+way - reusing it rather than reimplementing was deliberate: `AoscState::compress()` in particular is
+intricate, numerically fragile score/threshold logic (docs read in full before this decision), exactly where
+a hand transcription would risk a silent DER regression with no compiler or byte-identity gate to catch it.
+
+`DiarCrispASR` (`src/diar_crispasr.h`/`.cpp`, new) is the callback: the SAME op sequence
+`tools/encoder_port.cpp` and `tools/head_port.cpp` already proved byte-exact (SS13-15), restructured as a
+reusable class instead of a one-shot CLI tool, gated behind a new `--diar-native` flag (default off - the
+audio.cpp path is unchanged and still the default). Verified against the same dump-directory oracle the CLI
+tools use (`tools/diar_crispasr_test.cpp`): identical result, including the documented ~1e-3 conv1d gap - the
+refactor into a reusable class introduced no new discrepancy.
+
+**Two real bugs found and fixed while wiring it up, both about lifetime, not the math** (the math was already
+proven correct):
+1. First draft rebuilt the ENTIRE graph - all 31 layers' weights included - on every `encode()` call. Audio.cpp's
+   own "stop padding streaming windows" optimisation (this project's earliest, largest win) means the packed
+   `[speaker_cache|fifo|chunk]` length is almost never the same from one window to the next, so "rebuild
+   when the shape changes" was, in effect, "rebuild on almost every call" - re-uploading ~100 MB of Q8_0
+   weights repeatedly. Measured, not assumed: peak RSS 2.8 GB, and RTF WORSE than the audio.cpp path this was
+   meant to replace.
+2. Fixed by splitting into two `ggml_context`s, mirroring `ref/audiocpp`'s own split between
+   `BackendWeightStore` (persistent) and `EncoderGraph` (rebuilt per shape): weights are created and fed
+   into `weights_ctx_` exactly ONCE, at construction; only ~10 small activation tensors (input, mask) live in
+   the per-shape `Graph`, referencing the persistent weight tensors by pointer - the same cross-context
+   reference pattern any ggml-based inference uses for persistent weights. Also fixed in the same pass: the
+   constructor was calling `gguf_init_from_file` (a full header reparse) plus separate `fopen`/`fread`/`fclose`
+   for EACH of ~350 tensors; a single `GgufReader` that opens the file once cut per-call "load" time (which,
+   confusingly, showed up inside `encode()`'s own first call, not construction, until traced) from 3.1 s to
+   0.44 s.
+
+**Result after both fixes, on two clips, `--diar-native` vs the audio.cpp default (`taskset C0`, armed):**
+
+| clip | default diar_s | native diar_s | default RTF | native RTF |
+|---|---|---|---|---|
+| `gate_ms_v2.wav` (45 s) | 3.35-3.39 | 3.82-3.90 | 0.424-0.426 | 0.447-0.452 |
+| `chat69.wav` (69 s) | 8.82 | 9.96 | 0.442 | 0.468 |
+
+**Correctness: the transcript is right, segment/speaker labels shift slightly** (`out_native.txt` vs
+`out_default.txt` on `gate_ms_v2.wav`): the Chinese and English text is identical content, split at a
+one-character-different boundary in one place, and one speaker's arrival-order label reads 2 instead of 3 -
+consistent with the documented ~1e-3 head precision gap (SS15) nudging a turn-boundary or arrival-order
+decision, not a new bug. This is exactly the DER/WER check SS15 said was still owed before trusting the
+merged runtime for real use - not yet done (needs the project's own `validate.sh`/DER-lite protocol, not an
+eyeballed diff).
+
+**Performance: NOT yet better - reproducibly ~10-13% worse on the diar leg, both clips.** The "one shared
+ggml scheduler is faster" hypothesis this whole merge was chasing is not confirmed by this first working
+version. Structurally the two paths are now comparable (both rebuild a per-shape graph against persistent
+weights), so the gap is not the design-level problem the two fixes above were - likely candidates, in the
+order I would check them: (a) neither `ref/crispasr`'s ggml nor `ref/audiocpp`'s build passes any
+`-mcpu=cortex-a78`-class tuning flag for this composite (checked: absent from both `build_android.sh` and
+`ref/crispasr/CMakeLists.txt`) - a generic-ARMv8 build may simply codegen these specific Q8_0/flash-attention
+kernels worse than whatever audio.cpp's own build environment produces, in which case this affects the x-asr
+leg too and is a separate, general win, not evidence against the merge; (b) creating and destroying a fresh
+`ggml_context`/backend buffer/gallocr for the activation graph on nearly every call (small, but not free -
+worth measuring whether a fixed-max-capacity graph with masking, reused via views instead of rebuilt, is
+actually faster here even though audio.cpp's own no-padding design rejected that trade for itself); (c) thread
+count/affinity interaction between `DiarCrispASR`'s own `ggml_backend_cpu_init()` and whatever `xasr_context`
+already established - two logical CPU backends from the same statically-linked ggml, not two ggml copies, but
+worth checking whether they are actually contending for the same two cores at any point despite the composite's
+sequential (never concurrent) per-piece design.
+
+**What's left, in order:** (1) a real DER-lite/WER check of `--diar-native` against the gate clips, per SS15 -
+correctness before performance. (2) Profile the three performance candidates above instead of guessing among
+them - this project's own repeated lesson (SS7, kernel-brief) is that a percentage of runtime is not a
+diagnosis. (3) Only once native is both correct (measured) and at least neutral (measured) does flipping
+`--diar-native`'s default, or removing the audio.cpp diar compute path entirely, become the right question to
+ask.

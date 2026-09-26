@@ -52,9 +52,18 @@ Plus one merged GGUF (`--models-bundle`), measured neutral by design.
   CrispASR-local ggml patch that forces F32 im2col (audio.cpp's unpatched ggml hardcodes F16; forcing F16 in
   the port crashes with `GGML_ASSERT(src1->type==F32)`, confirming CrispASR's ggml cannot take that path at
   all). Permanent, well-understood, not a bug - CrispASR's path is higher precision, not lower. Full
-  writeup: docs/one-runtime-merge.md §15. Next: wire encoder+head+AOS state into an actual merged runtime,
-  measure whether the head's ~1e-3 deviation ever flips a speaker decision (unlikely - three orders of
-  magnitude below every StreamingConfig threshold - but unmeasured), then remeasure the ~10% ceiling.
+  writeup: docs/one-runtime-merge.md §15.
+  2026-09-26, wired the actual merge: `Session::set_external_encoder()` (audiocpp `deps.lock` now 4d3de79)
+  redirects JUST encode() to a caller-supplied ggml runtime, everything else (mel, scheduler, AOS state, turn
+  decoding) stays audio.cpp's own code - deliberately not reimplemented (`AoscState::compress()` is fragile
+  score logic with no gate to catch a transcription bug). `DiarCrispASR` (new, `src/diar_crispasr.h`/`.cpp`)
+  is the callback, gated behind `--diar-native` (default off). Runs end to end, correct (same transcript
+  text, small turn/speaker-label shifts matching the known ~1e-3 head gap), **not yet faster**: diar leg
+  ~10-13% WORSE on both gate clips after fixing two real bugs (rebuilding all 31 layers' weights on every
+  call - fixed by splitting persistent weights from the per-shape activation graph; reopening the GGUF ~350
+  times per call - fixed with one open). The "one shared scheduler is faster" hypothesis is not confirmed by
+  this first working version - full writeup, measured numbers, and next steps (DER check, then profile
+  instead of guessing among 3 candidates): docs/one-runtime-merge.md §16.
 - **KleidiAI** (`GGML_CPU_KLEIDIAI=ON`): the only untried kernel-level lever; needs a network fetch for the
   `arm_llama` kernels. Expect accumulation-order changes -> validation.
 - **ggml-native streaming caches** on the ASR side: 114 cache tensors per step currently go

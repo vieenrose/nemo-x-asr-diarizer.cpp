@@ -40,6 +40,11 @@
 #                     standalone rebuild to diff a CrispASR port against. Byte-identical (max abs diff 0.0)
 #                     to production. AUDIOCPP_HEAD_ISOLATED triggers it; probabilities.f32 (production's own)
 #                     is now dumped unconditionally alongside the AUDIOCPP_DUMP_LAYER0 files.
+#   audiocpp   4d3de79  Session::set_external_encoder() + audiocpp_nemotron3_diar_set_external_encoder C API:
+#                     lets a caller redirect JUST encode() (encoder+head) to a different ggml runtime while
+#                     every other piece of the family (mel frontend, streaming state, turn decoding) keeps
+#                     running audio.cpp's own code unmodified. ggml symbol visibility unaffected (leak check
+#                     still 0). This is the actual merge point nemo-x-asr-diarizer.cpp wires up.
 crispasr=714f457
 crispasr_ggml=512a020
-audiocpp=a9c032a
+audiocpp=4d3de79
