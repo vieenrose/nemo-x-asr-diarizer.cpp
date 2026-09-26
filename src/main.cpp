@@ -13,6 +13,34 @@
 #include <cstring>
 #include <algorithm>
 #include <cctype>
+
+// NEMO_PAGEFAULTS=1: prints minor/major page fault deltas for the whole run (fields 10/12 of
+// /proc/self/stat - man proc(5)). No root/strace needed, unlike everything else tried in
+// docs/one-runtime-merge.md SS21-22 to find where --diar-native's kernel-time gap actually comes from.
+static bool read_page_faults(long& minflt, long& majflt) {
+    FILE* f = std::fopen("/proc/self/stat", "r");
+    if (!f) return false;
+    // Field 2 (comm) is parenthesised and may contain spaces/parens itself - skip past the LAST ')' before
+    // counting fields, per proc(5)'s own documented parsing caveat.
+    char buf[1024];
+    if (!std::fgets(buf, sizeof(buf), f)) { std::fclose(f); return false; }
+    std::fclose(f);
+    char* p = std::strrchr(buf, ')');
+    if (!p) return false;
+    p++;
+    int field = 2;
+    long vals[2] = {-1, -1};   // minflt (field 10), majflt (field 12)
+    char* tok = std::strtok(p, " ");
+    while (tok) {
+        field++;
+        if (field == 10) vals[0] = std::atol(tok);
+        if (field == 12) { vals[1] = std::atol(tok); break; }
+        tok = std::strtok(nullptr, " ");
+    }
+    if (vals[0] < 0 || vals[1] < 0) return false;
+    minflt = vals[0]; majflt = vals[1];
+    return true;
+}
 #include <map>
 #include <string>
 #include <vector>
@@ -54,6 +82,9 @@ static void usage(const char* p) {
 }
 
 int main(int argc, char** argv) {
+    const bool pf_prof = std::getenv("NEMO_PAGEFAULTS") != nullptr;
+    long pf_minflt0 = 0, pf_majflt0 = 0;
+    if (pf_prof) read_page_faults(pf_minflt0, pf_majflt0);
     Config cfg;
     bool json = false, live = false, turns_out = false, tokens_out = false, windowed = false;
     double window_s = 70400.0 / 24000.0;   // the archive's HOP_S, in seconds
@@ -296,6 +327,12 @@ int main(int argc, char** argv) {
                     "audio %.2fs (attribution floor)\n",
                     st.turns, st.speakers, st.segments, st.unattributed_chars, st.snapped_chars,
                     st.first_turn_audio_s);
+    }
+    if (pf_prof) {
+        long pf_minflt1 = 0, pf_majflt1 = 0;
+        if (read_page_faults(pf_minflt1, pf_majflt1))
+            std::fprintf(stderr, "[pagefaults] minflt=%ld majflt=%ld\n",
+                          pf_minflt1 - pf_minflt0, pf_majflt1 - pf_majflt0);
     }
     return 0;
 }

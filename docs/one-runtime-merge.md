@@ -930,3 +930,48 @@ negative result, not an abandoned attempt - the hypothesis was concrete, the imp
 sequence (not fixable by changing who owns the pool), or something this session's tools cannot see. Not
 pursued further tonight. `--diar-native` remains exactly where SS20 left it: correct, WER-neutral, ~5%
 slower, default-off.
+
+## 23. Found the actual mechanism: page faults, not thread synchronisation - and it reopens SS18's redesign
+
+SS22 closed "thread-pool ownership" as the explanation for SS21's kernel-time gap. That still left the gap
+itself unexplained, and `simpleperf` couldn't resolve kernel symbol *names* without root (`kptr_restrict`).
+Found a privilege-free way to look anyway: `/proc/self/stat` fields 10 and 12 (`minflt`/`majflt`, documented
+in `proc(5)`) are readable by any process about itself, no `strace`/root needed. Added
+`NEMO_PAGEFAULTS=1` to `src/main.cpp` (reads them at entry and again just before exit, prints the delta).
+
+**The result is unambiguous and exactly reproduces SS21's ratio at a completely different layer of the
+stack**: `gate_ms_v2.wav`, two runs each -
+
+| build | minor page faults |
+|---|---|
+| default | 90,556 / 90,599 |
+| `--diar-native` | 733,037 / 733,489 |
+
+**8.1x**, matching SS21's kernel-time ratio (7.04% / 0.87% = 8.1x) almost exactly - two independent
+measurement methods (a sampling profiler and a raw kernel counter) agreeing this precisely is about as
+confident as this project's tools get without a real device-side heap/mmap tracer. `majflt` is 0 for both
+(everything stays in page cache / no disk I/O), so this is minor faults specifically - first-touch of freshly
+mapped or newly-zeroed anonymous memory, exactly what a repeated allocate/free cycle produces, not what
+thread scheduling produces.
+
+**This reopens, rather than closes, SS18's redesign.** SS18 deprioritised the fixed-max-capacity activation
+graph (build once for the largest frame count, reuse via views/masking for every call) on the reasoning that
+`encode()` only rebuilds 2-6 times per clip, so there is little rebuild overhead left to save. That reasoning
+measured the wrong thing: it counted *how often* the graph rebuilds, not *how expensive each rebuild is*. This
+section's evidence says each of those 2-6 rebuilds is expensive enough, in page faults alone, to plausibly
+account for the entire measured gap - rare-and-costly is still worth fixing when the cost is this large.
+
+**Not implemented tonight, deliberately.** The redesign has a real, unmeasured trade-off SS16 already named
+and this section does not resolve: a fixed `T_max` means every call pays for `T_max` queries' worth of flash
+attention, not just the real frame count's worth - audio.cpp's own no-padding optimisation exists precisely
+because that trade lost for *its* design. Sizing `T_max` correctly needs its own measurement (the theoretical
+capacity from `spkcache_len + fifo_len + chunk_capacity` undershot an actually-observed T of 548 earlier this
+session - session.cpp's own left/right-context additions to `chunk_capacity` are not simply `chunk_len`, and
+getting this wrong either under-provisions, needing a fallback rebuild path anyway, or over-provisions,
+paying more in wasted compute than the page faults ever cost). Implementing this correctly, verifying
+byte-identity (the padding/mask/RoPE-table interaction needs care - the returned probabilities must be
+truncated back to the caller's real frame count from a `T_max`-shaped output), and measuring whether it nets
+positive is real work, not a small change - the wrong moment to attempt it is late in a long session where a
+subtle bug in diarization output is harder to catch than usual. Left as the concrete, now well-evidenced next
+step, with the mechanism proven rather than guessed. `NEMO_PAGEFAULTS=1` kept as a permanent diagnostic to
+verify against once it is attempted.

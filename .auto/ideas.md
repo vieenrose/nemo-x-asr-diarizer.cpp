@@ -114,6 +114,21 @@ clean) rather than keep a new cross-repo API and a threading-model change for ze
 thorough negative result: SS21's kernel-time finding is real, but thread-pool ownership was the wrong fix for
 it. Full writeup: docs/one-runtime-merge.md §22.
 
+**Found the actual mechanism, without needing root.** `simpleperf` couldn't resolve kernel symbol *names*
+(`kptr_restrict`, no root), but `/proc/self/stat` fields 10/12 (`minflt`/`majflt`, `proc(5)`) are readable by
+any process about itself. Added `NEMO_PAGEFAULTS=1` (`src/main.cpp`) and measured: default 90,556-90,599 minor
+page faults on `gate_ms_v2.wav`, `--diar-native` 733,037-733,489 - **8.1x**, matching SS21's kernel-time ratio
+(7.04%/0.87% = 8.1x) almost exactly via a completely different measurement method. `majflt` is 0 both ways
+(no disk I/O) - this is first-touch of freshly allocated/zeroed anonymous memory, not thread scheduling.
+**This reopens SS18's fixed-max-capacity-graph redesign**, deprioritised there on the reasoning that
+`encode()` only rebuilds 2-6 times per clip - that measured *how often*, not *how expensive each rebuild is*,
+and this section's evidence says each one is expensive enough in page faults alone to plausibly explain the
+whole gap. Not implemented tonight (sizing `T_max` correctly, and truncating a `T_max`-shaped output back to
+the caller's real frame count without breaking byte-identity, is real work with a real unresolved trade-off -
+too much padding wastes more compute than the page faults cost, matching audio.cpp's own reason for never
+padding its streaming windows in the first place) - left as the next step with the mechanism proven, not
+guessed. Full writeup: docs/one-runtime-merge.md §23.
+
 ## Open, ranked
 
 - **One-runtime merge** (port the diar encoder into crispasr's ggml so one scheduler, one pool, one arena
@@ -264,3 +279,7 @@ it. Full writeup: docs/one-runtime-merge.md §22.
   (`kptr_restrict`), but addresses/callchains still resolve enough to see which thread/DSO kernel time lands
   on. Before writing another custom `XASR_PROF`-style eval-callback profiler (real, but ~2x-distorting and
   invasive to wire up per class), reach for this first.
+- **`/proc/self/stat` needs no root and no `strace`**: fields 10/12 (`minflt`/`majflt`, `proc(5)`) tell you
+  page-fault counts for the whole process, which is often enough to confirm or rule out "is this a memory-
+  allocation cost" without ever resolving a kernel symbol. Two independent measurements (a sampling profiler's
+  percentage and this raw counter) agreeing to within rounding is a much stronger signal than either alone.
