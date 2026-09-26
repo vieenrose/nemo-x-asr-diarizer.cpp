@@ -87,6 +87,20 @@ where the gap comes from. Four candidates now addressed (ISA tuning, graph churn
 copy), the gap held every time - it's diffuse, not one fixable thing findable without a real op-level
 profiler. Stopped here. Full writeup: docs/one-runtime-merge.md §20.
 
+**Continued ("you have all night"): the op-level profiler mentioned above already existed - the NDK ships
+`simpleperf`.** Recorded both paths; the op mix is essentially identical (both ~51% in the same
+`tinyBLAS_Q0_ARM<block_q8_0>::gemm<3,3>` kernel - SS15's dotprod finding confirmed at the profiler level, not
+just inferred). What differs: kernel-side CPU time, `default` 0.87% of samples vs `--diar-native` 7.04% -
+close in absolute size to the whole wall-time gap, landing on different thread IDs than the main compute,
+consistent with thread-synchronisation cost from `DiarCrispASR` running its own separate 2-thread
+`ggml_backend_cpu_init()` pool alongside `xasr_context`'s. Tested forcing it to 1 thread
+(`DIARCRISPASR_THREADS=1`, kept as a diagnostic) expecting less contention - wall time got ~30% WORSE
+(19.82s -> 25.7s), so the second thread does real useful work; this isn't a thread-count knob. The actual fix
+this points at - sharing one thread pool/scheduler between `xasr_context` and `DiarCrispASR`, i.e. the literal
+"one runtime" the whole merge is named for - is a real architectural change (threading a shared backend
+handle between two currently-independent CMake targets), not attempted blind overnight. Full writeup, with
+the disproven fix recorded so it isn't re-tried: docs/one-runtime-merge.md §21.
+
 ## Open, ranked
 
 - **One-runtime merge** (port the diar encoder into crispasr's ggml so one scheduler, one pool, one arena
@@ -231,3 +245,9 @@ profiler. Stopped here. Full writeup: docs/one-runtime-merge.md §20.
 - Look for work *outside* the engine: the ggml op profile cannot see host C++ (the joint was 31% of the ASR
   leg and invisible), and host phases can matter even when they are not on the critical path, because they
   consume the same memory bandwidth everything else needs.
+- **A real sampling profiler is sitting in the NDK already**: `$NDK/simpleperf/bin/android/arm64/simpleperf`,
+  usable from an unprivileged `adb shell` on this phone (`perf_event_paranoid=-1`) via `simpleperf record -o
+  out.data -- <cmd>` then `simpleperf report -i out.data --sort symbol -n`. Kernel symbol *names* need root
+  (`kptr_restrict`), but addresses/callchains still resolve enough to see which thread/DSO kernel time lands
+  on. Before writing another custom `XASR_PROF`-style eval-callback profiler (real, but ~2x-distorting and
+  invasive to wire up per class), reach for this first.

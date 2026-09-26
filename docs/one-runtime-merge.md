@@ -844,3 +844,46 @@ kind of gap that needs a proper op-level profiler comparing the two ggml call se
 instruction, not another structural guess. Not pursued further this session: `--diar-native` stays
 default-off, correct, WER-neutral, and now understood as precisely as this project's tools can measure it
 without building a new one.
+
+## 21. The op-level profiler this section said didn't exist, actually did: `simpleperf`, and what it found
+
+The NDK ships `simpleperf` (`$NDK/simpleperf/bin/android/arm64/simpleperf`) - a real sampling CPU profiler,
+not something that needed building. `perf_event_paranoid` on this phone is `-1` (unrestricted), so
+`simpleperf record` works from an unprivileged `adb shell`, though `kptr_restrict` still blocks resolving
+kernel symbol *names* (addresses only - no root to lower it).
+
+**The op mix itself is essentially identical between the two paths.** Recorded both the isolated
+`tools/diar_crispasr_bench.cpp` and the real composite (`--no-asr`, default path, audio.cpp's own encoder) and
+compared symbol tables: both are dominated by the same function, `tinyBLAS_Q0_ARM<block_q8_0>::gemm<3,3>`, at
+~51% of samples, with `ggml_compute_forward_flash_attn_ext` a distant second - same kernel, same tile shape,
+same relative weight. This directly confirms SS15's dotprod finding at a different level: both vendored ggmls
+dispatch this model's Q8_0 matmuls to the identical optimised kernel. Whatever the ~5% gap is, it is not "the
+wrong GEMM kernel."
+
+**What is different: kernel-side CPU time, roughly matching the whole gap in size.** Profiled the full
+composite (both legs, `--diar-native` vs default, same clip/mask) and summed every `[kernel.kallsyms]` sample:
+**default 0.87% of total samples, `--diar-native` 7.04%** - an 8x difference, and in absolute terms
+(6.17 percentage points of a ~20s run) close to the size of the entire measured wall-time gap. Symbol names
+are unresolved (`kptr_restrict`), but the callchain view shows these samples landing on different thread IDs
+than the ones running the bulk of the arithmetic - consistent with thread synchronisation (`ggml_barrier`,
+futex wait/wake) rather than the matmul kernel itself. `DiarCrispASR`'s own `ggml_backend_cpu_init()` spins up
+a separate 2-thread pool from `xasr_context`'s, which is architecturally different from how audio.cpp's own
+diar path integrates (single pool the whole session runs under).
+
+**Tested the obvious fix, and it made things worse, not better.** If a second, independently-scheduled
+thread pool were pure contention overhead, reducing `DiarCrispASR` to 1 thread (`DIARCRISPASR_THREADS=1`,
+kept as a diagnostic - see its comment in `src/diar_crispasr.cpp`) should help. It doesn't: wall time on
+`gate_ms_v2.wav` went from 19.82s to 25.68-25.76s, a ~30% regression. The second thread is doing real,
+useful parallel compute, not just adding coordination overhead to subtract away - so the kernel-time
+disparity is more likely the *cost* of running two independent 2-thread pools well (synchronisation between
+threads that don't share a scheduler's own bookkeeping) than a simple thread-count knob to turn.
+
+**Where this leaves it:** a concrete, measured, previously-invisible mechanism (kernel-side thread
+synchronisation cost, not application-level compute) now accounts for a share of the gap comparable to its
+whole size - but the one fix it suggested (fewer threads) is disproven, and the correct fix (sharing one
+thread pool/scheduler between `xasr_context` and `DiarCrispASR`, which is what "one runtime" ultimately
+means) is a real architectural change, not a parameter tweak. That is out of scope to attempt blind tonight -
+it would mean threading a shared `ggml_backend_t`/thread-pool handle between two currently-independent
+CMake targets (`xasr` and this repo's own `diar_crispasr.cpp`) and re-verifying byte-identity and WER-
+neutrality from scratch. Recorded here, with the profiling method and the disproven fix, so the next attempt
+starts from evidence instead of another guess.

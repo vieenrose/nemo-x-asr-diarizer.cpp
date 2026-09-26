@@ -29,6 +29,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
@@ -188,6 +189,12 @@ struct DiarCrispASR::Impl {
 
 DiarCrispASR::DiarCrispASR(const std::string & gguf_path, int threads) : impl_(new Impl()) {
     Impl & m = *impl_;
+    // DIARCRISPASR_THREADS: override for measurement only. Tried as a fix for the kernel-time gap in
+    // docs/one-runtime-merge.md SS21 (this backend's own separate ggml_backend_cpu_init() spins up its own
+    // thread pool alongside x-asr's) - forcing 1 thread made wall time WORSE (19.8s -> 25.7s on
+    // gate_ms_v2.wav), so the second thread is doing real, useful parallel work, not just contention
+    // overhead. Kept as a diagnostic so that negative result isn't re-discovered by trying it again.
+    if (const char * override_threads = getenv("DIARCRISPASR_THREADS")) threads = atoi(override_threads);
     m.threads = threads;
     m.backend = ggml_backend_cpu_init();
     if (m.backend == nullptr) throw std::runtime_error("DiarCrispASR: ggml_backend_cpu_init failed");
