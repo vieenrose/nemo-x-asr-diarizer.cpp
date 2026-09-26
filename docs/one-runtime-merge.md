@@ -304,3 +304,39 @@ half-built: the first stage of the layer reproduces byte-identically and the sha
 remaining work is the attention call, then the 31-layer loop, then the AOS state machine. The prize is still
 the measured ~10% of wall clock from overlapping the two graphs in one scheduler - and it is worth remembering
 that the prize did not grow while the port got more accurate.
+
+## 11. Exactness status of the unified runtime, and the one result that matters most for it
+
+Requirement being held to: **byte-exact output for both legs, one GGUF, one runtime.**
+
+| requirement | status |
+|---|---|
+| one GGUF | **met** - the bundle reproduces the blessed transcript hash and all 1328 payloads are byte-identical |
+| transcription exact | **met** - the ASR is unchanged and byte-identical through every change this session |
+| diarization exact | **not yet** - the ported layer reproduces stage 1 and nothing beyond it |
+| one runtime | **not met** - still two ggmLs; the port is the work |
+
+**The most important new result is a positive one.** Feeding the port's own `q`, `k`, `v` (8 heads, T=391,
+head_dim 64, F16 validity mask) through **one** `ggml_flash_attn_ext` in **both** vendored trees gives
+bit-identical results - 196,096 non-finite of 200,192 and rms 0.052133 in each, under both `DEFAULT` and
+`PREC_F32`. So the two runtimes agree on flash attention *at the real shapes with a real mask*, which the
+earlier parity test never covered (it used 16 heads, T=6, no mask). That was the biggest open risk to the
+merge - a version divergence in an op both models depend on - and it is now closed.
+
+**Where the port actually stands.** `01_norm1` is byte-identical, and every stage's `ne` matches audio.cpp.
+The divergence begins at the head/permute step: the port's `v` has exactly **2.0000x** the reference rms while
+holding the right value range, which is a scaling-or-striding fault in `reshape_4d`/`permute` over the
+contiguous slice - not a wrong weight, not a wrong norm, and not a runtime difference. Three variants
+(rope-cont, mask transposed, k/v contiguity) and both precisions leave the attention output non-finite, so the
+fault is upstream of all of them.
+
+**What I would do next, in order.** (1) Isolate the permute in isolation - build one `reshape_4d` + `permute`
+over a synthetic tensor, dump it, and compare against numpy for all four axis conventions; it is a five-minute
+test and it is the last unknown before the attention can be trusted. (2) Only then the flash call. (3) Then the
+remaining 30 layers, which is repetition once one layer is exact. (4) The AOS state machine, which is C++ and
+moves regardless of which runtime draws the graph.
+
+The discipline this slice has established, which is worth more than the layer: **compare against a sound
+oracle only** (`layer0_out`, a true graph output - never a traced intermediate, which the allocator recycles),
+**read the vendored source for conventions instead of inferring them** (every one of the six bugs so far was a
+logical-axis/ne-axis mix-up that the source settles in one read), and **hold the acceptance test to bytes**.
