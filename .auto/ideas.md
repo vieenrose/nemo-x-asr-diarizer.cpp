@@ -101,6 +101,19 @@ this points at - sharing one thread pool/scheduler between `xasr_context` and `D
 handle between two currently-independent CMake targets), not attempted blind overnight. Full writeup, with
 the disproven fix recorded so it isn't re-tried: docs/one-runtime-merge.md §21.
 
+**Attempted the same night, not left for later: the actual "one shared thread pool" fix.** Implemented in
+two verified-byte-identical stages - (1) `xasr_get_backend()` + a `DiarCrispASR` constructor overload to
+reuse x-asr's own `ggml_backend_t` instead of creating a second one, (2) discovering that alone does nothing
+(ggml's CPU backend spawns/joins fresh threads per `graph_compute` call unless a real `ggml_threadpool_t` is
+attached via `ggml_backend_cpu_set_threadpool` - neither path did that), then adding one to `xasr_context` so
+both x-asr's and (via stage 1's sharing) diar's compute share the same persistent pool. Both stages verified
+byte-identical, both measured: **zero effect on the gap** (default and native wall times both landed inside
+their pre-existing ranges, ~5% apart either way). `cores_used` ticked up slightly for both paths equally -
+some general efficiency gain, but not the specific thing being chased. Reverted both stages (`git checkout`,
+clean) rather than keep a new cross-repo API and a threading-model change for zero confirmed benefit. A real,
+thorough negative result: SS21's kernel-time finding is real, but thread-pool ownership was the wrong fix for
+it. Full writeup: docs/one-runtime-merge.md §22.
+
 ## Open, ranked
 
 - **One-runtime merge** (port the diar encoder into crispasr's ggml so one scheduler, one pool, one arena

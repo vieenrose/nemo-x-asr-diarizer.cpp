@@ -880,10 +880,53 @@ threads that don't share a scheduler's own bookkeeping) than a simple thread-cou
 
 **Where this leaves it:** a concrete, measured, previously-invisible mechanism (kernel-side thread
 synchronisation cost, not application-level compute) now accounts for a share of the gap comparable to its
-whole size - but the one fix it suggested (fewer threads) is disproven, and the correct fix (sharing one
-thread pool/scheduler between `xasr_context` and `DiarCrispASR`, which is what "one runtime" ultimately
-means) is a real architectural change, not a parameter tweak. That is out of scope to attempt blind tonight -
-it would mean threading a shared `ggml_backend_t`/thread-pool handle between two currently-independent
-CMake targets (`xasr` and this repo's own `diar_crispasr.cpp`) and re-verifying byte-identity and WER-
-neutrality from scratch. Recorded here, with the profiling method and the disproven fix, so the next attempt
-starts from evidence instead of another guess.
+whole size - but the one fix it suggested (fewer threads) is disproven. The other fix it suggested (sharing
+one thread pool/scheduler between `xasr_context` and `DiarCrispASR`) was *not* left for later - see SS22,
+attempted the same night: implemented in full, verified byte-identical, and it also closes nothing. The
+kernel-time finding is real; neither fix it motivated was the answer.
+
+## 22. The architectural fix SS21 pointed at: implemented, verified correct, closes nothing - reverted
+
+SS21 stopped short of the "real fix" (one shared thread pool) because it looked like a bigger change than to
+attempt blind. Given the time to actually try it: implemented it in full, in two stages, each verified
+byte-identical before being measured.
+
+**Stage 1: share the backend object.** Added `xasr_get_backend(xasr_context*)` (`ref/crispasr`, returns the
+raw `ggml_backend_t` as `void*` so `xasr.h` stays ggml-free like every other function in it) and a
+`DiarCrispASR` constructor overload taking an optional `shared_backend` - when given x-asr's own backend
+instead of creating its own via `ggml_backend_cpu_init()`, `DiarCrispASR` never frees it and never re-touches
+its thread count. `src/engine.cpp` wires this up whenever ASR is actually running (`--no-asr` falls back to
+`DiarCrispASR`'s own backend, unchanged). Verified byte-identical on host and on-device before measuring
+anything. **Result: no change.** Wall time on `gate_ms_v2.wav` stayed at 19.7-19.9s, same as before sharing.
+
+**Why: there was no persistent pool to share.** Reading `ggml_backend_cpu_graph_compute` (`ggml-cpu.cpp`)
+showed `ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool)` - `threadpool` stays null unless
+something calls `ggml_backend_cpu_set_threadpool()` explicitly, which neither `xasr_context` nor
+`DiarCrispASR` did (only `ggml_backend_cpu_set_n_threads`). Without it, ggml spawns and joins fresh worker
+threads on *every single* `graph_compute` call, for both paths, whether or not the backend struct is shared -
+so "sharing the backend" shared a struct, not a thread pool, and changed nothing.
+
+**Stage 2: attach an actual persistent `ggml_threadpool_t`.** `ggml-cpu.h` has the real API
+(`ggml_threadpool_new`, `ggml_backend_cpu_set_threadpool`, `ggml_threadpool_free`). Added one to
+`xasr_context` (`ref/crispasr`): created once in `xasr_init_from_file`, attached to `backend_cpu`, freed in
+`xasr_free` after both backend frees. Combined with Stage 1's sharing, this means `DiarCrispASR`'s compute
+calls run through the exact same persistent pool as x-asr's own, workers parked between calls instead of
+spawned fresh. Verified byte-identical again (a threading-model change, not a numerical one - confirmed on
+both the default path, unaffected by `--diar-native`, and the native path itself).
+
+**Result: still no change.** Wall time: default 18.76-18.85s (previously 18.78-18.94s), native 19.73-19.74s
+(previously 19.71-19.90s) - both landed inside the SAME range as before the threadpool existed, gap still
+~5%. `cores_used` ticked up slightly for both paths (1.81-1.82 -> 1.90) - some general scheduling efficiency
+gain, applied equally to both, which is why the *relative* gap did not move even though something measurably
+changed.
+
+**Reverted both stages** (`git checkout` back to the last commit, both repos) rather than keep unmeasured
+complexity: a new cross-repo API, a new constructor parameter, and a persistent thread pool touching every
+x-asr call, for a confirmed zero effect on the one thing they were built to fix. This is a real, thorough,
+negative result, not an abandoned attempt - the hypothesis was concrete, the implementation was correct
+(byte-identity held throughout), and the measurement says plainly that thread-pool lifecycle is not where the
+~5% lives. SS21's `[kernel.kallsyms]` finding (7.04% vs 0.87%) is still real, but its cause is something else
+- possibly futex/barrier synchronisation cost intrinsic to how two threads divide THIS port's specific op
+sequence (not fixable by changing who owns the pool), or something this session's tools cannot see. Not
+pursued further tonight. `--diar-native` remains exactly where SS20 left it: correct, WER-neutral, ~5%
+slower, default-off.
