@@ -488,12 +488,35 @@ ENCODER PORT (31 layers): BYTE-IDENTICAL to audio.cpp (269824 floats)   # gate_m
 ```
 
 **Stage 2 of the one-runtime merge (docs §9-10: "rebuild the diar encoder in CrispASR's ggml, byte-exact
-against audio.cpp") is complete for the whole encoder, not just a spot-checked layer.** What's left of the
-merge, in order: (1) `07_oproj`/`11_ffn_out` aliasing in `run_layer0_isolated` - still open, still not
-blocking (every acceptance test that matters, single-layer and whole-stack, reads the true final output, not
-those two stages). (2) The AOS state machine (streaming speaker-cache bookkeeping across windows) - plain
-C++, unaffected by which runtime draws the graph, and the one piece of the diarizer this session hasn't
-touched at all. (3) Wire the ported encoder into an actual merged runtime (one scheduler, one ggml, one
-arena, replacing the two-pool container-merge form already measured dead at 37-47% slower) - the reason this
-whole port exists. (4) Remeasure the ~10% ceiling (§8) on the real merged build; it hasn't been re-priced
-since §7's kernel-brief numbers and the prize was never going to grow while the port got more accurate.
+against audio.cpp") is complete for the whole encoder, not just a spot-checked layer.**
+
+**Scoped, not yet done: the AOS state machine needs no port at all.** Read `streaming.cpp`
+(`AoscState::update`/`compress`, `StreamScheduler`) end to end: every function operates on plain
+`float*`/`std::vector<float>` - the arrival-order speaker cache, its FIFO, and the window scheduler have zero
+ggml types anywhere in them. They take `chunk_embeddings` (from a separate small `pre_encode` step,
+`PreEncodeGraph`/`ensure_pre_encode_graph` in encoder.h - not yet looked at in this session) and
+`probabilities` (the head's sigmoid output) as raw float buffers and are indifferent to which runtime produced
+them. This item from earlier revisions of this doc's roadmap is not "port the state machine" - it already
+runs unmodified against CrispASR-sourced floats. It only needs wiring.
+
+**What's actually left, in order, now that both false starts above are corrected:**
+
+1. **Port the "head"** (`final_norm` LayerNorm, `encoder_projection` Linear, the `subpixel_upsample` Conv1d,
+   Relu, Linear, Relu, `speaker_head` Linear, Sigmoid - `encoder.cpp` lines ~435-463) into CrispASR's ggml the
+   same way the encoder was: an isolated oracle (`run_head_isolated`, mirroring
+   `run_layer0_isolated`/`run_encoder_isolated`) taking the encoder's real output and the real head weights,
+   then a port tool comparing byte for byte. Smaller than the encoder port (no attention, no RoPE, all
+   feed-forward/conv ops already used and proven byte-identical elsewhere in this codebase's parity tests).
+   Also worth checking: does `pre_encode` (before the encoder, feeding both the encoder's own input and
+   `chunk_embeddings` for the AOS state) need the same treatment, or is it small enough to eyeball.
+2. **`07_oproj`/`11_ffn_out` aliasing** in `run_layer0_isolated`/`run_encoder_isolated` - still open, still not
+   blocking (every acceptance test used, single-layer and whole-stack, reads the true final output, never
+   those two stages) but worth closing before it's mistaken for a NEW bug in a later exploration.
+3. **Wire it all into an actual merged runtime**: one scheduler, one ggml, one arena, replacing the two-pool
+   container-merge form already measured dead at 37-47% slower (§7-8) - CrispASR gains a new model path built
+   from the now-proven-byte-exact encoder+head op sequence and the model's real weights (already loadable via
+   the merged-bundle work, §0/`--models-bundle`), and `AoscState`/`StreamScheduler` get linked in unmodified
+   per the scoping above. This is the large remaining task - comparable in size to everything done so far in
+   this file, not a follow-on tweak - and the one this whole port existed to enable.
+4. **Remeasure the ~10% ceiling** (§8) on the real merged build; it hasn't been re-priced since §7's
+   kernel-brief numbers and the prize was never going to grow while the port got more accurate.
