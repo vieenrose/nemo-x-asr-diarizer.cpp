@@ -35,6 +35,11 @@
 #                     in one graph), not just one layer. encoder_out captures production's own real
 #                     31-layer output; AUDIOCPP_ENCODER_ISOLATED writes the isolated rebuild's
 #                     iso_encoder_out.f32 for comparison. Verified byte-identical to production on two clips.
+#   audiocpp   a9c032a  run_head_isolated(): sound oracle for the head (final_norm..sigmoid). probabilities is
+#                     a true graph output (nothing computed after it) so it was already sound; this gives a
+#                     standalone rebuild to diff a CrispASR port against. Byte-identical (max abs diff 0.0)
+#                     to production. AUDIOCPP_HEAD_ISOLATED triggers it; probabilities.f32 (production's own)
+#                     is now dumped unconditionally alongside the AUDIOCPP_DUMP_LAYER0 files.
 crispasr=714f457
 crispasr_ggml=512a020
-audiocpp=be2af81
+audiocpp=a9c032a

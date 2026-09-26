@@ -44,8 +44,17 @@ Plus one merged GGUF (`--models-bundle`), measured neutral by design.
   as a sound whole-stack oracle, and new `tools/encoder_port.cpp` loops the proven per-layer sequence over
   every real layer (auto-detects layer count from the GGUF). **`ENCODER PORT (31 layers): BYTE-IDENTICAL to
   audio.cpp`** on two independent clips (339 and 527 frames) - the entire encoder, not a spot check. Stage 2
-  is fully done: docs/one-runtime-merge.md §14. Next: the AOS state machine, then wiring the ported encoder
-  into an actual merged runtime, then remeasuring the ~10% ceiling.
+  is fully done: docs/one-runtime-merge.md §14.
+  Scoped the rest (§14 update): the AOS state machine (streaming.cpp) needs no port at all - every function
+  is plain float*/std::vector<float>, indifferent to which runtime produced the numbers. Ported the head
+  instead (`run_head_isolated`, audiocpp deps.lock now a9c032a; `tools/head_port.cpp`): byte-identical
+  through every op except the subpixel-upsample conv1d, which lands ~1e-3 off near unit scale - traced to a
+  CrispASR-local ggml patch that forces F32 im2col (audio.cpp's unpatched ggml hardcodes F16; forcing F16 in
+  the port crashes with `GGML_ASSERT(src1->type==F32)`, confirming CrispASR's ggml cannot take that path at
+  all). Permanent, well-understood, not a bug - CrispASR's path is higher precision, not lower. Full
+  writeup: docs/one-runtime-merge.md §15. Next: wire encoder+head+AOS state into an actual merged runtime,
+  measure whether the head's ~1e-3 deviation ever flips a speaker decision (unlikely - three orders of
+  magnitude below every StreamingConfig threshold - but unmeasured), then remeasure the ~10% ceiling.
 - **KleidiAI** (`GGML_CPU_KLEIDIAI=ON`): the only untried kernel-level lever; needs a network fetch for the
   `arm_llama` kernels. Expect accumulation-order changes -> validation.
 - **ggml-native streaming caches** on the ASR side: 114 cache tensors per step currently go

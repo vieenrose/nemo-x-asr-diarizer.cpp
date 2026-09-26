@@ -1,0 +1,184 @@
+From a9c032a2dda5f241f7801fa4e4ef899a51492007 Mon Sep 17 00:00:00 2001
+From: autoresearch <agent@localhost>
+Date: Sat, 26 Sep 2026 04:43:09 +0000
+Subject: [PATCH] diar: run_head_isolated - sound oracle for the head
+ (final_norm..sigmoid)
+
+Same idea as run_layer0_isolated/run_encoder_isolated, for the "head" that turns the encoder's output into
+per-frame speaker probabilities (final_norm -> encoder_projection -> subpixel_upsample conv1d -> relu ->
+head_hidden -> relu -> speaker_head -> sigmoid). Takes the encoder's real output directly rather than
+recomputing it. probabilities is the whole graph's terminal node (nothing computed after it), so unlike the
+per-layer stages it was already sound by construction - this just gives a standalone rebuild to diff a
+CrispASR port against, and confirms the module-call sequence read from encoder.cpp is exactly right.
+
+Verified: byte-identical (max abs diff 0.0) to production's real probabilities on bilingual_multispk_57s.wav
+across all three windows in the clip. AUDIOCPP_HEAD_ISOLATED triggers it; also dumps probabilities.f32
+(production's own) unconditionally alongside the existing AUDIOCPP_DUMP_LAYER0 files. Production path
+unaffected when unset (confirmed via the existing turns.json byte-identity check).
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QJVEwbN82WXJr6Us6kowEX
+---
+ .../engine/models/nemotron_3_diar/encoder.h   | 11 +++
+ src/models/nemotron_3_diar/encoder.cpp        | 74 +++++++++++++++++++
+ src/models/nemotron_3_diar/session.cpp        | 29 +++++++-
+ 3 files changed, 110 insertions(+), 4 deletions(-)
+
+diff --git a/include/engine/models/nemotron_3_diar/encoder.h b/include/engine/models/nemotron_3_diar/encoder.h
+index c10218a..00baac7 100644
+--- a/include/engine/models/nemotron_3_diar/encoder.h
++++ b/include/engine/models/nemotron_3_diar/encoder.h
+@@ -103,6 +103,17 @@ std::vector<float> run_encoder_isolated(
+     int64_t frames,
+     int64_t valid_frames);
+ 
++// Same idea for the "head" that turns the encoder's output into per-frame speaker probabilities
++// (final_norm -> encoder_projection -> subpixel_upsample conv -> relu -> head_hidden -> relu -> speaker_head
++// -> sigmoid; encoder.cpp's build_encoder_graph, the lines after the layer loop). Takes the encoder's real
++// output directly (e.g. encoder_out.f32 / run_encoder_isolated's own return) rather than recomputing it.
++std::vector<float> run_head_isolated(
++    ggml_backend_t backend,
++    const ModelWeights & weights,
++    const ModelConfig & config,
++    const std::vector<float> & encoder_output,   // [hidden, frames], hidden fastest
++    int64_t frames);
++
+ void ensure_pre_encode_graph(
+     std::unique_ptr<PreEncodeGraph> & graph,
+     const core::ExecutionContext & execution,
+diff --git a/src/models/nemotron_3_diar/encoder.cpp b/src/models/nemotron_3_diar/encoder.cpp
+index 9a1fb0f..7800d15 100644
+--- a/src/models/nemotron_3_diar/encoder.cpp
++++ b/src/models/nemotron_3_diar/encoder.cpp
+@@ -337,6 +337,80 @@ std::vector<float> run_encoder_isolated(
+     return output;
+ }
+ 
++std::vector<float> run_head_isolated(
++    ggml_backend_t backend,
++    const ModelWeights & weights,
++    const ModelConfig & config,
++    const std::vector<float> & encoder_output,
++    int64_t frames) {
++    const int64_t hidden = config.encoder.hidden_size;
++    if (static_cast<int64_t>(encoder_output.size()) != hidden * frames) {
++        throw std::runtime_error("run_head_isolated: encoder_output size does not match hidden*frames");
++    }
++    const size_t arena_bytes = ggml_tensor_overhead() * 128 + ggml_graph_overhead_custom(128, false);
++    ggml_context * ctx_mem = ggml_init({arena_bytes, nullptr, true});
++    if (ctx_mem == nullptr) throw std::runtime_error("run_head_isolated: ggml_init failed");
++    core::ModuleBuildContext ctx{ctx_mem, "nemotron_3_diar.head_isolated", core::BackendType::Cpu};
++
++    auto in_tv = core::make_tensor(ctx, GGML_TYPE_F32, core::TensorShape::from_dims({1, frames, hidden}));
++
++    // --- the head, exactly encoder.cpp's ensure_encoder_graph after the layer loop, unchanged -------------
++    auto output = modules::LayerNormModule({
++        config.encoder.hidden_size, config.encoder.layer_norm_eps, true, true,
++    }).build(ctx, in_tv, weights.final_norm);
++    output = modules::LinearModule({config.encoder.hidden_size, config.head.hidden_size, true})
++                 .build(ctx, output, weights.encoder_projection);
++    output = modules::TransposeModule({{0, 2, 1}, 3}).build(ctx, output);
++    output = modules::Conv1dModule({
++        config.head.hidden_size,
++        config.head.hidden_size * config.head.upsample_factor,
++        config.head.upsample_kernel_size,
++        1,
++        static_cast<int>(config.head.upsample_kernel_size / 2),
++        1,
++        true,
++    }).build(ctx, output, weights.subpixel_upsample);
++    output = modules::TransposeModule({{0, 2, 1}, 3}).build(ctx, output);
++    output = core::ensure_backend_addressable_layout(ctx, output);
++    output = core::reshape_tensor(
++        ctx, output,
++        core::TensorShape::from_dims({1, frames * config.head.upsample_factor, config.head.hidden_size}));
++    output = modules::ReluModule().build(ctx, output);
++    output = modules::LinearModule({config.head.hidden_size, config.head.hidden_size, true})
++                 .build(ctx, output, weights.head_hidden);
++    output = modules::ReluModule().build(ctx, output);
++    output = modules::LinearModule({config.head.hidden_size, config.num_speakers, true})
++                 .build(ctx, output, weights.speaker_head);
++    auto out_tv = modules::SigmoidModule().build(ctx, output);
++
++    ggml_set_input(in_tv.tensor);
++    ggml_set_output(out_tv.tensor);
++
++    ggml_cgraph * graph = ggml_new_graph_custom(ctx_mem, 128, false);
++    ggml_build_forward_expand(graph, out_tv.tensor);
++    ggml_gallocr_t allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
++    if (!ggml_gallocr_alloc_graph(allocator, graph)) {
++        ggml_gallocr_free(allocator);
++        ggml_free(ctx_mem);
++        throw std::runtime_error("run_head_isolated: failed to allocate graph");
++    }
++
++    core::write_tensor_f32(in_tv, encoder_output);
++
++    const auto status = ggml_backend_graph_compute(backend, graph);
++    if (status != GGML_STATUS_SUCCESS) {
++        ggml_gallocr_free(allocator);
++        ggml_free(ctx_mem);
++        throw std::runtime_error("run_head_isolated: graph compute failed");
++    }
++
++    std::vector<float> result(static_cast<size_t>(ggml_nelements(out_tv.tensor)));
++    core::read_tensor_f32_into(out_tv.tensor, result);
++    ggml_gallocr_free(allocator);
++    ggml_free(ctx_mem);
++    return result;
++}
++
+ void ensure_pre_encode_graph(
+     std::unique_ptr<PreEncodeGraph> & graph,
+     const core::ExecutionContext & execution,
+diff --git a/src/models/nemotron_3_diar/session.cpp b/src/models/nemotron_3_diar/session.cpp
+index 70ce660..d0c1213 100644
+--- a/src/models/nemotron_3_diar/session.cpp
++++ b/src/models/nemotron_3_diar/session.cpp
+@@ -268,11 +268,12 @@ std::vector<float> Session::encode(
+         dump("_in.f32", tin, false);
+         dump("_in.shape", tin, true);
+         dump("_out.f32", tout, false);
++        // The whole encoder stack's real output - the acceptance test for a port of ALL layers, not just the
++        // one AUDIOCPP_DUMP_LAYER_INDEX selects above, and the head's real input (NOT `tout`, which is only
++        // the selected layer's output unless AUDIOCPP_DUMP_LAYER_INDEX happens to be the last layer).
++        std::vector<float> eout(ggml_nelements(encoder_graph_->encoder_out.tensor));
++        core::read_tensor_f32_into(encoder_graph_->encoder_out.tensor, eout);
+         {
+-            // The whole encoder stack's real output - the acceptance test for a port of ALL layers, not just
+-            // the one AUDIOCPP_DUMP_LAYER_INDEX selects above.
+-            std::vector<float> eout(ggml_nelements(encoder_graph_->encoder_out.tensor));
+-            core::read_tensor_f32_into(encoder_graph_->encoder_out.tensor, eout);
+             std::FILE * fh = std::fopen((std::string(dir) + "/encoder_out.f32").c_str(), "wb");
+             if (fh != nullptr) { std::fwrite(eout.data(), sizeof(float), eout.size(), fh); std::fclose(fh); }
+         }
+@@ -368,6 +369,26 @@ std::vector<float> Session::encode(
+             std::fprintf(stderr, "[diar-dump] isolated FULL encoder (%zu layers) written -> %s\n",
+                          weights_->layers.size(), enc_dir);
+         }
++        {
++            // The head's real output - the acceptance test for porting it (probabilities is the whole
++            // graph's terminal node, nothing computed after it, so - like encoder_out/layer0_out - it is
++            // sound by construction regardless of AUDIOCPP_LAYER0_ISOLATED/AUDIOCPP_ENCODER_ISOLATED).
++            std::vector<float> probs(ggml_nelements(encoder_graph_->probabilities.tensor));
++            core::read_tensor_f32_into(encoder_graph_->probabilities.tensor, probs);
++            std::FILE * fh = std::fopen((std::string(dir) + "/probabilities.f32").c_str(), "wb");
++            if (fh != nullptr) { std::fwrite(probs.data(), sizeof(float), probs.size(), fh); std::fclose(fh); }
++        }
++        // Same idea as AUDIOCPP_ENCODER_ISOLATED but for the head: takes the ENCODER's real output directly
++        // (tout, already dumped above) and rebuilds only final_norm..sigmoid in an isolated graph. No
++        // aliasing risk to guard against here (this graph has 12 ops total, one of everything), but the same
++        // opt-in pattern keeps it consistent with the other two and costs nothing when unused.
++        if (const char * head_dir = std::getenv("AUDIOCPP_HEAD_ISOLATED"); head_dir != nullptr) {
++            auto probs = run_head_isolated(
++                execution_context().backend(), *weights_, assets_->model_config, eout, frames);
++            std::FILE * fh = std::fopen((std::string(head_dir) + "/iso_probabilities.f32").c_str(), "wb");
++            if (fh != nullptr) { std::fwrite(probs.data(), sizeof(float), probs.size(), fh); std::fclose(fh); }
++            std::fprintf(stderr, "[diar-dump] isolated head written -> %s\n", head_dir);
++        }
+     }
+     if (prof) {
+         const double dt = std::chrono::duration<double>(
+-- 
+2.53.0
+

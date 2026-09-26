@@ -520,3 +520,38 @@ runs unmodified against CrispASR-sourced floats. It only needs wiring.
    this file, not a follow-on tweak - and the one this whole port existed to enable.
 4. **Remeasure the ~10% ceiling** (§8) on the real merged build; it hasn't been re-priced since §7's
    kernel-brief numbers and the prize was never going to grow while the port got more accurate.
+
+## 15. The head ports too - with one permanent, well-understood, non-bug precision gap
+
+Item 1 above, done. `run_head_isolated` (`ref/audiocpp`, deps.lock `audiocpp=a9c032a`) rebuilds
+`final_norm -> encoder_projection -> subpixel_upsample (conv1d) -> relu -> head_hidden -> relu ->
+speaker_head -> sigmoid` in isolation from the encoder's real output; verified **byte-identical (max abs
+diff 0.0)** to production's real `probabilities` output. `tools/head_port.cpp` rebuilds the same sequence in
+CrispASR's ggml from the GGUF's real head weights.
+
+**Result: not byte-identical, and it cannot be, without reverting a CrispASR patch made for unrelated
+reasons.** Every op up to the conv matches (weight-name-to-field mapping cross-checked against
+`assets.cpp` rather than guessed from naming similarity - `speaker_head` is `single_hidden_to_spks`, not the
+more obviously-named `hidden_to_spks`, which is a different, unused tensor). The conv1d step lands ~1e-3 off
+near unit scale (`ref[0]=0.99524492` vs `ported=0.99525237`, max delta 0.00174, ~98% of elements affected at
+that scale) - small, uniform, and traced to its exact source by reading both vendored `ggml.c`s:
+`ggml_conv_1d` in **CrispASR's** ggml carries a fork-local patch (`ggml.c` ~line 4626, comment: *"CrispASR
+fork (issue #38 companion): pick im2col output type based on whether either side is F32. Upstream hardcodes
+F16, which produces MUL_MAT(F16, F16) - unsupported by the CPU backend after our F16 vec_dot_type=F32
+change"*) that forces **F32** im2col whenever the input or kernel is F32/BF16. **audio.cpp's own (unpatched)
+ggml hardcodes F16 im2col unconditionally** - a real precision difference between the two runtimes for this
+one op, not a bug in either. Confirmed empirically, not just from the comment: calling `ggml_im2col(...,
+GGML_TYPE_F16)` directly in the port to force audio.cpp's exact path **crashes** -
+`GGML_ASSERT(src1->type == GGML_TYPE_F32)` in `ggml-cpu.c` - CrispASR's ggml is structurally incapable of the
+F16 MUL_MAT audio.cpp's path requires; the patch that changed `vec_dot_type` for F16 removed that capability
+project-wide, for reasons unrelated to this port. `tools/head_port.cpp` uses CrispASR's own (higher-precision,
+not lower) F32 path and documents the gap inline rather than pretending it's closable.
+
+**What this means for the merge, not just the port exercise:** the merged runtime will run the head at
+CrispASR's (better) precision, not audio.cpp's. That is a real output change, small and one-directional
+(more precision, not less), and must be measured the way every other non-bit-exact change in this project's
+`.auto/ideas.md` was - a DER/WER check on the gate clips, not assumed neutral. Given the deviation is ~1e-3 on
+a sigmoid pre-threshold value, three orders of magnitude below the `pred_score_threshold` (0.25) and
+`sil_threshold`/boost-rate knobs `AoscState` actually thresholds against (§ StreamingConfig, `streaming.cpp`),
+it is very unlikely to flip a speaker decision - but "unlikely" is a hypothesis, not the byte-identity gate
+this whole project holds everything else to, and it should be checked before the merged runtime is trusted.
