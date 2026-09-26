@@ -272,3 +272,35 @@ went **23.28% -> 30.44%**. Fixed, re-verified, and the hash is back.
 The lesson generalises past this session: **"env-gated diagnostic code" is not automatically
 behaviour-preserving.** The guard covered the dump; the edit that added the trace line also duplicated a line
 outside it. The four-clip gate answered in 70 seconds what the port harness never would have.
+
+## 10. Stage 2, continued: the port is localised, and the oracle turned out to be unsound
+
+The harness was rebuilt from scratch with the four axis fixes, and the shapes now match audio.cpp at **every**
+stage - the four porting bugs are closed. Two findings, one of them about the tooling rather than the port.
+
+**The port: stage 1 is byte-identical, and the next failure is localised to the attention.**
+`01_norm1` matches exactly, and the divergence begins at the attention, whose output is **entirely NaN**
+(196,096 of 196,096 elements). The shapes around it are all correct, so this is the flash-attention call or
+what feeds it - the Q/K/V layout is now provably right, so the next candidate is the mask orientation (a square
+391x391 F16 tensor is orientation-ambiguous and nothing asserts it) or the k/v view convention.
+
+**The oracle is unsound for intermediates, and that invalidates part of the evidence above.** Tracing a stage
+marks it a graph output, but audio.cpp's own `02_qkv` still contains values up to 2.6e8 in 3136 of 600,576
+elements - the allocator reused that buffer after the layer finished. A numpy cross-check
+(`qkv = norm1 @ w_qkv^T` with the Q8_0 blocks dequantised by hand) puts the distance to the **port** at 18.6 and
+to **audio.cpp's trace** at 2.6e8: the traced intermediate is the corrupted one, and the port is not.
+So the earlier "every stage differs by 100%" readings partly measured my own instrumentation, not the port.
+
+**The fix for the oracle is structural, and it is the right shape for the whole port.** Stop tracing
+intermediates out of the running encoder. Instead build the reference the same way the port is built - a small
+harness linked against **audiocpp's own vendored ggml** - and run the identical layer there. Then both sides are
+computed by their own runtime from the same weights and the same input, and only the **final** output is
+compared, which is a real graph output and cannot be recycled. That also makes the parity question moot: stages
+1/1b/1c already showed the two trees agree bit for bit on this op vocabulary and on this model's real weights,
+so a difference would then be attributable to the *sequence* alone, which is the thing under test.
+
+**Where this leaves the port.** Numerically de-risked (parity), specified (the full op sequence), and now
+half-built: the first stage of the layer reproduces byte-identically and the shapes are all correct. The
+remaining work is the attention call, then the 31-layer loop, then the AOS state machine. The prize is still
+the measured ~10% of wall clock from overlapping the two graphs in one scheduler - and it is worth remembering
+that the prize did not grow while the port got more accurate.
