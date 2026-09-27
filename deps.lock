@@ -56,6 +56,8 @@
 #   audiocpp   3906bd4  AUDIOCPP_DIAR_COMPARE: runs the external encoder AND audio.cpp's own on the same inputs,
 #                     logs max |delta| / flips@0.5, returns audio.cpp's. The acceptance test that found the
 #                     port's missing embed_norm and conv1d-precision bugs (docs/one-runtime-merge.md SS26).
+#   audiocpp   8344bbe  AUDIOCPP_NEMOTRON3_DIAR_EXTERNAL_ENCODER: skip uploading the encoder+head weights when
+#                     DiarCrispASR supplies encode() - native peak RSS now at or below the audio.cpp path.
 crispasr=86bf8fe
 crispasr_ggml=512a020
-audiocpp=3906bd4
+audiocpp=8344bbe

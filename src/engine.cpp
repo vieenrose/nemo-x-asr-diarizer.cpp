@@ -185,6 +185,10 @@ bool Engine::init(std::string& err) {
         // A/B that silently keeps the default when the flag says otherwise is worse than no flag at all.
         std::map<std::string, std::string> session_map;
         for (const auto& kv : cfg_.diar_session_opts) session_map[kv.first] = kv.second;
+        // Native encoder: audio.cpp never runs its own encoder+head, so don't let it upload their weights
+        // (~100 MB duplicate of what DiarCrispASR holds). Read once at session construction; always set it
+        // (to 0 included) so a previous run in the same process cannot leak it.
+        ::setenv("AUDIOCPP_NEMOTRON3_DIAR_EXTERNAL_ENCODER", cfg_.diar_native ? "1" : "0", 1);
         audiocpp_options* sopts = audiocpp_options_create();
         if (!sopts) { err = "audiocpp_options_create failed"; return false; }
         for (const auto& kv : session_map) {

@@ -1097,3 +1097,18 @@ Result, `--diar-native` on vs off:
 models' heavy compute, bit-exact with the two-runtime pipeline it replaces, and faster.
 
 Remaining: drop audio.cpp's now-unused copy of the encoder weights to recover the ~100 MB.
+
+## 27. The last cost: audio.cpp's unused copy of the encoder weights - dropped
+
+With `--diar-native` the diar session still uploaded all encoder+head weights it never ran (~100 MB, the
++100 MB RSS in SS26). `ref/audiocpp` now honours `AUDIOCPP_NEMOTRON3_DIAR_EXTERNAL_ENCODER=1` at session
+construction by uploading only `pre_encode` (env var, not a session option: options are validated against
+the spec JSON embedded in each GGUF). `src/engine.cpp` sets it whenever `diar_native` is on (0 otherwise).
+Gate hash unchanged; device outputs byte-identical to SS26's validation. Phone, `taskset C0`:
+
+| clip | `--no-diar-native` | native (default) |
+|---|---|---|
+| gate_ms_v2 | 18.83 s, 396 MB | 18.66 s, 393 MB |
+| holdout_en | 62.80 s, 425 MB | 62.01 s, 422 MB |
+
+The unified runtime is now bit-exact, faster, and no larger than the two-runtime pipeline it replaced.

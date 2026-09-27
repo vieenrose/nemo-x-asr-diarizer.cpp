@@ -1,0 +1,113 @@
+From 8344bbef131f5607967eed771dbfcc04751d073f Mon Sep 17 00:00:00 2001
+From: autoresearch <agent@localhost>
+Date: Sun, 27 Sep 2026 04:49:00 +0000
+Subject: [PATCH] nemotron_3_diar: AUDIOCPP_NEMOTRON3_DIAR_EXTERNAL_ENCODER
+ skips encoder+head weight upload
+
+When the caller supplies encode() via set_external_encoder, the session's own encoder/head weights are
+never used; with this env var set at session construction, load_weights uploads only pre_encode (~100 MB
+saved). encode() throws if no external encoder is set; AUDIOCPP_DIAR_COMPARE is disabled in this mode.
+An env var rather than a session option because options are validated against the spec JSON embedded in
+each converted GGUF.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/engine/models/nemotron_3_diar/assets.h  |  3 ++-
+ include/engine/models/nemotron_3_diar/session.h |  1 +
+ src/models/nemotron_3_diar/assets.cpp           |  9 ++++++++-
+ src/models/nemotron_3_diar/session.cpp          | 15 +++++++++++++--
+ 4 files changed, 24 insertions(+), 4 deletions(-)
+
+diff --git a/include/engine/models/nemotron_3_diar/assets.h b/include/engine/models/nemotron_3_diar/assets.h
+index b638a73..5ee2ac1 100644
+--- a/include/engine/models/nemotron_3_diar/assets.h
++++ b/include/engine/models/nemotron_3_diar/assets.h
+@@ -110,6 +110,7 @@ std::shared_ptr<ModelWeights> load_weights(
+     ggml_backend_t backend,
+     core::BackendType backend_type,
+     assets::TensorStorageType storage_type,
+-    size_t context_bytes);
++    size_t context_bytes,
++    bool pre_encode_only = false);
+ 
+ }  // namespace engine::models::nemotron_3_diar
+diff --git a/include/engine/models/nemotron_3_diar/session.h b/include/engine/models/nemotron_3_diar/session.h
+index fea9e13..c74721b 100644
+--- a/include/engine/models/nemotron_3_diar/session.h
++++ b/include/engine/models/nemotron_3_diar/session.h
+@@ -112,6 +112,7 @@ private:
+     size_t graph_arena_bytes_ = 1024ull * 1024ull * 1024ull;
+     size_t weight_context_bytes_ = 1024ull * 1024ull * 1024ull;
+     ExternalEncoder external_encoder_;
++    bool external_encoder_only_ = false;   // encoder+head weights were never loaded
+ };
+ 
+ }  // namespace engine::models::nemotron_3_diar
+diff --git a/src/models/nemotron_3_diar/assets.cpp b/src/models/nemotron_3_diar/assets.cpp
+index 5649608..3ab80a7 100644
+--- a/src/models/nemotron_3_diar/assets.cpp
++++ b/src/models/nemotron_3_diar/assets.cpp
+@@ -88,7 +88,8 @@ std::shared_ptr<ModelWeights> load_weights(
+     ggml_backend_t backend,
+     core::BackendType backend_type,
+     assets::TensorStorageType storage_type,
+-    size_t context_bytes) {
++    size_t context_bytes,
++    bool pre_encode_only) {
+     const auto & source = *assets.model_weights;
+     const auto & config = assets.model_config;
+     auto result = std::make_shared<ModelWeights>();
+@@ -100,6 +101,12 @@ std::shared_ptr<ModelWeights> load_weights(
+     const auto stacked = config.encoder.feature_size * config.encoder.subsampling_factor;
+     result->pre_encode = modules::binding::linear_from_source(
+         store, source, "encoder.pre_encode.proj", storage_type, hidden, stacked, false);
++    if (pre_encode_only) {
++        // external_encoder session option: encode() (embed_norm, every layer, the head) runs elsewhere, so
++        // only the pre-encode projection - which this session still runs itself - needs uploading.
++        store.upload();
++        return result;
++    }
+     result->embed_norm = modules::binding::norm_from_source(store, source, "encoder.embed_norm", hidden);
+     result->layers.reserve(static_cast<size_t>(config.encoder.layers));
+     for (int64_t index = 0; index < config.encoder.layers; ++index) {
+diff --git a/src/models/nemotron_3_diar/session.cpp b/src/models/nemotron_3_diar/session.cpp
+index 9ddd39f..40b4961 100644
+--- a/src/models/nemotron_3_diar/session.cpp
++++ b/src/models/nemotron_3_diar/session.cpp
+@@ -166,9 +166,16 @@ Session::Session(
+         {assets::TensorStorageType::Native, assets::TensorStorageType::F32,
+          assets::TensorStorageType::F16, assets::TensorStorageType::BF16,
+          assets::TensorStorageType::Q8_0});
++    // AUDIOCPP_NEMOTRON3_DIAR_EXTERNAL_ENCODER=1: the caller will supply encode() via
++    // set_external_encoder, so skip uploading the encoder+head weights (~100 MB it would never touch). An env
++    // var, not a session option: session options are validated against the spec JSON embedded in the GGUF,
++    // and adding one would mean rewriting every converted model file.
++    if (const char * v = std::getenv("AUDIOCPP_NEMOTRON3_DIAR_EXTERNAL_ENCODER")) {
++        external_encoder_only_ = runtime::parse_bool_option(v, "AUDIOCPP_NEMOTRON3_DIAR_EXTERNAL_ENCODER");
++    }
+     weights_ = load_weights(
+         *assets_, execution_context().backend(), execution_context().backend_type(),
+-        storage, weight_context_bytes_);
++        storage, weight_context_bytes_, external_encoder_only_);
+     assets_->model_weights->release_storage();
+     stream_scheduler_ = std::make_unique<StreamScheduler>(
+         assets_->feature_config, streaming_config_, assets_->model_config.encoder.subsampling_factor);
+@@ -228,10 +235,14 @@ std::vector<float> Session::encode(
+     const std::vector<int64_t> & valid_frames) {
+     // AUDIOCPP_DIAR_COMPARE (diagnostic only): run the external encoder AND this one on the same inputs, log
+     // the difference, return THIS one's result.
+-    const bool compare_ext = external_encoder_ && std::getenv("AUDIOCPP_DIAR_COMPARE") != nullptr;
++    const bool compare_ext = external_encoder_ && !external_encoder_only_ && std::getenv("AUDIOCPP_DIAR_COMPARE") != nullptr;
+     std::vector<float> ext_probs;
+     if (compare_ext) ext_probs = external_encoder_(embeddings, batch, frames, valid_frames);
+     else if (external_encoder_) return external_encoder_(embeddings, batch, frames, valid_frames);
++    if (external_encoder_only_) {
++        throw std::runtime_error(
++            "nemotron_3_diar: session created with external_encoder=true but no external encoder is set");
++    }
+     const bool prof = diar_prof::on();
+     const auto t0 = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+     ensure_encoder_graph(
+-- 
+2.53.0
+
