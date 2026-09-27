@@ -24,8 +24,10 @@ fetch() { # fetch <repo> <file> <expected_bytes>
 # cstr/x-asr-zh-en-GGUF, q8_0. A truncated copy of this file once failed at emb.out.weight with a
 # bounds error and a "falling back to legacy loader" message that looked like a warning.
 fetch "cstr/x-asr-zh-en-GGUF" "x-asr-zh-en-q8_0.gguf" 168189920
-# Nemotron-3 diarization, q8_0.
-fetch "0xShug0/nemotron-3-diarization-GGUF" "nemotron-3-diarization-q8_0.gguf" 106674240
+# Nemotron-3 diarization, q8_0, from audio.cpp's official repo. (The file every measurement here used came
+# from 0xShug0/nemotron-3-diarization-GGUF, no longer public. This one has byte-identical tensors - checked
+# all 362 - and only a newer embedded model_spec.json; composite output is byte-identical with it.)
+fetch "audio-cpp/Nemotron-3-Diarization-GGUF" "nemotron-3-diarization-q8_0.gguf" 106675136
 
 python3 - "$DIR" <<'PY'
 import struct, sys, os
@@ -43,7 +45,7 @@ TYPES = {0: ("B", 1), 1: ("b", 1), 2: ("H", 2), 3: ("h", 2), 4: ("I", 4), 5: ("i
          6: ("f", 4), 7: ("?", 1), 10: ("Q", 8), 11: ("q", 8), 12: ("d", 8)}
 
 def val(f, t):
-    if t == 8: return rstr(f)
+    if t == 8: return (rstr(f), 8)   # same (value, type) shape as scalars - [0] must not index into the string
     if t == 9:
         et = struct.unpack("<I", rd(f, 4))[0]
         n = struct.unpack("<Q", rd(f, 8))[0]
@@ -65,28 +67,26 @@ for name in ("x-asr-zh-en-q8_0.gguf", "nemotron-3-diarization-q8_0.gguf"):
             kv[k] = val(f, t)[0] if t != 9 else val(f, t)
         align = kv.get("general.alignment", (32,))[0] if isinstance(kv.get("general.alignment"), tuple) else 32
         # walk the tensor infos and check every tensor lies inside the file, aligned, and non-empty
-        infos, prev_end = [], None
+        # walk the tensor infos: every tensor must lie inside the file at its declared offset, be aligned,
+        # non-empty, and of a type whose byte size is known (ggml type ids and block sizes).
+        infos = []
         for _ in range(nt):
             n = rstr(f); n_dims = struct.unpack("<I", rd(f, 4))[0]
             dims = [struct.unpack("<Q", rd(f, 8))[0] for _ in range(n_dims)]
             dt = struct.unpack("<I", rd(f, 4))[0]
-            _off = struct.unpack("<Q", rd(f, 8))[0]
-            infos.append((n, dims, dt))
+            off = struct.unpack("<Q", rd(f, 8))[0]
+            infos.append((n, dims, dt, off))
         hdr_end = f.tell()
         data_start = (hdr_end + align - 1) // align * align
-        sizes = {1: 2, 2: 4, 3: 4, 7: 4, 8: 8}
-        block = {8: 32, 9: 32, 10: 32}          # q8_0/q4_0/f16-ish sanity; unknown types are skipped
-        cursor = data_start
-        bad = 0
-        for n, dims, dt in infos:
+        # type id -> (bytes per block, elements per block): F32, F16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, BF16
+        BLK = {0: (4, 1), 1: (2, 1), 2: (18, 32), 3: (20, 32), 6: (22, 32), 7: (24, 32), 8: (34, 32), 30: (2, 1)}
+        cursor, bad = data_start, 0
+        for n, dims, dt, off in infos:
             elems = 1
-            for d in dims: elems *= max(1, d)
-            if dt in sizes: nbytes = elems * sizes[dt]
-            elif dt in (6, 8): nbytes = elems * 1
-            else: continue
-            cursor = (cursor + align - 1) // align * align
-            cursor += nbytes
-            if elems == 0: bad += 1
+            for d in dims: elems *= d
+            if dt not in BLK or elems == 0 or off % align or elems % BLK[dt][1]:
+                bad += 1; continue
+            cursor = max(cursor, data_start + off + elems // BLK[dt][1] * BLK[dt][0])
         with open(p, "rb") as g:
             g.seek(0, 2)
             fsize = g.tell()

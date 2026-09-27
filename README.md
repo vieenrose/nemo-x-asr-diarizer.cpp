@@ -13,7 +13,7 @@ C++17 + ggml, CPU only, no Python at runtime. It replaces a 1.5B ASR+diarize LLM
 
 ```mermaid
 flowchart TB
-    IN["WAV, any rate<br/>(resampled to 16 kHz in-process, Lanczos3)"] --> LOOP["Streaming loop<br/>100 ms pieces (engine.cpp)"]
+    IN["PCM16 WAV<br/>native: 16 kHz mono<br/>(other rates/channels converted in-process)"] --> LOOP["Streaming loop<br/>100 ms pieces (engine.cpp)"]
 
     subgraph RT["One shared ggml runtime (CrispASR ggml, ARM dotprod)"]
         EXT["DiarCrispASR<br/>embed_norm, 31 transformer layers, head"]
@@ -46,6 +46,22 @@ audio.cpp into `src/diar_crispasr.cpp`. The port is bit-exact with audio.cpp's o
 ([docs/one-runtime-merge.md](docs/one-runtime-merge.md) §25-27). audio.cpp keeps the parts that are logic, not
 compute: mel, pre-encode (0.05% of time), windowing, speaker cache and turn decoding.
 
+## Models
+
+| role | GGUF used (q8_0) | original weights | license |
+|---|---|---|---|
+| ASR | [cstr/x-asr-zh-en-GGUF](https://huggingface.co/cstr/x-asr-zh-en-GGUF) `x-asr-zh-en-q8_0.gguf` (168 MB) | [GilgameshWind/X-ASR-zh-en](https://huggingface.co/GilgameshWind/X-ASR-zh-en) | Apache-2.0 |
+| diarization | [audio-cpp/Nemotron-3-Diarization-GGUF](https://huggingface.co/audio-cpp/Nemotron-3-Diarization-GGUF) `nemotron-3-diarization-q8_0.gguf` (107 MB) | [nvidia/Nemotron-3-Diarization](https://huggingface.co/nvidia/Nemotron-3-Diarization) | see model card |
+
+`scripts/fetch_models.sh` downloads both and verifies them at value level.
+
+## Input
+
+Both models consume **16 kHz mono**, so that is the pipeline's native input: a 16 kHz mono 16-bit PCM WAV
+goes straight in with no conversion. Other rates and channel counts are also accepted and converted
+in-process (channel mixdown, then Lanczos3 resampling to 16 kHz). Unlike the VibeASR baseline, which runs at
+24 kHz, nothing needs converting ahead of time. The only supported encoding is PCM16 WAV.
+
 ## Output
 
 Matches the sibling ASR archive's streaming convention, so its WER and speaker-attribution scorers run on it
@@ -61,7 +77,7 @@ directly:
 ## Results
 
 Phone: Oppo CPH2371 (Dimensity 1300), `taskset C0` (the two A78 prime cores), `--threads 2`.
-Models: `x-asr-zh-en-q8_0.gguf` (168 MB) + `nemotron-3-diarization-q8_0.gguf` (107 MB).
+Models: see [Models](#models).
 
 | | RTF | peak RSS | first text |
 |---|---|---|---|
