@@ -133,6 +133,20 @@ std::vector<float> rope_table(int64_t heads, int64_t frames, int64_t head_dim, f
     return out;
 }
 
+long minflt_now() {
+    FILE * f = fopen("/proc/self/stat", "r");
+    if (!f) return -1;
+    char b[1024];
+    const bool ok = fgets(b, sizeof b, f) != nullptr;
+    fclose(f);
+    if (!ok) return -1;
+    char * p = strrchr(b, ')');
+    if (!p) return -1;
+    int field = 2;
+    for (char * t = strtok(p + 1, " "); t; t = strtok(nullptr, " ")) if (++field == 10) return atol(t);
+    return -1;
+}
+
 }  // namespace
 
 struct DiarCrispASR::Impl {
@@ -164,6 +178,7 @@ struct DiarCrispASR::Impl {
     // any weight, so it is cheap regardless of how often it happens.
     struct Graph {
         ggml_context * ctx = nullptr;
+        ggml_context * leaf_ctx = nullptr;   // in/mask/cos/sin only - own buffer, never touched by gallocr
         ggml_gallocr_t alloc = nullptr;
         ggml_backend_buffer_t buf = nullptr;
         int64_t frames = -1;
@@ -175,6 +190,7 @@ struct DiarCrispASR::Impl {
             if (alloc != nullptr) ggml_gallocr_free(alloc);
             if (buf != nullptr) ggml_backend_buffer_free(buf);
             if (ctx != nullptr) ggml_free(ctx);
+            if (leaf_ctx != nullptr) ggml_free(leaf_ctx);
         }
     };
     std::unique_ptr<Graph> graph;
@@ -348,6 +364,7 @@ std::vector<float> DiarCrispASR::encode(
     // docs/one-runtime-merge.md SS19.
     const bool prof = getenv("DIARCRISPASR_PROF") != nullptr;
     const auto t_call0 = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const long pf0 = prof ? minflt_now() : 0;
     double ms_rebuild = 0.0;
     if (!m.graph || m.graph->frames != T) {
         // (Re)build the ACTIVATION graph for this frame count. Cheap regardless of how often it happens -
@@ -370,10 +387,18 @@ std::vector<float> DiarCrispASR::encode(
         if (g->ctx == nullptr) throw std::runtime_error("DiarCrispASR::encode: ggml_init failed");
         ggml_context * ctx = g->ctx;
 
-        ggml_tensor * in   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, T);
-        ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, T, T, 1, 1);
-        ggml_tensor * cos  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, HALF, T, HEADS, 1);
-        ggml_tensor * sin  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, HALF, T, HEADS, 1);
+        // Inputs live in their OWN context with their own buffer. They used to share `ctx` with every compute
+        // node, and ggml_backend_alloc_ctx_tensors(ctx) then allocated ALL of those nodes (not just these four,
+        // as the old comment claimed) in one flat buffer with zero reuse - ~1.7 GB at T=548, first-touched on
+        // the first compute after every rebuild: the 8x page-fault gap and the 1.5-2 GB peak RSS of
+        // docs/one-runtime-merge.md SS23-25. gallocr now places the intermediates with lifetime-based reuse,
+        // and skips these four because they already have data, so it can never overwrite cos/sin.
+        g->leaf_ctx = ggml_init({ggml_tensor_overhead() * 8, nullptr, true});
+        if (g->leaf_ctx == nullptr) throw std::runtime_error("DiarCrispASR::encode: ggml_init (leaf) failed");
+        ggml_tensor * in   = ggml_new_tensor_2d(g->leaf_ctx, GGML_TYPE_F32, H, T);
+        ggml_tensor * mask = ggml_new_tensor_4d(g->leaf_ctx, GGML_TYPE_F16, T, T, 1, 1);
+        ggml_tensor * cos  = ggml_new_tensor_4d(g->leaf_ctx, GGML_TYPE_F32, HALF, T, HEADS, 1);
+        ggml_tensor * sin  = ggml_new_tensor_4d(g->leaf_ctx, GGML_TYPE_F32, HALF, T, HEADS, 1);
 
         // --- encoder layer, tools/encoder_port.cpp's proven op sequence, unchanged -------------------------
         const auto build_layer = [&](ggml_tensor * x, int i) {
@@ -439,9 +464,8 @@ std::vector<float> DiarCrispASR::encode(
 
         g->gf = ggml_new_graph_custom(ctx, (size_t) (96 * n_layers + 128), false);
         ggml_build_forward_expand(g->gf, out);
-        // Only in_/mask/cos/sin are real ctx-owned leaves here; every weight is already allocated in
-        // weights_ctx and already has data, so alloc_ctx_tensors below only materialises these four.
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        ggml_set_output(out);
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(g->leaf_ctx, backend);
         if (buf == nullptr) throw std::runtime_error("DiarCrispASR::encode: alloc failed");
         g->buf = buf;
         g->alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
@@ -469,11 +493,13 @@ std::vector<float> DiarCrispASR::encode(
         ggml_backend_tensor_set(g.mask, mf16.data(), 0, mf16.size() * sizeof(ggml_fp16_t));
     }
     const auto t_compute0 = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const long pf1 = prof ? minflt_now() : 0;
 
     if (ggml_backend_graph_compute(backend, g.gf) != GGML_STATUS_SUCCESS) {
         throw std::runtime_error("DiarCrispASR::encode: graph compute failed");
     }
     const auto t_readback0 = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const long pf2 = prof ? minflt_now() : 0;
 
     std::vector<float> result((size_t) ggml_nelements(g.out));
     ggml_backend_tensor_get(g.out, result.data(), 0, result.size() * sizeof(float));
@@ -485,6 +511,7 @@ std::vector<float> DiarCrispASR::encode(
                 std::chrono::duration<double, std::milli>(t_readback0 - t_compute0).count(),
                 std::chrono::duration<double, std::milli>(t_end - t_readback0).count(),
                 std::chrono::duration<double, std::milli>(t_end - t_call0).count());
+        fprintf(stderr, "DIARCRISPASR_PF T=%lld pre_compute=%ld compute=%ld\n", (long long) T, pf1 - pf0, pf2 - pf1);
     }
     return result;
 }

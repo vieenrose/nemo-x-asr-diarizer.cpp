@@ -1034,3 +1034,34 @@ slower, default-off - now with three concrete, well-evidenced non-fixes on recor
 persistent thread pool, fixed-capacity graph) so a future session does not re-derive any of them from
 scratch. The mechanism (page faults) is proven; no fix for it that keeps this port's per-call frame-length
 variance has been found.
+
+## 25. The actual bug: every intermediate tensor was allocated flat, with zero reuse - fixed, native now FASTER
+
+SS23 proved the gap was page faults; SS24's fixed-capacity graph attacked their *frequency*. Per-phase
+instrumentation inside `encode()` (`DIARCRISPASR_PROF`, now also printing `/proc/self/stat` minflt per phase)
+showed where they actually land: 295k-423k faults on the first compute after each rebuild (~1.2-1.7 GB
+first-touched), and 3 faults when the graph is reused. So the activation buffer itself was ~1.7 GB at T=548.
+
+Cause: `in/mask/cos/sin` shared `ctx` with every compute node, and `ggml_backend_alloc_ctx_tensors(ctx)`
+allocates *every* tensor in the context without data - all ~2000 intermediates, one flat buffer, no reuse -
+not "only these four" as the old comment claimed. `ggml_gallocr_alloc_graph` then saw them already placed and
+had nothing to optimise. (An exact-T LRU graph cache was tried first and did nothing - rebuilds were never
+the issue, the size of what each rebuild allocates was. Removed.)
+
+Fix: the four inputs get their own `leaf_ctx` + buffer; compute nodes are placed by `gallocr` with lifetime
+reuse (it skips the inputs since they already have data, so cos/sin can never be overwritten). Byte-identical
+on host (gate_ms_v2, holdout_en, control_ls) and on-device; host gate hash unchanged.
+
+Device, `taskset C0`, interleaved, two runs each:
+
+| clip | default | native before | native after |
+|---|---|---|---|
+| gate_ms_v2 wall | 18.84 / 18.88 s | ~19.8 s | **18.65 / 18.72 s** |
+| holdout_en wall | 62.82 / 62.94 s | ~64.3 s | **61.83 / 61.89 s** |
+| peak RSS | 392 / 421 MB | 1.5-2.0 GB | 491 / 519 MB |
+| minor faults | 91k / 141k | 735k / 1.07M | 143k / 194k |
+
+`--diar-native` - the single-scheduler unified runtime - is now 1-1.6% faster than the two-runtime default,
+with output byte-identical to the path already validated WER-neutral on all 11 clips (SS17). Still default-off
+pending a decision: flipping it changes shipped output (speaker-label churn vs the audio.cpp path, SS17), so it
+needs a deliberate re-bless, not a silent swap. SS20-24's non-fixes all stand; none of them was this.
