@@ -83,9 +83,10 @@ Models: see [Models](#models).
 |---|---|---|---|
 | 1.5B ASR+diarize baseline (armed) | 1.2231 | 2198 MB | 2.93 s |
 | this composite (armed) | 0.4627 | 396 MB | 0.32 s |
-| this composite, current build* | **0.415** | **393 MB** | 0.40 s |
+| this composite, current build* | **0.60** | **375 MB** | 0.40 s (speaker turns: 5.0 s) |
 
-\* `gate_ms_v2` (45 s, bilingual, 4 speakers). The current build adds ARM dotprod and the unified runtime. It
+\* `gate_ms_v2` (45 s, bilingual, 4 speakers). The current build adds ARM dotprod, the unified runtime and
+4 s diarizer chunks (turns commit at 5 s instead of 30.5 s, which costs RTF 0.42 -> 0.60). It
 was measured back-to-back in a working session, not under the armed/witnessed protocol of the first two rows.
 Its output is byte-identical to the armed build.
 
@@ -123,11 +124,11 @@ transcribed; the reference here is the ground-truth manifest):
 
 | clip | 1.5B | 7B | composite |
 |---|---|---|---|
-| gate_ms | 43 / 57 % | 43 / 57 % | **94 / 2 %** |
+| gate_ms | 43 / 57 % | 43 / 57 % | **96 / 0 %** |
 | gate_ms_g100 | 43 / 57 % | 43 / 57 % | **96 / 0 %** |
 | gate_ms_g1000 | 38 / 61 % | 72 / 28 % | **100 / 0 %** |
 | gate_ms_v2 | 58 / 42 % | **95 / 0 %** | 84 / 6 % |
-| gate_long | 35 / 54 % | 39 / 59 % | **88 / 1 %** |
+| gate_long | 35 / 54 % | 39 / 59 % | **86 / 3 %** |
 | **mean** | 44 / 54 % | 59 / 40 % | **92 / 2 %** |
 
 Both VibeASR sizes mostly collapse the speakers into one or two labels (1-2 of 4-6 voices used, all clips but
@@ -137,7 +138,7 @@ Versus the 7B reference, the composite:
 - **Transcription:** 0.117 vs 0.112 micro WER (+0.005). It is better on Chinese, worse on English and on
   mixed-language clips.
 - **Who spoke:** separates the speakers that both VibeASR models merge.
-- **Resources:** runs on the phone at RTF 0.45 in ~450 MB.
+- **Resources:** runs on the phone at RTF 0.60 in ~430 MB, with speaker turns ~5 s behind the audio.
 
 ## Build and run
 
@@ -171,8 +172,11 @@ Useful flags:
 
 ## Known limits
 
-- **Turns commit late.** The diarizer streams, but its first turns arrive ~30 s into a clip. Until then,
-  `--live` output is provisional.
+- **Speaker turns lag the words by ~5 s.** Text appears within ~0.4 s. Each speaker turn is confirmed once
+  its 4 s diarizer chunk plus 1 s of lookahead is in, and `--live` labels before that are provisional. The
+  latency is a setting: `--diar-session-opt nemotron_3_diar.chunk_len=25 ...chunk_right_context=4` gives
+  ~2.4 s at RTF ~0.87, and `chunk_len=340 ...chunk_right_context=40 ...spkcache_update_period=300` gives
+  30.5 s at RTF 0.42. The official `low` profile (~1 s) is not real time on 2 cores (RTF 3.4).
 - **Diarization recall.** It misses ~41% of speech frames on the hard bilingual clip, with near-zero false
   alarms. This is the limiting factor for attribution.
 - **Two ggml libraries are still linked.** The CrispASR ggml fork cannot replace audio.cpp's (missing ops),

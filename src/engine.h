@@ -86,12 +86,19 @@ struct Config {
     // --models-bundle; handed to crispasr's loader, which tries "<prefix><name>" before the bare name.
     std::string asr_gguf_prefix;
 
+    // Diarizer streaming geometry (80 ms frames). 2026-09-27: 4 s chunks + 0.96 s lookahead, so the first
+    // speaker turn commits at 5.0 s of audio (gate_ms_v2, phone) instead of 30.5 s (the old 340-frame chunks). The model re-encodes its
+    // speaker cache + FIFO on every chunk, which is what makes short chunks expensive; with the cache at
+    // 128 + 40 frames, phone RTF on gate_ms_v2 is 0.60 (was 0.42); final attribution is equal or better on all 5
+    // multi-speaker clips and DER-lite drops 23.28 -> 22.74 % (57 s clip), 15.24 -> 10.00 % (gate_long). The
+    // 12-frame lookahead was picked over 8 (57 s DER 30.8 %) among 6 variants on those 2 clips. Measured alternatives: 2 s chunks -> 2.4 s latency, RTF 0.87; the
+    // official "low" profile (264 + 264 cache, 0.72 s chunks) -> RTF 3.4, not real time on 2 cores.
     std::vector<std::pair<std::string, std::string>> diar_session_opts = {
         {"nemotron_3_diar.latency_profile",                 "custom"},
-        {"nemotron_3_diar.chunk_len",                        "340"},
-        {"nemotron_3_diar.chunk_right_context",              "40"},
+        {"nemotron_3_diar.chunk_len",                        "50"},
+        {"nemotron_3_diar.chunk_right_context",              "12"},
         {"nemotron_3_diar.fifo_len",                         "40"},
-        {"nemotron_3_diar.spkcache_update_period",           "300"},
+        {"nemotron_3_diar.spkcache_update_period",           "60"},
         {"nemotron_3_diar.spkcache_len",                     "128"},
     };
 

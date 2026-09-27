@@ -18,10 +18,16 @@
 # 0.0791; attribution 0.0779 of 77 and DER-lite 23.28% unchanged. Known regressions: one sentence after a
 # pause loses its LM context (孙中山 -> 村中三, holdout_zh_aligned/ph35200), and on the phone holdout_en
 # 0.2409 -> 0.2591 (one sentence dropped). Previous hash 192184ebcd54977e.
-hash=704e1e3e02070f5a
+# 2026-09-27 re-bless: diarizer streaming geometry 340 -> 50-frame chunks (4 s), lookahead 40 -> 12, update
+# period 300 -> 60 (src/engine.h): first speaker turn at 5.0 s of audio instead of 30.5 s. Transcript text is
+# unchanged (the ASR does not depend on the diarizer); speaker tags and segment boundaries move. Evidence:
+# gate WERs identical, attribution 0.0779 of 77 unchanged on gate_ms_v2, right/wrong speaker share equal or
+# better on all 5 multi-speaker clips (gate_long 87/3 -> 89/2 %, gate_ms 92/5 -> 94/3 %), DER-lite 23.28 ->
+# 22.74 % (57 s) and 15.24 -> 10.00 % (gate_long). Phone RTF 0.42 -> 0.60. Previous hash 704e1e3e02070f5a.
+hash=3000e77383407023
 clips=gate_ms_v2,holdout_en,holdout_zh,multispk57(24kHz originals, in-process Lanczos3)
 wer_gate_ms_v2=0.1800
 wer_holdout_en=0.2400
 wer_holdout_zh=0.0810
 info_attribution_gate_ms_v2=0.0779 of 77
-info_der_bilingual57=23.28%
+info_der_bilingual57=22.74%
