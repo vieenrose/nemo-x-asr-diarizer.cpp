@@ -1,0 +1,213 @@
+# Findings
+
+Detailed measurements and design notes moved out of the README. Numbers were taken on the build current at
+the time of each section; transcripts have stayed byte-identical since (gate hash `192184ebcd54977e`).
+
+## How attribution works (and why it is not a timestamp lookup)
+
+`src/fusion.h` is the whole idea. A text delta is not *at* a moment; it is a claim about an interval of
+audio, delayed by the encoder's own window. So:
+
+1. each delta is pinned to the audio span it decodes (`charged_upto -> fed - asr_latency`);
+2. its **codepoints** (not bytes - half the output is Chinese) are placed inside that span, right-aligned,
+   at `--char-dur-ms` each, because a delta arrives when words *came out*, not when the silence before them
+   started;
+3. each character is attributed to the turn overlapping it; text inside a between-turns pause goes to the
+   nearer turn and is marked `snapped`, because the diarizer misses ~41 % of speech frames on this material
+   and untaged text is a worse report than proximity-attributed text;
+4. attribution runs over the buffered deltas **against the turn timeline as it stands**, which is the only
+   way it can work at all - see the next section.
+
+Tunables: `--asr-latency-ms` (default = `--chunk-ms`), `--char-dur-ms` (90), `--gap-snap-ms` (400; 0 =
+always nearest-speaker).
+
+## The window format has to be scored, not eyeballed
+
+Two bugs of the same shape showed up while building `--windows`, and both were invisible to the obvious
+check ("is the text the same?"):
+
+1. Cutting text at window boundaries split English words (`"that end"` | `"s well"`, 27 of 55 lines on the
+   English holdout). Concatenated text was identical to segment output; scored, WER went 0.2455 -> 0.3136,
+   because the scorer tokenises per line, so one reference word became a substitution plus an insertion.
+2. "Fixing" the grouping by flushing on spaces dropped the separators. Words merged (`the cat` -> `thecat`),
+   WER 0.9455. Still identical when concatenated.
+
+Now text is grouped into words first - a word goes whole into the window its first character falls in, CJK
+stays character-granular, punctuation and spaces attach to the word they follow - and the two output shapes
+are equivalent where it counts: on host and on the phone, gate_ms_v2 scores WER 0.1765 / attribution 0.0658
+of 76 either way, and holdout_en scores 0.2455 / 0.6124 of 209 either way. Consistency differs slightly
+(0.963 vs 0.957) only because boundaries split speaker runs differently.
+
+The transferable rule: **a formatter is verified by scoring its output, never by comparing its characters.**
+Character equality was true in both broken cases.
+
+## Token timestamps (added, and what they turned out to be worth)
+
+x-asr never returned times, so the engine used to *infer* where each character was spoken. It can now use
+the model's own timeline: `patches/crispasr-token-times.patch` adds a frame counter to the greedy loop
+(CrispASR consumes one encoder frame per greedy step and emits at most one symbol, so a token's timestamp
+is a loop counter - 40 ms grid, no alignment model, no extra compute). Verify the claim yourself with
+`tools/validate_timestamps.py`, which checks timestamps against reference **silence** - a score can be
+moved by the attributor or by luck, silence cannot.
+
+Three measurements, in order of how much they surprised me:
+
+1. **A transducer's frame index is a decision time, not a sound time.** Raw frame timestamps run ~0.3 s late:
+   measured against an independent timeline they are +0.295 s median (p10 +0.08, p90 +0.48), and against
+   ground-truth silence the shift that puts **0 of 119** tokens in silence is +300 ms (3 at 0 ms, 2 at
+   450 ms). So `--token-offset-ms 300` is the default, derived from the audio and never from a score. This
+   one generalises: anyone wiring up transducer timestamps will hit it.
+2. **The timestamps are real.** 114 tokens over 44.98 s, monotonic, last one at 44.92 s - which also proves
+   the 40 ms mapping rather than a fitted 39.0 ms (a 2.5 % scale error would have put the tail at 46.2 s).
+   The exact path is used only if it reproduces the streamed transcript byte for byte; otherwise the engine
+   falls back and says so (`[timing] inferred-placement`).
+3. **Attribution did not get better, and the honest reading is that it could not have.** Attribution error
+   moved between 0.0132 and 0.0658 across timing/offset/gap-fill combinations - that is **1 to 5 wrong tokens
+   out of 76**, i.e. noise on a single clip. Meanwhile the 10x placement sweep above showed a flat 0.0132.
+   Both point the same way: with a diarizer that misses 41 % of speech frames, *recall* is the binding
+   constraint on speaker attribution, not clocks. Timestamps bought exact word alignment (subtitles, forced
+   alignment, A/V sync, boundary reporting), not a better who.
+
+So `--timing auto` prefers model timestamps, `inferred` reproduces the previous behaviour, and neither is
+allowed to claim an accuracy win on this evidence. What is solid: a 40 ms token timeline that verifies
+against silence, and a documented 300 ms decision lag.
+
+## Drop-in output contract
+
+`--windows` re-emits the same attribution in the shape the VibeASR autoresearch harness consumes: one
+`[k/N]` block per `HOP_S = 70400/24000 = 2.933 s` of audio, text inside tagged with the speaker(s) that
+spoke it, silent windows emitting nothing. Window cuts use the model's token times when available, and
+otherwise spread each segment's text uniformly over its span (coarse, and the window-onset diagnostic says
+so rather than pretending). Both shapes score identically through the archive's `score_stream.py` - WER
+0.1765 and attribution 0.0658 either way on the bilingual gate - which is the point: "drop-in" is checkable
+by running the archive's own tools against this binary.
+
+## Diarization detection knobs
+
+The diarizer's decode config is read from the REQUEST (`nemotron_3_diar/session.cpp` reads
+`stream_request_.options`), so session options do nothing and a NULL request silently means
+`threshold=0.5, min_frames=0, pad_frames=0`. Measured DER-lite (12-14 ground-truth turns per clip):
+
+| speaker_pad_frames | 57 s clip (tuned on) | 45 s v2 clip (never tuned on) |
+|---|---|---|
+| 0 (upstream) | 37.8 | 45.8 |
+| 20 | 30.3 | 37.5 |
+| 45 (**default**) | 30.3 -> 27.6 miss | 29.3 (FA 1.1, spk 1.9) |
+| 90 | ~20 | 22.3 (FA 3.7) |
+
+`speaker_threshold` barely matters between 0.25-0.35; **pad_frames dominates**, because most of the miss
+was the diarizer dropping below threshold in the middle of a turn rather than never detecting it. Defaults
+are `threshold=0.3, pad_frames=45`, chosen in the middle of the curve rather than at its best point on the
+eval clips: past that, `pad` starts merging genuine turn-taking, and both clips here are presentation-style
+audio with few rapid exchanges. At these settings silence, pink-ish noise and a 440 Hz tone all produce
+**zero** turns and zero text, which is the contract that matters for a streaming product.
+
+Attribution on the 85-token gate moved between 0.0263 and 0.0658 across these settings - 2 to 5 wrong tokens
+out of 76 - so no attribution claim is made from it; DER-lite above, on ~50 s of ground-truth turns per clip,
+is the metric that actually resolves this change.
+
+## Does the missing timestamp data actually hurt? (measured, `scripts/attribution_sensitivity.sh`)
+
+x-asr returns text, not tokens with times, so `Fusion` places each delta's characters inside the audio it
+decodes. Two knobs control that placement (`--char-dur-ms`, `--asr-latency-ms`) and one controls what happens
+in gaps (`--gap-snap-ms`). The transcript is byte-identical across every cell below - same model, same audio,
+greedy decode - so whatever moves is the placement doing its work. Bilingual gate clip, 18 runs:
+
+| placement sweep | attribution error | coverage | consistency | WER |
+|---|---|---|---|---|
+| per-char duration 30 / 90 / 300 ms (10x range) | 0.0132 | 0.894 | 0.993 | 0.1765 |
+| lag correct (480 ms = `--chunk-ms`) | 0.0132 | 0.894 | 0.994→0.993 | 0.1765 |
+| lag wrong by 3x low (160 ms) | 0.0526 | 0.894 | 0.958 | 0.1765 |
+| lag wrong by 2x high (960 ms) | 0.0526-0.0658 | 0.894 | 0.950-0.971 | 0.1765 |
+
+So:
+
+1. **Per-character precision is nearly free.** A 10x change in the character-time model moves attribution
+   by 0.0000. Real token timestamps would not make "who said this word" meaningfully better on this material.
+2. **The aggregate lag is not free.** Getting it wrong by 3x costs 4-5x the attribution error - and that lag
+   is *known analytically* (the encoder's chunk length), no timestamps needed.
+3. **The damage timestamps did cause was indirect, and it was in the cut, not the choice.** With
+   character-granular cuts, a boundary landing inside a word printed `...subsequently dro` / `f`. The scorer
+   then reads two tokens where the reference has one: the same transcript scored **WER 0.1765 with clean cuts
+   and 0.3176 with cuts through words**, while attribution barely noticed. Attribution is now word-granular
+   where words exist (CJK stays per-character), and WER is invariant across all 18 cells.
+
+Two honest caveats about timing measurement:
+
+* Boundary *time* is still inferred at word granularity, and the diarizer's own turn onsets are median 0.80 s
+  off the reference (p90 1.30 s) on this clip. That is the floor under any boundary claim here.
+* The archive scorer's `turn-onset` diagnostic reports 7.78 s for this output format. Ignore it: it multiplies
+  the segment counter by its 2.93 s window hop, which is only meaningful for a windowed streaming transcript.
+  It is a diagnostic in that tool and is not gated - do not gate it against this format.
+
+## Input format: 24 kHz goes in, nothing needs converting
+
+The streaming baseline is fed 24 kHz files (its VAE runs at 24 kHz natively). Refusing anything but 16 kHz
+made this a non-drop-in on the baseline's OWN protocol clip, and every measurement here had to be taken on a
+pre-converted copy. `Wav::to_16k()` now resamples in-process (Lanczos3, lowpass before decimate, original
+rate kept and reported as `[input] resampled 24000 Hz -> 16000 Hz`).
+
+Verified by round-tripping clips that already have a native 16 kHz reference, so the comparison is "my
+resampler vs the file's real rate", not "resampling vs nothing":
+
+| clip | fed as 24 kHz | native 16 kHz |
+|---|---|---|
+| bilingual gate (host) | WER 0.1647, attrib 0.0779/77 | 0.1765, 0.0658/76 |
+| holdout_en (host) | WER 0.2455 | 0.2455 |
+| bilingual gate (**on the phone**) | WER 0.1765, attrib 0.0658/76 | 0.1765, 0.0658/76 |
+
+No WER cost. The resampling also costs nothing measurable in time (~40 lines, one pass per file).
+
+## On the phone (Oppo CPH2371, Dimensity 1300, Android 13)
+
+The arm64 build in `scripts/build_android.sh` is the one that ran on the device, armed and witness-checked
+through the same protocol as the VibeASR streaming-1.5B baseline (`taskset`, `--threads 2`, wake-stream
+arming, `time_in_state` witness, repeats inside one armed window). Mask `f0`, 2 threads:
+
+| clip | RTF | first partial | p95 piece | peak RSS | witness mean |
+|---|---|---|---|---|---|
+Measured on `taskset C0` - the baseline's OWN mask (cpu6-7, the two primes), armed, witness 2316-2378 MHz:
+
+| clip | RTF | first partial | p95 piece | peak RSS |
+|---|---|---|---|---|
+| gate_ms_v2 (hard, 4 speakers) | **0.4627** | 0.319 s | 95 ms | 396 MB |
+| bilingual_multispk_57s | 0.4982 | 0.324 s | 95 ms | 409 MB |
+
+Current build (2026-09-27: ARM dotprod compiled in, unified diar runtime on by default), same mask, two runs
+each - taken back-to-back in a working session, NOT through the arming/witness protocol above, so compare
+them to each other rather than to the armed rows:
+
+| clip | RTF | peak RSS |
+|---|---|---|
+| gate_ms_v2 | **0.4144 / 0.4160** | 393 MB |
+| bilingual_multispk_57s | **0.4410 / 0.4412** | 406 MB |
+
+Transcript and speaker output are byte-identical to the armed rows' build (gate hash unchanged); what moved
+is speed - see docs/pipeline-design.md §15 and docs/one-runtime-merge.md §25-27.
+
+(Earlier rows in the table below were taken before the `use_gpu` fix, on 4 cpus, and are 1.6x too slow.)
+
+Against the baseline's own anchor on the same device (RTF 1.2231, peak RSS 2198 MB, first text at one 2.93 s
+window): **1.6x lower RTF, 5.5x less memory, ~4x lower first-output latency**, and it also emits speaker
+turns, which the baseline does not. Token timestamps work on arm64 too (388 tokens on chat69, 40 ms grid).
+
+Two findings that only showed up on the device:
+
+1. **`use_gpu` was the whole story, and it was mine.** `xasr_context_default_params()` sets
+   `use_gpu = true`, and `xasr_init` then calls `crispasr_init_gpu_backend()` whenever it is set. On a
+   GPU-less phone that is not a clean cpu fallback: it cost ~2x on the ASR leg (16.3 s vs 33.7 s per 45 s of
+   audio) and made the 2-cpu mask look pathologically stalled (45 s of audio had not finished in 400 s, on
+   `c0`, `f0`, and `3`, with the standalone probe too). After `p.use_gpu = false`: same binary, same clip,
+   `c0` completes in 35.3 s and `c0` ≈ `f0` (0.784 vs 0.790). There was never a core-count cliff.
+   The host never showed it (rtf 0.142 before and after), which is why it survived so long.
+   What I published before this - "two ggml spin pools livelock on 2 cpus", then "the composite needs four
+   cpus" - was wrong twice, and both times the wrong mechanism was believed because the numbers were stable.
+   They were stable because of a wrong init flag.
+
+Invariant worth having: with and without `--no-diar` the ASR text is byte-identical (1185 chars on chat69),
+so attribution is a layer over the transcript, never a rewrite of it.
+
+## Build note
+
+`scripts/build_host.sh` deletes objects before compiling. A stale object linked against a changed struct
+layout does not fail to link - it corrupts memory at run time and segfaults somewhere unhelpful.
