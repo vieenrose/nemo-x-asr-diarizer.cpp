@@ -89,17 +89,30 @@ Models: see [Models](#models).
 was measured back-to-back in a working session, not under the armed/witnessed protocol of the first two rows.
 Its output is byte-identical to the armed build.
 
-Accuracy:
+### Accuracy vs VibeASR streaming 1.5B
 
-| set | metric | baseline | composite |
+**Transcription** (WER, lower is better). The diarizer never changes the text: the transcript is
+byte-identical with or without it.
+
+| test set | VibeASR 1.5B | this composite | reading |
 |---|---|---|---|
-| LibriSpeech gate (40 utt.) | WER | 4.51 % | 4.27 % (McNemar p = 1.0, indistinguishable) |
-| `gate_ms_v2` | WER | 0.1765 | 0.1765 |
-| `gate_ms_v2` | speaker attribution error | 0.4235 | **0.0132** |
-| `holdout_en` / `holdout_zh` | WER | 0.2636 / 0.1538 | 0.2455 / 0.0791 |
+| LibriSpeech, 40 utterances (clean English) | 4.51 % | 4.27 % | tie (paired McNemar p = 1.0) |
+| `gate_ms_v2` (bilingual, 4 speakers) | 17.65 % | 17.65 % | same |
+| `holdout_en` (hard English) | 26.36 % | 24.55 % | composite slightly better |
+| `holdout_zh` (hard Chinese) | 15.38 % | 7.91 % | composite ~2x fewer errors |
 
-Attribution error is measured over tagged tokens. The composite tags 89% of tokens, the baseline 100%. See
-[docs/findings.md](docs/findings.md).
+The last three are single clips: observations, not statistical proof.
+
+**Who spoke** (`gate_ms_v2`, share of all words):
+
+| | VibeASR 1.5B | this composite |
+|---|---|---|
+| words given the right speaker | ~58 % | ~84 % |
+| words given the wrong speaker | ~42 % | ~7 % |
+| words left untagged | 0 % | ~9 % |
+
+VibeASR tags every word but gets 42% of them wrong. The composite leaves ~9% untagged (mostly speech the
+diarizer missed) and gets few of the rest wrong. Details in [docs/findings.md](docs/findings.md).
 
 ## Build and run
 
