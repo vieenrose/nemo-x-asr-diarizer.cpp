@@ -239,3 +239,11 @@ cannot transcribe two voices at once) and en->zh onsets with pauses under 1 s.
 `gate_long` (`tools/build_gate_long.py`): 5.6 min, 6 recurring voices (4 zh-TW Common Voice, 2 LibriSpeech),
 154 s zh / 154 s en, 44 language switches, 4 overlaps; deterministic, writes a `score_stream.py` manifest and
 a `score_turns.py` turns file.
+
+**Encoder reset on real acoustic silence - tried, worse (2026-09-27).** To test whether the encoder-cache
+reset only hurt because the no-emission trigger can fire mid-speech, the reset was moved to real silence
+(10 ms RMS blocks below -50 dBFS for >= 200/300/500 ms, applied when the next encoder chunk starts inside
+that silence). Micro WER on 11 clips went 0.0981 -> 0.147 / 0.138 / 0.125, and Chinese deletions from 1 to
+10-27 per clip. A fresh encoder state costs the first words of every utterance whatever the trigger: this
+encoder needs its left context. The en->zh deletions it would fix are a model limitation (fixing them would
+need training on multi-utterance, language-switching streams), so the shipped fix stays decoder-only.
