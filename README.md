@@ -103,16 +103,18 @@ byte-identical with or without it.
 
 The last three are single clips: observations, not statistical proof.
 
-**Who spoke** (`gate_ms_v2`, share of all words):
+**Who spoke** (`gate_ms_v2`, share of the reference words):
 
 | | VibeASR 1.5B | this composite |
 |---|---|---|
-| words given the right speaker | ~58 % | ~84 % |
-| words given the wrong speaker | ~42 % | ~7 % |
-| words left untagged | 0 % | ~9 % |
+| right speaker | ~58 % | ~84 % |
+| wrong speaker | ~42 % | ~7 % |
+| word not transcribed (so nothing to tag) | 0 % | ~9 % |
 
-VibeASR tags every word but gets 42% of them wrong. The composite leaves ~9% untagged (mostly speech the
-diarizer missed) and gets few of the rest wrong. Details in [docs/findings.md](docs/findings.md).
+The composite tags **every word it transcribes**. The ~9% are ASR deletions: words the transcript is missing,
+already counted in the WER above, which is the same for both systems on this clip. Among the words both
+systems produce, the composite puts the wrong speaker on ~8% versus ~42% for VibeASR. Details in
+[docs/findings.md](docs/findings.md).
 
 ## Build and run
 
