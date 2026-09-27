@@ -6,8 +6,11 @@ Streaming speech recognition **and** speaker diarization in one process, on one 
 - **Speakers:** Nemotron-3 Diarization (streaming Sortformer, up to 8 speakers).
 - **Fusion:** a small attribution layer that tags each word with who said it.
 
-C++17 + ggml, CPU only, no Python at runtime. It replaces a 1.5B ASR+diarize LLM at 2.6x lower RTF and
-5.5x less memory on the same phone, with lower WER and far better speaker attribution; see [Results](#results).
+C++17 + ggml, CPU only, no Python at runtime. On the same phone it replaces a 1.5B ASR+diarize LLM at ~2x
+lower RTF and ~5x less memory, with lower WER and far better speaker attribution; see [Results](#results).
+
+**Latency:** words appear ~0.4 s after they are spoken; speaker labels are confirmed ~5 s behind the audio
+(configurable, see [Known limits](#known-limits)).
 
 ## Architecture
 
@@ -25,14 +28,14 @@ flowchart TB
 
     subgraph AC["audio.cpp - Nemotron-3 diarization (libaudiocpp.so)"]
         MEL["Mel frontend (128 bins)"] --> PRE["pre-encode"]
-        PRE --> WIN["Stream scheduler<br/>window = [speaker cache | fifo | chunk]"]
+        PRE --> WIN["Stream scheduler<br/>4 s chunks + 1 s lookahead<br/>window = [speaker cache | fifo | chunk]"]
         WIN -->|"encode() hook"| EXT
         EXT -->|"speaker probabilities"| AOSC["Speaker cache + turn decoding"]
     end
 
     subgraph XA["CrispASR - x-asr"]
         FB["Kaldi fbank (80 bins)"] --> ENC
-        ENC --> JOIN["Greedy transducer joint"]
+        ENC --> JOIN["Greedy transducer decode<br/>(context reset at pauses)"]
         JOIN --> TXT["Text + token times (40 ms)"]
     end
 
@@ -86,9 +89,9 @@ Models: see [Models](#models).
 | this composite, current build* | **0.60** | **375 MB** | 0.40 s (speaker turns: 5.0 s) |
 
 \* `gate_ms_v2` (45 s, bilingual, 4 speakers). The current build adds ARM dotprod, the unified runtime and
-4 s diarizer chunks (turns commit at 5 s instead of 30.5 s, which costs RTF 0.42 -> 0.60). It
-was measured back-to-back in a working session, not under the armed/witnessed protocol of the first two rows.
-Its output is byte-identical to the armed build.
+4 s diarizer chunks (turns commit at 5 s instead of 30.5 s, which costs RTF 0.42 -> 0.60), and an ASR decoder
+reset at pauses (fewer dropped words). It was measured back-to-back in a working session, not under the
+armed/witnessed protocol of the first two rows.
 
 ### Accuracy vs the on-edge baseline and the accuracy reference
 
@@ -168,6 +171,8 @@ Useful flags:
 | `--live` | print provisional segments as they close |
 | `--no-diar-native` | run the diarizer encoder on audio.cpp's own ggml (old path) |
 | `--diar-threshold`, `--diar-opt K=V` | diarizer decode config (defaults: threshold 0.3, pad 45 frames) |
+| `--diar-session-opt K=V` | diarizer streaming geometry, e.g. `nemotron_3_diar.chunk_len=25` (latency vs RTF) |
+| `XASR_RESET_BLANK_FRAMES=N` | ASR decoder-context reset after N silent 40 ms frames (default 25; 0 = off) |
 | `XASR_JOINT_Q8=1` | ~5-7% faster ASR leg; WER moves on some clips, so off by default |
 
 ## Known limits
@@ -177,15 +182,19 @@ Useful flags:
   latency is a setting: `--diar-session-opt nemotron_3_diar.chunk_len=25 ...chunk_right_context=4` gives
   ~2.4 s at RTF ~0.87, and `chunk_len=340 ...chunk_right_context=40 ...spkcache_update_period=300` gives
   30.5 s at RTF 0.42. The official `low` profile (~1 s) is not real time on 2 cores (RTF 3.4).
-- **Diarization recall.** It misses ~41% of speech frames on the hard bilingual clip, with near-zero false
-  alarms. This is the limiting factor for attribution.
+- **Diarization recall.** It misses 19% of speech frames on the 57 s bilingual clip and 7% on `gate_long`,
+  with few false alarms (DER-lite 22.7% and 10.0%).
+- **Some words are not transcribed.** These are overlapped speech (a single-stream ASR transcribes one voice
+  at a time) and Chinese that follows English after a short pause. The latter comes from the x-asr model's
+  own streaming state and would need retraining to fix
+  ([docs/findings.md](docs/findings.md#missing-words-were-a-streaming-state-problem-not-diarization-2026-09-27)).
 - **Two ggml libraries are still linked.** The CrispASR ggml fork cannot replace audio.cpp's (missing ops),
   so the unified runtime goes through audio.cpp's external-encoder hook instead.
 
 ## Docs
 
 - [docs/findings.md](docs/findings.md): attribution, token timestamps, window format, diarizer knobs,
-  phone findings, resampling
+  phone findings, resampling, missing words
 - [docs/one-runtime-merge.md](docs/one-runtime-merge.md): how the diarizer was moved onto the shared
   runtime, including the dead ends
 - [docs/pipeline-design.md](docs/pipeline-design.md): performance work (dotprod, joint, KleidiAI, …)
