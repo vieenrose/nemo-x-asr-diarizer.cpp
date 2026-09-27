@@ -118,9 +118,10 @@ struct Config {
     // src/diar_crispasr.h) via audiocpp_nemotron3_diar_set_external_encoder, instead of audio.cpp's own
     // internal graph. Every other piece of the diar family (mel frontend, streaming window scheduling, the
     // arrival-order speaker-cache state, turn decoding) is audio.cpp's own code either way - this flag picks
-    // which runtime does JUST the matmul-heavy compute. Default false (audio.cpp's own ggml, today's
-    // behaviour, unchanged) until this is validated end to end and measured, not assumed, faster.
-    bool diar_native  = false;
+    // which runtime does JUST the matmul-heavy compute. Default TRUE since 2026-09-27: validated WER-neutral
+    // on all 11 clips and measured faster than audio.cpp's own graph on the phone once its activation
+    // allocation was fixed (docs/one-runtime-merge.md SS25-26). --no-diar-native restores the old path.
+    bool diar_native  = true;
 };
 
 struct Segment {

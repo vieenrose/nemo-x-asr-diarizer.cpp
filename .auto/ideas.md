@@ -274,7 +274,7 @@ docs/one-runtime-merge.md §24.
   the dotprod-only baseline. Performance: **diar leg ~62% SLOWER** (3.39s -> 5.49s/5.50s, reproduced twice,
   same clip/mask), ASR leg flat. Full writeup: docs/pipeline-design.md §16. Not wired into
   `scripts/build_android.sh` - closed, not an open lever.
-- **2026-09-27: --diar-native now FASTER than default** (18.65 vs 18.86 s gate_ms_v2, 61.9 vs 62.9 s holdout_en, RSS 491 MB vs 1.5 GB before) after fixing a flat allocation of every intermediate tensor in `DiarCrispASR` - docs/one-runtime-merge.md §25. Default flip pending re-bless.
+- **2026-09-27: --diar-native now FASTER than default** (18.65 vs 18.86 s gate_ms_v2, 61.9 vs 62.9 s holdout_en, RSS 491 MB vs 1.5 GB before) after fixing a flat allocation of every intermediate tensor in `DiarCrispASR` - docs/one-runtime-merge.md §25. Now the DEFAULT, bit-exact with audio.cpp after fixing a missing F16 embed_norm and the conv1d F16-im2col gap (§26) - no re-bless needed.
 - One shared ggml between the two engines (dies at `GGML_ASSERT(*cur_backend_id != -1)`).
 
 ## Method notes worth keeping

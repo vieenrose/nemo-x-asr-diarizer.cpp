@@ -1065,3 +1065,35 @@ Device, `taskset C0`, interleaved, two runs each:
 with output byte-identical to the path already validated WER-neutral on all 11 clips (SS17). Still default-off
 pending a decision: flipping it changes shipped output (speaker-label churn vs the audio.cpp path, SS17), so it
 needs a deliberate re-bless, not a silent swap. SS20-24's non-fixes all stand; none of them was this.
+
+## 26. The port was never numerically correct - two bugs found, fixed; bit-exact now, and the default
+
+Flipping the default (SS25) required re-running the accuracy gate with `--diar-native` on - and it failed on
+*diarization*, not WER: attribution 0.0779 -> 0.3117 on gate_ms_v2, DER-lite 23.28% -> 54.41%, 31 turns
+instead of 11. SS17's "WER-neutral on 11 clips" was true and beside the point: the transcript does not depend
+on the diarizer, so WER could never have caught this. The per-layer dump validations (SS13-15) could not
+either, because they all started from `layer0_in`.
+
+New acceptance test, `AUDIOCPP_DIAR_COMPARE=1` (ref/audiocpp 3906bd4): when an external encoder is set,
+run it AND audio.cpp's own on the same inputs every call, log max |delta| and how many probabilities cross
+0.5, return audio.cpp's. First call: max |delta| 0.97, 2695 of 24320 flipped. Bisecting every commit of
+`src/diar_crispasr.cpp` against `tools/diar_crispasr_test` showed it was wrong from the wiring commit onward.
+
+1. **Missing `encoder.embed_norm`.** audio.cpp LayerNorms the encoder input before layer 0; `layer0_in` is
+   *post*-norm, so the port never had the op. Added - and it is the one **F16** tensor the class reads
+   (everything else is BF16/Q8_0); `load_bf16` reinterpreted it as garbage silently. New `load_f16`.
+   After: max |delta| 0.003, 0 flips - exactly the known conv1d gap.
+2. **The conv1d gap was not harmless.** It still moved attribution on 3/11 clips (control_ls 0.5953 ->
+   0.6271, holdout_en 0.6000 -> 0.6095, holdout_zh_aligned 0.7987 -> 0.8009), always worse. Cause (already
+   documented): audio.cpp's ggml builds an F16 im2col; CrispASR's fork keeps F32. Fix: round the conv input
+   through F16 (`ggml_cast` F32->F16->F32; the kernel was already F16). **max |delta| = 0**, every call.
+
+Result, `--diar-native` on vs off:
+- host: 11/11 clips byte-identical; gate hash `192184ebcd54977e` unchanged - **no re-bless needed**.
+- phone (`taskset C0`, interleaved per clip): 11/11 byte-identical, faster on every clip, 767.84 s ->
+  759.01 s total (**-1.15%**), peak RSS +~100 MB (audio.cpp still loads its own copy of the diar weights).
+
+**Now the default** (`--no-diar-native` restores the old path). The composite is one ggml runtime for both
+models' heavy compute, bit-exact with the two-runtime pipeline it replaces, and faster.
+
+Remaining: drop audio.cpp's now-unused copy of the encoder weights to recover the ~100 MB.

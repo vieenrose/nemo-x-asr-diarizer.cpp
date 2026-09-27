@@ -70,6 +70,7 @@ static void usage(const char* p) {
         "  --diar-threshold F    diarizer detection threshold (family default 0.5; lower = more speech found)\n"
         "  --diar-opt K=V        any diarizer request option, e.g. speaker_min_frames=2 (repeatable)\n"
         "  --no-asr / --no-diar  run one half (diar-only still emits turn timeline; asr-only tags nothing)\n"
+        "  --no-diar-native      run the diar encoder on audio.cpp's own ggml instead of the shared runtime\n"
         "  --live                print segments as they close, to stderr (latency demonstration)\n"
         "  --main-affinity HEX     cpu mask for the ASR thread (e.g. c0 = cpu6-7, the A78 primes)\n"
         "  --engine-affinity HEX   cpu mask for the diarizer's worker pool (e.g. f = cpu0-3, the A55s)\n"
@@ -153,6 +154,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-asr") cfg.skip_asr = true;
         else if (a == "--no-diar") cfg.skip_diar = true;
         else if (a == "--diar-native") cfg.diar_native = true;
+        else if (a == "--no-diar-native") cfg.diar_native = false;
         else if (a == "--live") live = true;
         else if (a == "--json") json = true;
         else if (a == "--turns-out") { turns_path = next("--turns-out"); turns_out = true; }

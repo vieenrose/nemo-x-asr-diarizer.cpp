@@ -169,6 +169,7 @@ struct DiarCrispASR::Impl {
         ggml_tensor * ob = nullptr, * fib = nullptr, * fob = nullptr;
     };
     std::vector<LayerTensors> layers;
+    ggml_tensor * enw = nullptr, * enb = nullptr;   // encoder.embed_norm - applied BEFORE layer 0 (see encode())
     ggml_tensor * fnw = nullptr, * fnb = nullptr, * epw = nullptr, * epb = nullptr;
     ggml_tensor * usw = nullptr, * usb = nullptr, * hhw = nullptr, * hhb = nullptr, * shw = nullptr, * shb = nullptr;
 
@@ -240,6 +241,13 @@ DiarCrispASR::DiarCrispASR(const std::string & gguf_path, int threads) : impl_(n
         load_raw(name, dst);
         dst.f32 = bf16_to_f32(dst.raw);
     };
+    // encoder.embed_norm is the ONE F16 (not BF16) tensor this class reads - reinterpreting it as BF16
+    // silently produces garbage weights, not an error.
+    auto load_f16 = [&](const std::string & name, Loaded & dst) {
+        load_raw(name, dst);
+        dst.f32.resize(dst.raw.size() / 2);
+        ggml_fp16_to_fp32_row(reinterpret_cast<const ggml_fp16_t *>(dst.raw.data()), dst.f32.data(), (int64_t) dst.f32.size());
+    };
     for (int i = 0; i < n_layers; i++) {
         const std::string lp = "encoder.layers." + std::to_string(i) + ".";
         auto & l = raw_layers[static_cast<size_t>(i)];
@@ -254,8 +262,10 @@ DiarCrispASR::DiarCrispASR(const std::string & gguf_path, int threads) : impl_(n
     }
     m.hidden = raw_layers[0].n1w.ne[0];
 
-    Loaded final_norm_w, final_norm_b, enc_proj_w, enc_proj_b, upsample_w, upsample_b,
+    Loaded embed_norm_w, embed_norm_b, final_norm_w, final_norm_b, enc_proj_w, enc_proj_b, upsample_w, upsample_b,
            head_hidden_w, head_hidden_b, speaker_w, speaker_b;
+    load_f16("encoder.embed_norm.weight", embed_norm_w);
+    load_f16("encoder.embed_norm.bias", embed_norm_b);
     load_bf16("encoder.final_norm.weight", final_norm_w);
     load_bf16("encoder.final_norm.bias", final_norm_b);
     load_raw("sortformer_modules.encoder_proj.weight", enc_proj_w);
@@ -302,6 +312,8 @@ DiarCrispASR::DiarCrispASR(const std::string & gguf_path, int threads) : impl_(n
         l.fib = ggml_new_tensor_1d(wctx, GGML_TYPE_F32, (int64_t) raw.fib.f32.size());
         l.fob = ggml_new_tensor_1d(wctx, GGML_TYPE_F32, (int64_t) raw.fob.f32.size());
     }
+    m.enw = ggml_new_tensor_1d(wctx, GGML_TYPE_F32, embed_norm_w.ne[0]);
+    m.enb = ggml_new_tensor_1d(wctx, GGML_TYPE_F32, embed_norm_b.ne[0]);
     m.fnw = ggml_new_tensor_1d(wctx, GGML_TYPE_F32, final_norm_w.ne[0]);
     m.fnb = ggml_new_tensor_1d(wctx, GGML_TYPE_F32, final_norm_b.ne[0]);
     m.epw = ggml_new_tensor_2d(wctx, GGML_TYPE_Q8_0, enc_proj_w.ne[0], enc_proj_w.ne[1]);
@@ -325,6 +337,7 @@ DiarCrispASR::DiarCrispASR(const std::string & gguf_path, int threads) : impl_(n
         feed_f32(l.n2w, raw.n2w.f32); feed_f32(l.n2b, raw.n2b.f32);
         feed_f32(l.ob, raw.ob.f32);   feed_f32(l.fib, raw.fib.f32); feed_f32(l.fob, raw.fob.f32);
     }
+    feed_f32(m.enw, embed_norm_w.f32);   feed_f32(m.enb, embed_norm_b.f32);
     feed_f32(m.fnw, final_norm_w.f32);   feed_f32(m.fnb, final_norm_b.f32);
     feed_raw(m.epw, enc_proj_w.raw);     feed_f32(m.epb, enc_proj_b.f32);
     feed_f32_as_f16(m.usw, upsample_w.f32); feed_f32(m.usb, upsample_b.f32);
@@ -444,13 +457,23 @@ std::vector<float> DiarCrispASR::encode(
             ggml_tensor * ff_out = ggml_add(ctx, ggml_mul_mat(ctx, w.w_ffn_out, ff_gel), w.fob);
             return ggml_add(ctx, x1, ff_out);
         };
-        ggml_tensor * stage = in;
+        // encoder.embed_norm: audio.cpp's encoder graph LayerNorms its input BEFORE layer 0
+        // (ref/audiocpp encoder.cpp, `weights.embed_norm`). tools/encoder_port.cpp started from the
+        // AUDIOCPP_DUMP_LAYER0 `layer0_in` dump, which is already post-embed_norm, so the port never had this
+        // op - and every encode() since the wiring commit ran on un-normalised input (docs/one-runtime-merge.md
+        // SS26: 100% of outputs differed from audio.cpp, max |delta| 0.97; WER held, diarization did not).
+        ggml_tensor * stage = ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, in, m.eps), m.enw), m.enb);
         for (int i = 0; i < n_layers; i++) stage = build_layer(stage, i);
 
         // --- head, tools/head_port.cpp's proven op sequence, unchanged --------------------------------------
         ggml_tensor * fn = ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, stage, m.eps), m.fnw), m.fnb);
         ggml_tensor * proj = ggml_add(ctx, ggml_mul_mat(ctx, m.epw, fn), m.epb);
         ggml_tensor * proj_t = ggml_cont(ctx, ggml_transpose(ctx, proj));
+        // audio.cpp's unpatched ggml_conv_1d builds an F16 im2col, i.e. rounds this input to F16 before the
+        // dot; CrispASR's forked one keeps F32 (docs/one-runtime-merge.md, the ~1e-3 conv1d gap). Round-trip
+        // through F16 here so both runtimes see the same input values - the gap was enough to flip borderline
+        // speaker decisions on 3 of 11 validation clips (SS26).
+        proj_t = ggml_cast(ctx, ggml_cast(ctx, proj_t, GGML_TYPE_F16), GGML_TYPE_F32);
         ggml_tensor * conv = ggml_conv_1d(ctx, m.usw, proj_t, 1, (int) (m.upsample_kernel / 2), 1);
         ggml_tensor * bias_bc = ggml_reshape_2d(ctx, m.usb, 1, m.head_hidden * m.upsample_factor);
         conv = ggml_add(ctx, conv, bias_bc);

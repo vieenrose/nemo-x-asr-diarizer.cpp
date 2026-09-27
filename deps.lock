@@ -53,6 +53,9 @@
 #                     mirror was - better on 9 clips, worse on 2, one exceeding this repo's blessed ceiling -
 #                     so it stays opt-in. Confirmed byte-identical to the existing f16 path when unset.
 #                     Full account: docs/pipeline-design.md SS17.
+#   audiocpp   3906bd4  AUDIOCPP_DIAR_COMPARE: runs the external encoder AND audio.cpp's own on the same inputs,
+#                     logs max |delta| / flips@0.5, returns audio.cpp's. The acceptance test that found the
+#                     port's missing embed_norm and conv1d-precision bugs (docs/one-runtime-merge.md SS26).
 crispasr=86bf8fe
 crispasr_ggml=512a020
-audiocpp=4d3de79
+audiocpp=3906bd4
