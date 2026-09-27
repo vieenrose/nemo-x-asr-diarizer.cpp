@@ -89,12 +89,12 @@ Models: see [Models](#models).
 was measured back-to-back in a working session, not under the armed/witnessed protocol of the first two rows.
 Its output is byte-identical to the armed build.
 
-### Accuracy vs two baselines
+### Accuracy vs the on-edge baseline and the accuracy reference
 
 - **VibeASR streaming 1.5B:** the on-edge baseline, run on the same phone with its official measurement
   config (int8 VAE, q8-head LM, `taskset C0`, 2 threads).
-- **VibeASR streaming 7B (q4_k):** the high-quality baseline. It does not fit on the phone (5.9 GB), so it
-  ran on the host (16 threads, RTF ~1.4 on `gate_long`).
+- **VibeASR streaming 7B (q4_k):** the transcription accuracy reference only, not a deployment target. It
+  ran on the host (16 threads).
 - **This composite:** run on the phone, current build.
 
 Same 12 clips and scorer for all three (`score_stream.py`). `[Noise]`-style event tags are stripped from the
@@ -102,7 +102,7 @@ Same 12 clips and scorer for all three (`score_stream.py`). `[Noise]`-style even
 
 **Transcription (WER, lower is better)**
 
-| clip | 1.5B | 7B | composite |
+| clip | 1.5B | 7B (reference) | composite |
 |---|---|---|---|
 | gate_ms | 0.144 | **0.082** | 0.155 |
 | gate_ms_g100 | 0.227 | **0.113** | 0.165 |
@@ -119,7 +119,7 @@ Same 12 clips and scorer for all three (`score_stream.py`). `[Noise]`-style even
 | **all 12 (micro)** | 0.167 | **0.112** | 0.117 |
 
 **Who spoke** (multi-speaker clips; share of reference words with the right / wrong speaker; the rest were not
-transcribed):
+transcribed; the reference here is the ground-truth manifest):
 
 | clip | 1.5B | 7B | composite |
 |---|---|---|---|
@@ -130,12 +130,14 @@ transcribed):
 | gate_long | 35 / 54 % | 39 / 59 % | **88 / 1 %** |
 | **mean** | 44 / 54 % | 59 / 40 % | **92 / 2 %** |
 
-In short, the composite:
-- **Transcription:** beats the on-edge 1.5B (WER 0.117 vs 0.167) and comes within 0.005 of the 7B. It
-  leads on Chinese and trails the 7B on English and mixed-language clips.
-- **Speaker attribution:** far ahead of both. The 7B is excellent on some clips (gate_ms_v2) but mislabels
-  most words on others, including the 5.6 min clip.
-- **Resources:** runs on the phone at RTF 0.45 in ~450 MB, where the 7B needs a host and ~6.6 GB.
+Both VibeASR sizes mostly collapse the speakers into one or two labels (1-2 of 4-6 voices used, all clips but
+`gate_ms_v2`). So the 7B is a transcription reference, not a speaker reference.
+
+Versus the 7B reference, the composite:
+- **Transcription:** 0.117 vs 0.112 micro WER (+0.005). It is better on Chinese, worse on English and on
+  mixed-language clips.
+- **Who spoke:** separates the speakers that both VibeASR models merge.
+- **Resources:** runs on the phone at RTF 0.45 in ~450 MB.
 
 ## Build and run
 
