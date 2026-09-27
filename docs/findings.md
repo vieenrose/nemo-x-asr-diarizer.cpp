@@ -211,3 +211,31 @@ so attribution is a layer over the transcript, never a rewrite of it.
 
 `scripts/build_host.sh` deletes objects before compiling. A stale object linked against a changed struct
 layout does not fail to link - it corrupts memory at run time and segfaults somewhere unhelpful.
+
+## Missing words were a streaming-state problem, not diarization (2026-09-27)
+
+The "untagged" share in speaker attribution is exactly the ASR's deletions: every transcribed word is tagged
+(attributed = S + H in `score_stream.py`). The deletions come in runs, and nearly always right after a
+language switch. The same turn cut out alone is transcribed correctly, so the cause is state carried
+across utterances, which the model never saw in training (isolated utterances):
+
+- **zh -> en: decoder context.** The transducer decoder conditions on its last 2 tokens; Chinese tokens
+  there bias an English onset to blank. Fix (default): reset the context to `[-1, blank]` after ~1 s with
+  no emission (`XASR_RESET_BLANK_FRAMES`, 25 frames).
+- **en -> zh with short pauses: encoder caches.** Decoder reset alone barely helps; resetting the encoder
+  caches too (`XASR_RESET_ENC=1`) recovers whole Chinese turns but costs monolingual Chinese accuracy.
+  Opt-in.
+- Beam search (modified, K=4) did not help: the model, given that state, is confident about blank.
+
+| config (host) | micro WER, 12 clips | deletions | gate_long |
+|---|---|---|---|
+| no reset | 0.1187 | 184 | 0.1830 |
+| decoder reset (default) | **0.1087** | **121** | 0.1499 |
+| decoder + encoder reset | 0.1132 | 111 | **0.1229** |
+
+Phone, 11 clips: 0.1073 -> 0.1047, deletions 81 -> 64. Remaining: overlapped speech (a single-stream ASR
+cannot transcribe two voices at once) and en->zh onsets with pauses under 1 s.
+
+`gate_long` (`tools/build_gate_long.py`): 5.6 min, 6 recurring voices (4 zh-TW Common Voice, 2 LibriSpeech),
+154 s zh / 154 s en, 44 language switches, 4 overlaps; deterministic, writes a `score_stream.py` manifest and
+a `score_turns.py` turns file.

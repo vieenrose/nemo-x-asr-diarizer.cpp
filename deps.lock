@@ -58,10 +58,13 @@
 #                     port's missing embed_norm and conv1d-precision bugs (docs/one-runtime-merge.md SS26).
 #   audiocpp   8344bbe  AUDIOCPP_NEMOTRON3_DIAR_EXTERNAL_ENCODER: skip uploading the encoder+head weights when
 #                     DiarCrispASR supplies encode() - native peak RSS now at or below the audio.cpp path.
+#   crispasr 657bc15  decoder-context reset at endpoints (default on): the previous utterance's last tokens no
+#                     longer bias the next utterance's onset to blank. 12 clips (host) micro WER 0.1187 ->
+#                     0.1087, deletions 184 -> 121; phone 11 clips 0.1073 -> 0.1047. Output changes: re-blessed.
 # Where the pinned commits live (branch nemo-x-asr-diarizer on each):
 #   audiocpp      https://github.com/vieenrose/audio.cpp
 #   crispasr      https://github.com/vieenrose/CrispASR
 #   crispasr_ggml https://github.com/vieenrose/ggml   (CrispASR's ggml submodule)
-crispasr=86bf8fe
+crispasr=657bc15
 crispasr_ggml=512a020
 audiocpp=8344bbe

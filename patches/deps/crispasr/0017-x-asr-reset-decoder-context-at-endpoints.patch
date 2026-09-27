@@ -1,0 +1,86 @@
+From 657bc153cfb1b5bc2c46a9315e4c2e49b5ef0ea4 Mon Sep 17 00:00:00 2001
+From: autoresearch <agent@localhost>
+Date: Sun, 27 Sep 2026 06:29:08 +0000
+Subject: [PATCH] x-asr: reset the transducer decoder context at endpoints
+ (default on)
+
+After ~1 s with no emission (XASR_RESET_BLANK_FRAMES, default 25 frames of
+40 ms; 0 disables) the 2-token decoder context returns to greedy_init's
+[-1, blank]. The model was trained on isolated utterances; across utterances
+in a stream the previous language's tokens biased the next utterance's onset
+to blank, deleting whole runs of words. Opt-in XASR_RESET_ENC=1 also resets
+the encoder caches (helps en->zh switches, hurts monolingual zh).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xasr.cpp | 33 +++++++++++++++++++++++++++++++++
+ 1 file changed, 33 insertions(+)
+
+diff --git a/src/xasr.cpp b/src/xasr.cpp
+index 0ee5ecb..15c9a94 100644
+--- a/src/xasr.cpp
++++ b/src/xasr.cpp
+@@ -1038,6 +1038,8 @@ struct greedy_state {
+     std::vector<int64_t> frames;
+     int64_t frame_pos = 0;   // global across chunk calls; greedy_run is called once per chunk
+     bool first = true;
++    int64_t blank_run = 0;   // consecutive frames with no emission
++    bool enc_reset_pending = false;   // endpoint seen: reset encoder caches before the next chunk (opt-in)
+ };
+ 
+ void greedy_init(const xasr_model& m, greedy_state& gs) {
+@@ -1048,6 +1050,7 @@ void greedy_init(const xasr_model& m, greedy_state& gs) {
+     gs.frames.clear();
+     gs.frame_pos = 0;
+     gs.first = true;
++    gs.blank_run = 0;
+ }
+ 
+ void greedy_run(const xasr_model& m, greedy_state& gs, const float* enc, int n_enc, float* first_logits) {
+@@ -1152,6 +1155,28 @@ void greedy_run(const xasr_model& m, greedy_state& gs, const float* enc, int n_e
+         if (gs.first && first_logits)
+             std::memcpy(first_logits, logits.data(), (size_t)V * sizeof(float));
+         gs.first = false;
++        if (best == hp.blank_id || best == hp.unk_id) {
++            // Endpoint reset: after ~1 s with no emission, put the 2-token decoder context back to
++            // greedy_init's [-1, blank]. The model was trained on isolated utterances, each starting from that
++            // context; in a long stream the previous utterance's last tokens carry over instead, and after a
++            // Chinese sentence they bias the first English words of the next one to blank - whole runs of
++            // words went missing (e.g. "There he showed skill in clay" on gate_ms, transcribed perfectly when
++            // the turn is cut out alone). Across 11 validation clips: micro WER 0.1022 -> 0.0981, deletions
++            // 69 -> 43. Cost: the first characters after a pause lose their LM context (one sentence,
++            // 孙中山 -> 村中三). XASR_RESET_BLANK_FRAMES=0 disables; frames are 40 ms.
++            static const int64_t reset_after = [] {
++                const char * v = getenv("XASR_RESET_BLANK_FRAMES");
++                return v ? (int64_t) atoll(v) : (int64_t) 25;
++            }();
++            if (reset_after > 0 && ++gs.blank_run == reset_after && gs.hyp.back() != hp.blank_id) {
++                gs.hyp.push_back(-1);
++                gs.hyp.push_back(hp.blank_id);   // context back to greedy_init's [-1, blank]
++                gs.d = decoder_out(m, gs.hyp);
++                gs.enc_reset_pending = true;
++            }
++        } else {
++            gs.blank_run = 0;
++        }
+         if (best != hp.blank_id && best != hp.unk_id) {
+             gs.toks.push_back(best);
+             gs.frames.push_back(gs.frame_pos);
+@@ -1459,6 +1484,14 @@ bool stream_accept(xasr_stream* s, const float* pcm, int n, bool flush) {
+     if (flush)
+         s->pcm.resize(s->pcm.size() + (size_t)s->c->g.tail_pad_ms * 16, 0.0f);
+     stream_extend_frames(s, flush);
++    // XASR_RESET_ENC=1 also resets the encoder caches at that endpoint. It recovers whole zh turns that follow
++    // English with a short pause (gate_long WER 0.150 -> 0.123), but drops useful left context inside a
++    // language (holdout_zh2 0.043 -> 0.076), so it is off by default.
++    static const bool reset_enc = [] { const char* v = getenv("XASR_RESET_ENC"); return v && atoi(v) != 0; }();
++    if (s->gs.enc_reset_pending) {
++        s->gs.enc_reset_pending = false;
++        if (reset_enc) s->st = enc_state();   // encoder caches back to stream start (left context dropped)
++    }
+     std::vector<float> enc;
+     if (!run_chunks(s->c, s->meta, s->st, s->feats.data(), s->n_frames, &s->pos, enc, nullptr))
+         return false;
+-- 
+2.53.0
+
