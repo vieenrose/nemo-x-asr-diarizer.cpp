@@ -205,6 +205,18 @@ Measured on `taskset C0` - the baseline's OWN mask (cpu6-7, the two primes), arm
 | gate_ms_v2 (hard, 4 speakers) | **0.4627** | 0.319 s | 95 ms | 396 MB |
 | bilingual_multispk_57s | 0.4982 | 0.324 s | 95 ms | 409 MB |
 
+Current build (2026-09-27: ARM dotprod compiled in, unified diar runtime on by default), same mask, two runs
+each - taken back-to-back in a working session, NOT through the arming/witness protocol above, so compare
+them to each other rather than to the armed rows:
+
+| clip | RTF | peak RSS |
+|---|---|---|
+| gate_ms_v2 | **0.4144 / 0.4160** | 393 MB |
+| bilingual_multispk_57s | **0.4410 / 0.4412** | 406 MB |
+
+Transcript and speaker output are byte-identical to the armed rows' build (gate hash unchanged); what moved
+is speed - see docs/pipeline-design.md §15 and docs/one-runtime-merge.md §25-27.
+
 (Earlier rows in the table below were taken before the `use_gpu` fix, on 4 cpus, and are 1.6x too slow.)
 
 Against the baseline's own anchor on the same device (RTF 1.2231, peak RSS 2198 MB, first text at one 2.93 s
@@ -259,11 +271,15 @@ No WER cost. The resampling also costs nothing measurable in time (~40 lines, on
   attribution is flat across a 10x range of the placement model, so exact token times would buy almost
   nothing for *who said it*. What they would buy is *when the speaker changed* - boundaries are placed at
   word granularity, so a label change carries about one word of timing uncertainty.
-* **Two ggml runtimes in one process, deliberately.** x-asr's runtime is CrispASR's, against its ggml fork;
-  Nemotron-3 lives in audio.cpp's C API, which is version-scripted to hide its own ggml. Building the two
-  against a single ggml compiles and links - and then asserts in `ggml_backend_sched` because the fork has
-  ops the other does not. If you are reading this to wire the libraries up yourself: keep them separate,
-  `libaudiocpp.so` for the diarizer, static CrispASR for the ASR.
+* **One ggml runtime for both models' heavy compute (since 2026-09-27).** x-asr runs on CrispASR's ggml; the
+  Nemotron-3 encoder and head used to run on audio.cpp's own hidden ggml, and now run on CrispASR's too
+  (`src/diar_crispasr.cpp`, plugged into audio.cpp through `audiocpp_nemotron3_diar_set_external_encoder`),
+  while audio.cpp keeps the mel frontend, pre-encode, streaming windows, speaker cache and turn decoding.
+  Output is bit-exact with the old two-runtime path (every probability, every call), ~1% faster on the phone
+  across 11 clips, and no larger. `--no-diar-native` restores the old path. Linking the two *libraries*
+  against one ggml still does not work (the CrispASR fork has ops the other lacks) - which is why the port
+  goes through the external-encoder hook instead. Full story, including the two numerical bugs the first
+  version shipped with: docs/one-runtime-merge.md §25-27.
 
 ## Provenance
 
