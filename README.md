@@ -7,7 +7,7 @@ Streaming speech recognition **and** speaker diarization in one process, on one 
 - **Fusion:** a small attribution layer that tags each word with who said it.
 
 C++17 + ggml, CPU only, no Python at runtime. It replaces a 1.5B ASR+diarize LLM at 2.6x lower RTF and
-5.5x less memory on the same phone.
+5.5x less memory on the same phone, with lower WER and far better speaker attribution; see [Results](#results).
 
 ## Architecture
 
@@ -89,32 +89,53 @@ Models: see [Models](#models).
 was measured back-to-back in a working session, not under the armed/witnessed protocol of the first two rows.
 Its output is byte-identical to the armed build.
 
-### Accuracy vs VibeASR streaming 1.5B
+### Accuracy vs two baselines
 
-**Transcription** (WER, lower is better). The diarizer never changes the text: the transcript is
-byte-identical with or without it.
+- **VibeASR streaming 1.5B:** the on-edge baseline, run on the same phone with its official measurement
+  config (int8 VAE, q8-head LM, `taskset C0`, 2 threads).
+- **VibeASR streaming 7B (q4_k):** the high-quality baseline. It does not fit on the phone (5.9 GB), so it
+  ran on the host (16 threads, RTF ~1.4 on `gate_long`).
+- **This composite:** run on the phone, current build.
 
-| test set | VibeASR 1.5B | this composite | reading |
+Same 12 clips and scorer for all three (`score_stream.py`). `[Noise]`-style event tags are stripped from the
+7B output. `gate_long` is 5.6 min, 6 voices, 44 zh/en switches (`tools/build_gate_long.py`).
+
+**Transcription (WER, lower is better)**
+
+| clip | 1.5B | 7B | composite |
 |---|---|---|---|
-| LibriSpeech, 40 utterances (clean English) | 4.51 % | 4.27 % | tie (paired McNemar p = 1.0) |
-| `gate_ms_v2` (bilingual, 4 speakers) | 17.65 % | 17.65 % | same |
-| `holdout_en` (hard English) | 26.36 % | 24.55 % | composite slightly better |
-| `holdout_zh` (hard Chinese) | 15.38 % | 7.91 % | composite ~2x fewer errors |
+| gate_ms | 0.144 | **0.082** | 0.155 |
+| gate_ms_g100 | 0.227 | **0.113** | 0.165 |
+| gate_ms_g1000 | 0.196 | **0.082** | 0.144 |
+| gate_ms_v2 | 0.176 | **0.165** | 0.176 |
+| gate_long | 0.210 | **0.134** | 0.162 |
+| control_ls (en) | 0.055 | 0.053 | **0.044** |
+| holdout_en | 0.264 | **0.236** | 0.259 |
+| holdout_en_aligned | 0.250 | **0.227** | 0.255 |
+| holdout_zh | 0.154 | **0.085** | **0.085** |
+| holdout_zh2 | 0.120 | 0.089 | **0.047** |
+| holdout_zh_aligned | 0.169 | 0.100 | **0.079** |
+| holdout_zh_ph35200 | 0.165 | **0.083** | **0.083** |
+| **all 12 (micro)** | 0.167 | **0.112** | 0.117 |
 
-The last three are single clips: observations, not statistical proof.
+**Who spoke** (multi-speaker clips; share of reference words with the right / wrong speaker; the rest were not
+transcribed):
 
-**Who spoke** (`gate_ms_v2`, share of the reference words):
+| clip | 1.5B | 7B | composite |
+|---|---|---|---|
+| gate_ms | 43 / 57 % | 43 / 57 % | **94 / 2 %** |
+| gate_ms_g100 | 43 / 57 % | 43 / 57 % | **96 / 0 %** |
+| gate_ms_g1000 | 38 / 61 % | 72 / 28 % | **100 / 0 %** |
+| gate_ms_v2 | 58 / 42 % | **95 / 0 %** | 84 / 6 % |
+| gate_long | 35 / 54 % | 39 / 59 % | **88 / 1 %** |
+| **mean** | 44 / 54 % | 59 / 40 % | **92 / 2 %** |
 
-| | VibeASR 1.5B | this composite |
-|---|---|---|
-| right speaker | ~58 % | ~84 % |
-| wrong speaker | ~42 % | ~7 % |
-| word not transcribed (so nothing to tag) | 0 % | ~9 % |
-
-The composite tags **every word it transcribes**. The ~9% are ASR deletions: words the transcript is missing,
-already counted in the WER above, which is the same for both systems on this clip. Among the words both
-systems produce, the composite puts the wrong speaker on ~8% versus ~42% for VibeASR. Details in
-[docs/findings.md](docs/findings.md).
+In short, the composite:
+- **Transcription:** beats the on-edge 1.5B (WER 0.117 vs 0.167) and comes within 0.005 of the 7B. It
+  leads on Chinese and trails the 7B on English and mixed-language clips.
+- **Speaker attribution:** far ahead of both. The 7B is excellent on some clips (gate_ms_v2) but mislabels
+  most words on others, including the 5.6 min clip.
+- **Resources:** runs on the phone at RTF 0.45 in ~450 MB, where the 7B needs a host and ~6.6 GB.
 
 ## Build and run
 
