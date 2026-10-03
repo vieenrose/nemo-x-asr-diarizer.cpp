@@ -143,6 +143,58 @@ Versus the 7B reference, the composite:
 - **Who spoke:** separates the speakers that both VibeASR models merge.
 - **Resources:** runs on the phone at RTF 0.60 in ~430 MB, with speaker turns ~5 s behind the audio.
 
+### Same design, three runtimes: ggml vs ONNX Runtime vs LiteRT
+
+The ggml composite above is this project's own implementation. To see what the *design* (streaming x-asr +
+Nemotron-3 diarization + fusion) costs on the two other runtimes that ship prebuilt Android binaries for
+these models, we built independent native harnesses against each and ran them on the same phone, same
+`gate_ms_v2` clip, same scorer:
+
+- **ONNX Runtime:** [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)'s streaming x-asr export (identical
+  480 ms chunking) + a from-scratch C++ port of Nemotron-3's Arrival-Order Speaker Cache against the raw
+  ONNX diarization graph (no official wrapper exists for it). Same streaming geometry as the ggml build
+  (128/40/60 cache/FIFO/update-period, 4 s chunks).
+- **LiteRT:** [`Luigi/xasr-litert`](https://huggingface.co/Luigi/xasr-litert) (an **offline** zipformer2
+  export - fixed 3.75-30 s blocks, no carried encoder state across them; only the transducer decoder's
+  2-token context is carried here as a practical approximation) +
+  [`litert-community/Nemotron-3-Diarization-LiteRT`](https://huggingface.co/litert-community/Nemotron-3-Diarization-LiteRT)'s
+  own published streaming profile (0.72 s steps, 264/264 cache/FIFO - a different, higher-latency operating
+  point than the ggml/ORT builds, fixed by that export's compiled graph shape).
+
+| | RTF | peak RSS | WER | who spoke right/wrong |
+|---|---|---|---|---|
+| ggml (this project) | **0.60** | **375 MB** | **0.117** (micro, 12 clips) | **92 / 2 %**\* |
+| ONNX Runtime | 0.67 | 413 MB | 0.137 (micro, 12 clips) | 73 / 9 %\* |
+| LiteRT | 14.58 | 1935 MB | 0.247 (`gate_ms_v2` only\*\*) | 49 / 32 % (`gate_ms_v2` only\*\*) |
+
+\* mean over the 5 multi-speaker gate clips, same convention as the table above (share of reference words
+with the right/wrong speaker; the rest weren't transcribed).
+\*\* LiteRT ran only on `gate_ms_v2` (45 s) - at this RTF, the full 12-clip/`gate_long` suite would take
+hours on this phone; see why below.
+
+**Why LiteRT is 24x slower here.** The diarization graphs compile cleanly to the CPU XNNPACK delegate (100%
+of nodes delegated, one partition each) and produce turn boundaries matching the other two backends almost
+exactly (validated independently before fusing: `speaker_0: 0.43s-1.42s`, `speaker_1: 2.18s-7.04s`, ... -
+same segments ggml and ORT find). The diarization encoder is a 199 MB fp16 model that
+[its own README](https://huggingface.co/litert-community/Nemotron-3-Diarization-LiteRT) measures at
+RTF 0.16-0.24 - *on a Galaxy S26's GPU delegate*. This phone (Oppo CPH2371, Dimensity 1300) has no GPU
+accelerator LiteRT could load (`GPU accelerator could not be loaded and registered`), so the whole
+199 MB transformer runs on CPU instead, at RTF ~14.4 for the diarizer alone (646 s for 45 s of audio). The
+ASR side is unaffected and fast (RTF 0.21) since it was built for CPU (int8) from the start. Peak RSS is
+also far higher: LiteRT keeps all four of xasr-litert's fixed-length encoder signatures (375/750/1500/3000
+frames) resident at once, plus both diarization graphs, with no cross-graph memory sharing.
+**Takeaway:** LiteRT's own numbers are real, but they assume a GPU delegate; on CPU-only phones (most
+budget/midrange Android hardware, including this one) this design is not competitive with ggml or ORT.
+
+**Why ORT is close but not equal to ggml on "who spoke".** Same streaming geometry and the same (corrected)
+AOSC algorithm, but a coarser word-to-turn fusion: the ORT harness places each ASR word at its sherpa-onnx
+token timestamp and snaps to the nearest turn within 2 s, where ggml's `fusion.cpp` does boundary-aware,
+word-majority attribution (see [Output](#output) and `docs/findings.md`). The gap is in the fusion, not the
+diarization core - both runtimes found the same speaker turns.
+
+Harness code: `compare/ort/android/` (ONNX Runtime) and `compare/litert/` (LiteRT), not part of the shipped
+binary - built to measure this comparison, not to deploy.
+
 ## Build and run
 
 Needs the pinned upstreams in `deps.lock`. Published on the `nemo-x-asr-diarizer` branch of
