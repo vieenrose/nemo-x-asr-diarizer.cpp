@@ -6,7 +6,7 @@ Streaming speech recognition **and** speaker diarization in one process, on one 
 - **Speakers:** Nemotron-3 Diarization (streaming Sortformer, up to 8 speakers).
 - **Fusion:** a small attribution layer that tags each word with who said it.
 
-C++17 + ggml, CPU only, no Python at runtime. On the same phone it replaces a 1.5B ASR+diarize LLM at ~2x
+C++17 + ggml (CPU), with an experimental LiteRT backend for both neural graphs (`--backend litert_cpu`). No Python at runtime. On the same phone it replaces a 1.5B ASR+diarize LLM at ~2x
 lower RTF and ~5x less memory, with lower WER and far better speaker attribution; see [Results](#results).
 
 **Latency:** words appear ~0.4 s after they are spoken; speaker labels are confirmed ~5 s behind the audio
@@ -44,7 +44,7 @@ flowchart TB
     FUS["Fusion (fusion.cpp)<br/>tag each word with the turn covering it"] --> OUT["[i/N] Speaker k: text"]
 ```
 
-Both models' heavy compute runs on one ggml runtime. The diarizer's encoder and head were ported from
+Both models' heavy compute runs on one ggml runtime by default. With `--backend litert_cpu` the X-ASR encoder and the diarizer encoder/head run as LiteRT int8 graphs instead; mel, decoder, joiner, scheduler and fusion are unchanged ([docs/LITERT.md](docs/LITERT.md)). The diarizer's encoder and head were ported from
 audio.cpp into `src/diar_crispasr.cpp`. The port is bit-exact with audio.cpp's own path and ~1% faster
 ([docs/one-runtime-merge.md](docs/one-runtime-merge.md) §25-27). audio.cpp keeps the parts that are logic, not
 compute: mel, pre-encode (0.05% of time), windowing, speaker cache and turn decoding.
@@ -57,6 +57,8 @@ compute: mel, pre-encode (0.05% of time), windowing, speaker cache and turn deco
 | diarization | [audio-cpp/Nemotron-3-Diarization-GGUF](https://huggingface.co/audio-cpp/Nemotron-3-Diarization-GGUF) `nemotron-3-diarization-q8_0.gguf` (107 MB) | [nvidia/Nemotron-3-Diarization](https://huggingface.co/nvidia/Nemotron-3-Diarization) | see model card |
 
 `scripts/fetch_models.sh` downloads both and verifies them at value level.
+
+LiteRT backend (`--backend litert_cpu`, branch `litert`): `xasr_stream_q8_octav.tflite` (153 MB, X-ASR streaming encoder, dynamic int8) and `sortformer_int8_f190.tflite` (101 MB, diarizer, dynamic int8, F_max 190). Not yet published; see [docs/LITERT.md](docs/LITERT.md) for how they are produced.
 
 ## Input
 
