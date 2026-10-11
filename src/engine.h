@@ -17,6 +17,10 @@
 #include <vector>
 
 #include "diar_crispasr.h"
+#ifdef NEMO_WITH_LITERT
+#include "diar_litert.h"
+#include "xasr_litert.h"
+#endif
 #include "fusion.h"
 
 namespace nemo {
@@ -129,6 +133,10 @@ struct Config {
     // on all 11 clips and measured faster than audio.cpp's own graph on the phone once its activation
     // allocation was fixed (docs/one-runtime-merge.md SS25-26). --no-diar-native restores the old path.
     bool diar_native  = true;
+    // Diarizer graph runtime (dev bench): "ggml" (default) | "litert_cpu" | "litert_gpu". litert_* need diar_native.
+    std::string backend = "ggml";
+    std::string diar_tflite;        // sortformer_int8_f190.tflite (used by litert_*)
+    std::string xasr_tflite;        // streaming X-ASR encoder, xasr_stream_q8_octav.tflite (used by litert_*)
 };
 
 struct Segment {
@@ -206,7 +214,13 @@ private:
     void* session_ = nullptr;
     void* diar_request_ = nullptr;
     std::vector<double> piece_ms_;
-    std::unique_ptr<DiarCrispASR> diar_crispasr_;   // set only when cfg_.diar_native
+    std::unique_ptr<DiarCrispASR> diar_crispasr_;   // set only when cfg_.diar_native and backend == ggml
+#ifdef NEMO_WITH_LITERT
+    std::unique_ptr<DiarLiteRT> diar_litert_;       // set only when cfg_.diar_native and backend is litert_*
+    std::unique_ptr<XasrLiteRT> xasr_litert_;       // set only when backend is litert_* (replaces the ggml chunk graph)
+#endif
+    // The external-encoder hook's user_data: whichever diarizer is active, behind one callable.
+    std::function<std::vector<float>(const std::vector<float>&, int64_t, int64_t, const std::vector<int64_t>&)> diar_encode_;
 };
 
 double rss_mb();      // VmHWM, peak resident set of this process

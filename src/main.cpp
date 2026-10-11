@@ -155,6 +155,9 @@ int main(int argc, char** argv) {
         else if (a == "--no-diar") cfg.skip_diar = true;
         else if (a == "--diar-native") cfg.diar_native = true;
         else if (a == "--no-diar-native") cfg.diar_native = false;
+        else if (a == "--backend") cfg.backend = next("--backend");
+        else if (a == "--diar-tflite") cfg.diar_tflite = next("--diar-tflite");
+        else if (a == "--xasr-tflite") cfg.xasr_tflite = next("--xasr-tflite");
         else if (a == "--live") live = true;
         else if (a == "--json") json = true;
         else if (a == "--turns-out") { turns_path = next("--turns-out"); turns_out = true; }

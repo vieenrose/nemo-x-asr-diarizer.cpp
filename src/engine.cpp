@@ -19,6 +19,10 @@
 
 #include <ctime>
 
+#ifdef NEMO_WITH_LITERT
+#include "diar_litert.h"
+#include "xasr_litert.h"
+#endif
 #include "xasr.h"                       // CrispASR (MIT) - x-asr streaming Zipformer2
 #include "audiocpp.h"                   // audio.cpp (Apache-2.0) - Nemotron-3 diarization stream
 
@@ -33,11 +37,27 @@ static int diar_native_encode(
     const float* embeddings, int64_t batch, int64_t frames, int64_t hidden,
     const int64_t* valid_frames,
     float** out_probabilities, int64_t* out_len) {
-    auto* diar = static_cast<DiarCrispASR*>(user_data);
+    auto* encode = static_cast<std::function<std::vector<float>(
+        const std::vector<float>&, int64_t, int64_t, const std::vector<int64_t>&)>*>(user_data);
     try {
         std::vector<float> emb(embeddings, embeddings + batch * frames * hidden);
         std::vector<int64_t> vf(valid_frames, valid_frames + batch);
-        auto probs = diar->encode(emb, batch, frames, vf);
+        auto probs = (*encode)(emb, batch, frames, vf);
+        // Dev-only: NEMO_DUMP_DIAR_WINDOWS=<dir> records each window (embeddings, valid, probs) for the
+        // LiteRT parity gate (tools/litert-export/g2_compare.py).
+        if (const char* dd = std::getenv("NEMO_DUMP_DIAR_WINDOWS")) {
+            static int n = 0;
+            char path[512];
+            const auto dump = [&](const char* ext, const void* p, size_t bytes) {
+                std::snprintf(path, sizeof path, "%s/win_%04d.%s", dd, n, ext);
+                if (FILE* f = std::fopen(path, "wb")) { std::fwrite(p, 1, bytes, f); std::fclose(f); }
+            };
+            dump("emb.f32", emb.data(), emb.size() * sizeof(float));
+            dump("probs.f32", probs.data(), probs.size() * sizeof(float));
+            const int64_t meta[3] = {frames, hidden, vf[0]};
+            dump("meta.i64", meta, sizeof meta);
+            n++;
+        }
         float* buf = static_cast<float*>(std::malloc(probs.size() * sizeof(float)));
         if (!buf) return 1;
         std::memcpy(buf, probs.data(), probs.size() * sizeof(float));
@@ -162,6 +182,19 @@ bool Engine::init(std::string& err) {
         ::setenv("CRISPASR_GGUF_PREFIX", cfg_.asr_gguf_prefix.c_str(), 1);
         asr_ctx_ = xasr_init_from_file(cfg_.xasr_model.c_str(), p);
         if (!asr_ctx_) { err = "x-asr model failed to load: " + cfg_.xasr_model; return false; }
+#ifdef NEMO_WITH_LITERT
+        if (cfg_.backend != "ggml") {
+            if (cfg_.xasr_tflite.empty()) { err = "--xasr-tflite required for backend " + cfg_.backend; return false; }
+            try {
+                xasr_litert_ = std::make_unique<XasrLiteRT>(cfg_.xasr_tflite, cfg_.threads,
+                                                            cfg_.backend == "litert_gpu" ? "gpu" : "cpu");
+            } catch (const std::exception & e) { err = std::string("xasr litert: ") + e.what(); return false; }
+            xasr_set_external_chunk_encoder((xasr_context*)asr_ctx_, nemo::xasr_litert_chunk_cb,
+                                            nemo::xasr_litert_reset_cb, xasr_litert_.get());
+        }
+#else
+        if (cfg_.backend != "ggml") { err = "this build has no LiteRT support (LITERT_SO_DIR at build time)"; return false; }
+#endif
         asr_stream_ = xasr_stream_init((xasr_context*)asr_ctx_);
         if (!asr_stream_) { err = "xasr_stream_init failed"; return false; }
     }
@@ -205,13 +238,31 @@ bool Engine::init(std::string& err) {
         if (st != AUDIOCPP_OK) { err = std::string("diar session (streaming): ") + audiocpp_last_error(); return false; }
         if (cfg_.diar_native) {
             try {
-                diar_crispasr_ = std::make_unique<DiarCrispASR>(cfg_.diar_model, cfg_.threads);
+                if (cfg_.backend == "ggml") {
+                    diar_crispasr_ = std::make_unique<DiarCrispASR>(cfg_.diar_model, cfg_.threads);
+                    DiarCrispASR* d = diar_crispasr_.get();
+                    diar_encode_ = [d](const std::vector<float>& e, int64_t b, int64_t f, const std::vector<int64_t>& v) {
+                        return d->encode(e, b, f, v);
+                    };
+                } else {
+#ifdef NEMO_WITH_LITERT
+                    // Bench-only LiteRT graph (litert_cpu / litert_gpu); same hook, same contract.
+                    diar_litert_ = std::make_unique<DiarLiteRT>(cfg_.diar_tflite, cfg_.threads,
+                                                                cfg_.backend == "litert_gpu" ? "gpu" : "cpu");
+                    DiarLiteRT* d = diar_litert_.get();
+                    diar_encode_ = [d](const std::vector<float>& e, int64_t b, int64_t f, const std::vector<int64_t>& v) {
+                        return d->encode(e, b, f, v);
+                    };
+#else
+                    throw std::runtime_error("built without LiteRT (set LITERT_SO_DIR in build_host.sh)");
+#endif
+                }
             } catch (const std::exception& e) {
-                err = std::string("diar_native: DiarCrispASR load failed: ") + e.what();
+                err = std::string("diar_native: diarizer load failed: ") + e.what();
                 return false;
             }
             st = audiocpp_nemotron3_diar_set_external_encoder(
-                (audiocpp_session*)session_, &diar_native_encode, diar_crispasr_.get());
+                (audiocpp_session*)session_, &diar_native_encode, &diar_encode_);
             if (st != AUDIOCPP_OK) {
                 err = std::string("diar_native: set_external_encoder: ") + audiocpp_last_error();
                 return false;

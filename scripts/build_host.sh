@@ -53,6 +53,16 @@ if [ -f "$ROOT/patches/crispasr-token-times.patch" ]; then
     echo "   NOTE: token-times patch does not apply to this CrispASR revision - attribution will infer timing"
   fi
 fi
+# External chunk encoder hook (LiteRT X-ASR path). Additive; the ggml path is unchanged when unused.
+if [ -f "$ROOT/patches/crispasr-chunk-hook.patch" ]; then
+  if git -C "$C" apply -R --check "$ROOT/patches/crispasr-chunk-hook.patch" 2>/dev/null; then
+    echo "   chunk-hook patch already applied"
+  elif git -C "$C" apply --check "$ROOT/patches/crispasr-chunk-hook.patch" 2>/dev/null; then
+    git -C "$C" apply "$ROOT/patches/crispasr-chunk-hook.patch" && echo "   applied chunk-hook patch"
+  else
+    echo "   NOTE: chunk-hook patch does not apply to this CrispASR revision"
+  fi
+fi
 cmake -S "$C" -B "$C/build-host" -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON >/dev/null
 for t in xasr crispasr-core ggml ggml-base ggml-cpu; do
   cmake --build "$C/build-host" --target "$t" -j"$THREADS" > /tmp/ar_crisp_host.log 2>&1 || {
@@ -74,14 +84,25 @@ if nm --defined-only "$C/build-host/src/libxasr.a" 2>/dev/null | grep -q xasr_st
 else
   echo "   exact token timestamps: NOT available (inferred placement will be used)"
 fi
-g++ -O2 -std=c++17 $INC -c "$ROOT/src/engine.cpp" -o "$ROOT/build/engine.o"
+# Bench-only LiteRT diarizer graph: built only when LITERT_SO_DIR points at a libLiteRt.so (C API headers are
+# LITERT_INC_DIR = parent of the litert/ headers). Default build is unchanged.
+LRT_DEFS=""; LRT_OBJS=""; LRT_LIBS=""
+if [ -n "${LITERT_SO_DIR:-}" ]; then
+  LRT_INC="-I${LITERT_INC_DIR:?set LITERT_INC_DIR to a dir containing litert/c/*.h}"
+  g++ -O2 -std=c++17 -DNEMO_WITH_LITERT $INC $LRT_INC -c "$ROOT/src/litert_graph.cc" -o "$ROOT/build/litert_graph.o"
+  g++ -O2 -std=c++17 -DNEMO_WITH_LITERT $INC $LRT_INC -c "$ROOT/src/diar_litert.cc" -o "$ROOT/build/diar_litert.o"
+  g++ -O2 -std=c++17 -DNEMO_WITH_LITERT $INC $LRT_INC -c "$ROOT/src/xasr_litert.cc" -o "$ROOT/build/xasr_litert.o"
+  LRT_DEFS="-DNEMO_WITH_LITERT"; LRT_OBJS="$ROOT/build/litert_graph.o $ROOT/build/diar_litert.o $ROOT/build/xasr_litert.o"
+  LRT_LIBS="-L $LITERT_SO_DIR -l:libLiteRt.so -Wl,-rpath,$LITERT_SO_DIR"
+fi
+g++ -O2 -std=c++17 $LRT_DEFS $INC -c "$ROOT/src/engine.cpp" -o "$ROOT/build/engine.o"
 g++ -O2 -std=c++17 $INC -c "$ROOT/src/fusion.cpp" -o "$ROOT/build/fusion.o"
-g++ -O2 -std=c++17 $INC -c "$ROOT/src/main.cpp"  -o "$ROOT/build/main.o"
+g++ -O2 -std=c++17 $LRT_DEFS $INC -c "$ROOT/src/main.cpp"  -o "$ROOT/build/main.o"
 # diar_crispasr.cpp needs CrispASR's ggml headers directly (docs/one-runtime-merge.md SS16: it builds the
 # diar encoder+head on CrispASR's own ggml, the actual one-runtime merge) - a separate include path from the
 # rest of the composite, which only ever saw ggml through xasr.h/audiocpp.h's own C APIs before this.
 g++ -O2 -std=c++17 $INC $GGML_INC -c "$ROOT/src/diar_crispasr.cpp" -o "$ROOT/build/diar_crispasr.o"
-g++ "$ROOT/build/engine.o" "$ROOT/build/fusion.o" "$ROOT/build/main.o" "$ROOT/build/diar_crispasr.o" \
+g++ "$ROOT/build/engine.o" "$ROOT/build/fusion.o" "$ROOT/build/main.o" "$ROOT/build/diar_crispasr.o" $LRT_OBJS $LRT_LIBS \
     -o "$ROOT/build/nemo-x-asr-diarizer" \
     -L "$A/build-host/bin" -l:libaudiocpp.so \
     "$C/build-host/src/libxasr.a" "$C/build-host/src/libcrispasr-core.a" \
