@@ -118,7 +118,7 @@ compute: mel, pre-encode (0.05% of time), windowing, speaker cache and turn deco
 
 `scripts/fetch_models.sh` downloads both and verifies them at value level.
 
-LiteRT backend (`--backend litert_cpu`, branch `litert`): `xasr_stream_q8_octav.tflite` (153 MB, X-ASR streaming encoder, dynamic int8) and `sortformer_int8_f190.tflite` (101 MB, diarizer, dynamic int8, F_max 190). Not yet published; see [docs/LITERT.md](docs/LITERT.md) for how they are produced.
+LiteRT backend (`--backend litert_cpu`, branch `litert-port`): `xasr_stream_q8_octav.tflite` (153 MB, X-ASR streaming encoder, dynamic int8) and `sortformer_int8_f190.tflite` (101 MB, diarizer, dynamic int8, F_max 190). Not yet published; see [docs/LITERT.md](docs/LITERT.md) for how they are produced.
 
 ## Known limits
 
