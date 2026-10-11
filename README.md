@@ -195,6 +195,25 @@ diarization core - both runtimes found the same speaker turns.
 Harness code: `compare/ort/android/` (ONNX Runtime) and `compare/litert/` (LiteRT), not part of the shipped
 binary - built to measure this comparison, not to deploy.
 
+## LiteRT backend (experimental)
+
+The two neural graphs (X-ASR streaming encoder and Nemotron-3 Sortformer) can run on
+[LiteRT](https://ai.google.dev/edge/litert) with dynamic int8 weights, selected by `--backend litert_cpu`.
+Feature extraction, decoder, joiner, scheduler and fusion stay shared with the ggml build. This is a
+host-side benchmark path for now; the default `--backend ggml` is unchanged.
+
+```bash
+LITERT_SO_DIR=<dir with libLiteRt.so> LITERT_INC_DIR=<litert headers> ALLOW_DEPS_DRIFT=1 scripts/build_host.sh
+./build/nemo-x-asr-diarizer --audio clip.wav --backend litert_cpu \
+    --xasr-tflite xasr_stream_q8_octav.tflite --diar-tflite sortformer_int8_f190.tflite \
+    --xasr-model models/x-asr-zh-en-q8_0.gguf
+```
+
+On a 600 s EN2002a excerpt (host CPU): LiteRT int8 runs at RTF 0.11 with 728 MB peak RSS, against 0.25 and
+517 MB for ggml q8. DER (collar 0.25, [120, 720) s) is 19.08 % against 18.66 %. The 60 s ASR transcripts are
+identical word for word; over 600 s the ASR-only transcripts agree at 98.1 %. GPU, Android and iOS are not
+measured yet. Details and the open items are in [docs/LITERT.md](docs/LITERT.md).
+
 ## Build and run
 
 Needs the pinned upstreams in `deps.lock`. Published on the `nemo-x-asr-diarizer` branch of
@@ -225,6 +244,7 @@ Useful flags:
 | `--diar-threshold`, `--diar-opt K=V` | diarizer decode config (defaults: threshold 0.3, pad 45 frames) |
 | `--diar-session-opt K=V` | diarizer streaming geometry, e.g. `nemotron_3_diar.chunk_len=25` (latency vs RTF) |
 | `XASR_RESET_BLANK_FRAMES=N` | ASR decoder-context reset after N silent 40 ms frames (default 25; 0 = off) |
+| `--backend ggml\|litert_cpu` | ASR and diarizer graph runtime (LiteRT needs `--xasr-tflite` and `--diar-tflite`) |
 | `XASR_JOINT_Q8=1` | ~5-7% faster ASR leg; WER moves on some clips, so off by default |
 
 ## Known limits
@@ -249,6 +269,7 @@ Useful flags:
   phone findings, resampling, missing words
 - [docs/one-runtime-merge.md](docs/one-runtime-merge.md): how the diarizer was moved onto the shared
   runtime, including the dead ends
+- [docs/LITERT.md](docs/LITERT.md): LiteRT backend status, numbers and open items
 - [docs/pipeline-design.md](docs/pipeline-design.md): performance work (dotprod, joint, KleidiAI, …)
 
 ## Provenance
