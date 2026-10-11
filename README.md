@@ -28,30 +28,39 @@ Both graphs now run on LiteRT behind `--backend litert_cpu`:
 | Diarizer int8 LiteRT vs ggml q8, 16 real windows | 99.95 % of frame×speaker decisions agree |
 | Diarizer fp32 LiteRT vs torch | max abs diff 5.7e-6 |
 
-## LiteRT vs ggml: comparison (EN2002a excerpt, 600 s, host CPU)
+## LiteRT vs ggml: comparison (host CPU, 600 s excerpts of AMI EN2002a/b/c)
+
+Diarization error rate, md-eval-22, collar 0.25, full 600 s of each excerpt (each starts 120 s into its meeting):
+
+| Excerpt | ggml q8 | LiteRT int8 | LiteRT int8 minus ggml | LiteRT fp32 diarizer |
+|---|---|---|---|---|
+| EN2002a | 17.33 % | 17.72 % | +0.39 pt | 16.82 % |
+| EN2002b | 22.41 % | 22.43 % | +0.02 pt | not run |
+| EN2002c | 11.13 % | 10.90 % | -0.23 pt | not run |
+
+Speed, memory and transcript agreement (EN2002a):
 
 | | ggml q8 | LiteRT int8 | difference |
 |---|---|---|---|
-| Peak RSS | 517 MB | 728 MB | LiteRT +211 MB |
-| RTF (ASR + diar) | 0.25 | 0.11 | LiteRT about 2.3x faster |
-| DER, collar 0.25, [120, 720) s | 18.66 % | 19.08 % | +0.42 pt |
-| Speaker turns / speakers | 430 / 4 | 486 / 4 | same speaker count |
+| Peak RSS | 517 MB | 728 MB | LiteRT +211 MB (fp32 diarizer: 1289 MB) |
+| RTF (ASR + diar) | 0.25 | 0.11 | LiteRT about 2.3x faster (fp32 diarizer: 0.15) |
+| Speaker count | 4 | 4 | same |
 | ASR-only transcript similarity (600 s) | reference | 98.1 % (word level) | small deletions and substitutions |
 | Full transcript, labels and punctuation removed | reference | 99.0 % | |
 
 **Reading the comparison.**
 
-- **Accuracy:** on this clip the two backends are close (0.4 DER point). The ASR transcripts are identical
-  on 60 s and differ by small word-level edits over 600 s, which is consistent with int8 quantization in the
+- **Accuracy:** on the three excerpts the LiteRT int8 pipeline and ggml q8 are equivalent: the DER difference
+  is +0.39, +0.02 and -0.23 point (mean +0.06), with no consistent sign. The 60 s ASR transcripts are
+  identical, and over 600 s they differ by small word-level edits consistent with int8 quantization of the
   encoder.
-- **Likely source of the DER gap:** the diarizer int8 weights. An earlier host run on the same clip gave
-  LiteRT fp32 17.88 % against ggml 17.80 %, and int8 19.87 %. The fp32 full-pipeline DER has not been measured
-  yet, so this is not isolated.
-- **Cost:** LiteRT uses more memory here and is faster on this CPU. The GPU backend, Android and iOS are not
+- **fp32 diarizer:** on EN2002a it is 0.5 point better than int8, at twice the memory. One clip only, so
+  it is not evidence of an int8 loss on the diarizer.
+- **Cost:** LiteRT uses more memory and is faster on this CPU. The GPU backend, Android and iOS are not
   measured yet.
 
-Not yet done: GPU backend (ML Drift), Android (Note10+) and iOS (iPhone 14 Pro Max) benchmarks, a second
-evaluation clip (AMI or AISHELL-4), and the fp32 full-pipeline DER. Details in [docs/LITERT.md](docs/LITERT.md).
+Not yet done: GPU backend (ML Drift), Android (Note10+) and iOS (iPhone 14 Pro Max) benchmarks, speed and
+memory on EN2002b/c, and a non-English clip. Details in [docs/LITERT.md](docs/LITERT.md).
 
 ## Build and run (host)
 
