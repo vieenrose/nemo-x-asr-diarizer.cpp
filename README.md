@@ -1,16 +1,76 @@
-# nemo-x-asr-diarizer.cpp
+# nemo-x-asr-diarizer.cpp (LiteRT branch)
 
-Streaming speech recognition **and** speaker diarization in one process, on one audio timeline, on a phone CPU.
+Streaming speech recognition and speaker diarization in one process, on one audio timeline.
 
 - **Words:** [X-ASR](https://huggingface.co/cstr/x-asr-zh-en-GGUF), a streaming Zipformer2 transducer (zh + en).
 - **Speakers:** Nemotron-3 Diarization (streaming Sortformer, up to 8 speakers).
 - **Fusion:** a small attribution layer that tags each word with who said it.
 
-C++17 + ggml (CPU), with an experimental LiteRT backend for both neural graphs (`--backend litert_cpu`). No Python at runtime. On the same phone it replaces a 1.5B ASR+diarize LLM at ~2x
-lower RTF and ~5x less memory, with lower WER and far better speaker attribution; see [Results](#results).
+This branch ports both neural graphs to **LiteRT** (dynamic int8) and compares them with the ggml build.
+Everything else (fbank, decoder, joiner, scheduler, fusion) is shared. The ggml path stays the default.
 
-**Latency:** words appear ~0.4 s after they are spoken; speaker labels are confirmed ~5 s behind the audio
-(configurable, see [Known limits](#known-limits)).
+## LiteRT port: result
+
+Both graphs now run on LiteRT behind `--backend litert_cpu`:
+
+- **X-ASR streaming encoder** (480 ms chunks, 116 carried state tensors): `xasr_stream_q8_octav.tflite`,
+  153 MB, dynamic int8 with OCTAV. Exported from the trainable torch checkpoint; a CrispASR chunk hook
+  (`patches/crispasr-chunk-hook.patch`) replaces the ggml graph compute.
+- **Sortformer diarizer** (encoder and head, F_max 190): `sortformer_int8_f190.tflite`, 101 MB, dynamic int8.
+
+### Equivalence checks
+
+| Check | Result |
+|---|---|
+| X-ASR fp32 LiteRT vs torch (10 chunks) | max abs diff 4.9e-6 |
+| X-ASR torch streaming vs chunk-480ms ONNX | 2.4e-6 |
+| X-ASR ASR-only, 60 s clip | transcript identical to ggml, word for word (194 words) |
+| Diarizer int8 LiteRT vs ggml q8, 16 real windows | 99.95 % of frame×speaker decisions agree |
+| Diarizer fp32 LiteRT vs torch | max abs diff 5.7e-6 |
+
+## LiteRT vs ggml: comparison (EN2002a excerpt, 600 s, host CPU)
+
+| | ggml q8 | LiteRT int8 | difference |
+|---|---|---|---|
+| Peak RSS | 517 MB | 728 MB | LiteRT +211 MB |
+| RTF (ASR + diar) | 0.25 | 0.11 | LiteRT about 2.3x faster |
+| DER, collar 0.25, [120, 720) s | 18.66 % | 19.08 % | +0.42 pt |
+| Speaker turns / speakers | 430 / 4 | 486 / 4 | same speaker count |
+| ASR-only transcript similarity (600 s) | reference | 98.1 % (word level) | small deletions and substitutions |
+| Full transcript, labels and punctuation removed | reference | 99.0 % | |
+
+**Reading the comparison.**
+
+- **Accuracy:** on this clip the two backends are close (0.4 DER point). The ASR transcripts are identical
+  on 60 s and differ by small word-level edits over 600 s, which is consistent with int8 quantization in the
+  encoder.
+- **Likely source of the DER gap:** the diarizer int8 weights. An earlier host run on the same clip gave
+  LiteRT fp32 17.88 % against ggml 17.80 %, and int8 19.87 %. The fp32 full-pipeline DER has not been measured
+  yet, so this is not isolated.
+- **Cost:** LiteRT uses more memory here and is faster on this CPU. The GPU backend, Android and iOS are not
+  measured yet.
+
+Not yet done: GPU backend (ML Drift), Android (Note10+) and iOS (iPhone 14 Pro Max) benchmarks, a second
+evaluation clip (AMI or AISHELL-4), and the fp32 full-pipeline DER. Details in [docs/LITERT.md](docs/LITERT.md).
+
+## Build and run (host)
+
+```bash
+scripts/fetch_models.sh        # ggml GGUFs for the reference path, verified
+LITERT_SO_DIR=<dir with libLiteRt.so> LITERT_INC_DIR=<litert headers> ALLOW_DEPS_DRIFT=1 scripts/build_host.sh
+
+# LiteRT
+./build/nemo-x-asr-diarizer --audio clip.wav --backend litert_cpu \
+    --xasr-tflite xasr_stream_q8_octav.tflite --diar-tflite sortformer_int8_f190.tflite \
+    --xasr-model models/x-asr-zh-en-q8_0.gguf
+
+# ggml (default)
+./build/nemo-x-asr-diarizer --audio clip.wav --json --turns-out turns.json
+```
+
+The LiteRT `.tflite` files are not published; `tools/litert-export/` contains the export and quantization
+scripts. Speaker turns and transcripts are the same format on both backends.
+
 
 ## Architecture
 
@@ -59,195 +119,6 @@ compute: mel, pre-encode (0.05% of time), windowing, speaker cache and turn deco
 `scripts/fetch_models.sh` downloads both and verifies them at value level.
 
 LiteRT backend (`--backend litert_cpu`, branch `litert`): `xasr_stream_q8_octav.tflite` (153 MB, X-ASR streaming encoder, dynamic int8) and `sortformer_int8_f190.tflite` (101 MB, diarizer, dynamic int8, F_max 190). Not yet published; see [docs/LITERT.md](docs/LITERT.md) for how they are produced.
-
-## Input
-
-Both models consume **16 kHz mono**, so that is the pipeline's native input: a 16 kHz mono 16-bit PCM WAV
-goes straight in with no conversion. Other rates and channel counts are also accepted and converted
-in-process (channel mixdown, then Lanczos3 resampling to 16 kHz). Unlike the VibeASR baseline, which runs at
-24 kHz, nothing needs converting ahead of time. The only supported encoding is PCM16 WAV.
-
-## Output
-
-Matches the sibling ASR archive's streaming convention, so its WER and speaker-attribution scorers run on it
-directly:
-
-```
-[1/12]
- Speaker 0:一次次存取不同的视角
-[2/12]
- Speaker 1:。黄灯的十字路口
-```
-
-## Results
-
-Phone: Oppo CPH2371 (Dimensity 1300), `taskset C0` (the two A78 prime cores), `--threads 2`.
-Models: see [Models](#models).
-
-| | RTF | peak RSS | first text |
-|---|---|---|---|
-| 1.5B ASR+diarize baseline (armed) | 1.2231 | 2198 MB | 2.93 s |
-| this composite (armed) | 0.4627 | 396 MB | 0.32 s |
-| this composite, current build* | **0.60** | **375 MB** | 0.40 s (speaker turns: 5.0 s) |
-
-\* `gate_ms_v2` (45 s, bilingual, 4 speakers). The current build adds ARM dotprod, the unified runtime and
-4 s diarizer chunks (turns commit at 5 s instead of 30.5 s, which costs RTF 0.42 -> 0.60), and an ASR decoder
-reset at pauses (fewer dropped words). It was measured back-to-back in a working session, not under the
-armed/witnessed protocol of the first two rows.
-
-### Accuracy vs the on-edge baseline and the accuracy reference
-
-- **VibeASR streaming 1.5B:** the on-edge baseline, run on the same phone with its official measurement
-  config (int8 VAE, q8-head LM, `taskset C0`, 2 threads).
-- **VibeASR streaming 7B (q4_k):** the transcription accuracy reference only, not a deployment target. It
-  ran on the host (16 threads).
-- **This composite:** run on the phone, current build.
-
-Same 12 clips and scorer for all three (`score_stream.py`). `[Noise]`-style event tags are stripped from the
-7B output. `gate_long` is 5.6 min, 6 voices, 44 zh/en switches (`tools/build_gate_long.py`).
-
-**Transcription (WER, lower is better)**
-
-| clip | 1.5B | 7B (reference) | composite |
-|---|---|---|---|
-| gate_ms | 0.144 | **0.082** | 0.155 |
-| gate_ms_g100 | 0.227 | **0.113** | 0.165 |
-| gate_ms_g1000 | 0.196 | **0.082** | 0.144 |
-| gate_ms_v2 | 0.176 | **0.165** | 0.176 |
-| gate_long | 0.210 | **0.134** | 0.162 |
-| control_ls (en) | 0.055 | 0.053 | **0.044** |
-| holdout_en | 0.264 | **0.236** | 0.259 |
-| holdout_en_aligned | 0.250 | **0.227** | 0.255 |
-| holdout_zh | 0.154 | **0.085** | **0.085** |
-| holdout_zh2 | 0.120 | 0.089 | **0.047** |
-| holdout_zh_aligned | 0.169 | 0.100 | **0.079** |
-| holdout_zh_ph35200 | 0.165 | **0.083** | **0.083** |
-| **all 12 (micro)** | 0.167 | **0.112** | 0.117 |
-
-**Who spoke** (multi-speaker clips; share of reference words with the right / wrong speaker; the rest were not
-transcribed; the reference here is the ground-truth manifest):
-
-| clip | 1.5B | 7B | composite |
-|---|---|---|---|
-| gate_ms | 43 / 57 % | 43 / 57 % | **96 / 0 %** |
-| gate_ms_g100 | 43 / 57 % | 43 / 57 % | **96 / 0 %** |
-| gate_ms_g1000 | 38 / 61 % | 72 / 28 % | **100 / 0 %** |
-| gate_ms_v2 | 58 / 42 % | **95 / 0 %** | 84 / 6 % |
-| gate_long | 35 / 54 % | 39 / 59 % | **86 / 3 %** |
-| **mean** | 44 / 54 % | 59 / 40 % | **92 / 2 %** |
-
-Both VibeASR sizes mostly collapse the speakers into one or two labels (1-2 of 4-6 voices used, all clips but
-`gate_ms_v2`). So the 7B is a transcription reference, not a speaker reference.
-
-Versus the 7B reference, the composite:
-- **Transcription:** 0.117 vs 0.112 micro WER (+0.005). It is better on Chinese, worse on English and on
-  mixed-language clips.
-- **Who spoke:** separates the speakers that both VibeASR models merge.
-- **Resources:** runs on the phone at RTF 0.60 in ~430 MB, with speaker turns ~5 s behind the audio.
-
-### Same design, three runtimes: ggml vs ONNX Runtime vs LiteRT
-
-The ggml composite above is this project's own implementation. To see what the *design* (streaming x-asr +
-Nemotron-3 diarization + fusion) costs on the two other runtimes that ship prebuilt Android binaries for
-these models, we built independent native harnesses against each and ran them on the same phone, same
-`gate_ms_v2` clip, same scorer:
-
-- **ONNX Runtime:** [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)'s streaming x-asr export (identical
-  480 ms chunking) + a from-scratch C++ port of Nemotron-3's Arrival-Order Speaker Cache against the raw
-  ONNX diarization graph (no official wrapper exists for it). Same streaming geometry as the ggml build
-  (128/40/60 cache/FIFO/update-period, 4 s chunks).
-- **LiteRT:** [`Luigi/xasr-litert`](https://huggingface.co/Luigi/xasr-litert) (an **offline** zipformer2
-  export - fixed 3.75-30 s blocks, no carried encoder state across them; only the transducer decoder's
-  2-token context is carried here as a practical approximation) +
-  [`litert-community/Nemotron-3-Diarization-LiteRT`](https://huggingface.co/litert-community/Nemotron-3-Diarization-LiteRT)'s
-  own published streaming profile (0.72 s steps, 264/264 cache/FIFO - a different, higher-latency operating
-  point than the ggml/ORT builds, fixed by that export's compiled graph shape).
-
-| | RTF | peak RSS | WER | who spoke right/wrong |
-|---|---|---|---|---|
-| ggml (this project) | **0.60** | **375 MB** | **0.117** (micro, 12 clips) | **92 / 2 %**\* |
-| ONNX Runtime | 0.67 | 413 MB | 0.137 (micro, 12 clips) | 73 / 9 %\* |
-| LiteRT | 14.58 | 1935 MB | 0.247 (`gate_ms_v2` only\*\*) | 49 / 32 % (`gate_ms_v2` only\*\*) |
-
-\* mean over the 5 multi-speaker gate clips, same convention as the table above (share of reference words
-with the right/wrong speaker; the rest weren't transcribed).
-\*\* LiteRT ran only on `gate_ms_v2` (45 s) - at this RTF, the full 12-clip/`gate_long` suite would take
-hours on this phone; see why below.
-
-**Why LiteRT is 24x slower here.** The diarization graphs compile cleanly to the CPU XNNPACK delegate (100%
-of nodes delegated, one partition each) and produce turn boundaries matching the other two backends almost
-exactly (validated independently before fusing: `speaker_0: 0.43s-1.42s`, `speaker_1: 2.18s-7.04s`, ... -
-same segments ggml and ORT find). The diarization encoder is a 199 MB fp16 model that
-[its own README](https://huggingface.co/litert-community/Nemotron-3-Diarization-LiteRT) measures at
-RTF 0.16-0.24 - *on a Galaxy S26's GPU delegate*. This phone (Oppo CPH2371, Dimensity 1300) has no GPU
-accelerator LiteRT could load (`GPU accelerator could not be loaded and registered`), so the whole
-199 MB transformer runs on CPU instead, at RTF ~14.4 for the diarizer alone (646 s for 45 s of audio). The
-ASR side is unaffected and fast (RTF 0.21) since it was built for CPU (int8) from the start. Peak RSS is
-also far higher: LiteRT keeps all four of xasr-litert's fixed-length encoder signatures (375/750/1500/3000
-frames) resident at once, plus both diarization graphs, with no cross-graph memory sharing.
-**Takeaway:** LiteRT's own numbers are real, but they assume a GPU delegate; on CPU-only phones (most
-budget/midrange Android hardware, including this one) this design is not competitive with ggml or ORT.
-
-**Why ORT is close but not equal to ggml on "who spoke".** Same streaming geometry and the same (corrected)
-AOSC algorithm, but a coarser word-to-turn fusion: the ORT harness places each ASR word at its sherpa-onnx
-token timestamp and snaps to the nearest turn within 2 s, where ggml's `fusion.cpp` does boundary-aware,
-word-majority attribution (see [Output](#output) and `docs/findings.md`). The gap is in the fusion, not the
-diarization core - both runtimes found the same speaker turns.
-
-Harness code: `compare/ort/android/` (ONNX Runtime) and `compare/litert/` (LiteRT), not part of the shipped
-binary - built to measure this comparison, not to deploy.
-
-## LiteRT backend (experimental)
-
-The two neural graphs (X-ASR streaming encoder and Nemotron-3 Sortformer) can run on
-[LiteRT](https://ai.google.dev/edge/litert) with dynamic int8 weights, selected by `--backend litert_cpu`.
-Feature extraction, decoder, joiner, scheduler and fusion stay shared with the ggml build. This is a
-host-side benchmark path for now; the default `--backend ggml` is unchanged.
-
-```bash
-LITERT_SO_DIR=<dir with libLiteRt.so> LITERT_INC_DIR=<litert headers> ALLOW_DEPS_DRIFT=1 scripts/build_host.sh
-./build/nemo-x-asr-diarizer --audio clip.wav --backend litert_cpu \
-    --xasr-tflite xasr_stream_q8_octav.tflite --diar-tflite sortformer_int8_f190.tflite \
-    --xasr-model models/x-asr-zh-en-q8_0.gguf
-```
-
-On a 600 s EN2002a excerpt (host CPU): LiteRT int8 runs at RTF 0.11 with 728 MB peak RSS, against 0.25 and
-517 MB for ggml q8. DER (collar 0.25, [120, 720) s) is 19.08 % against 18.66 %. The 60 s ASR transcripts are
-identical word for word; over 600 s the ASR-only transcripts agree at 98.1 %. GPU, Android and iOS are not
-measured yet. Details and the open items are in [docs/LITERT.md](docs/LITERT.md).
-
-## Build and run
-
-Needs the pinned upstreams in `deps.lock`. Published on the `nemo-x-asr-diarizer` branch of
-[audio.cpp](https://github.com/vieenrose/audio.cpp), [CrispASR](https://github.com/vieenrose/CrispASR) and
-[ggml](https://github.com/vieenrose/ggml).
-
-```bash
-scripts/fetch_models.sh        # two GGUFs, verified
-scripts/build_host.sh          # -> build/nemo-x-asr-diarizer
-./build/nemo-x-asr-diarizer --audio clip.wav --windows
-./build/nemo-x-asr-diarizer --audio clip.wav --json --turns-out turns.json --live
-```
-
-Android (arm64-v8a, NDK r26): `scripts/build_android.sh`. On device, set `--threads` to the number of cores
-in the mask:
-
-```bash
-adb shell "cd /data/local/tmp/nemo && LD_LIBRARY_PATH=. taskset C0 ./nemo-x-asr-diarizer --audio clip.wav -t 2"
-```
-
-Useful flags:
-
-| flag | effect |
-|---|---|
-| `--windows` | `[k/N]` blocks every 2.93 s (drop-in for the VibeASR harness) |
-| `--live` | print provisional segments as they close |
-| `--no-diar-native` | run the diarizer encoder on audio.cpp's own ggml (old path) |
-| `--diar-threshold`, `--diar-opt K=V` | diarizer decode config (defaults: threshold 0.3, pad 45 frames) |
-| `--diar-session-opt K=V` | diarizer streaming geometry, e.g. `nemotron_3_diar.chunk_len=25` (latency vs RTF) |
-| `XASR_RESET_BLANK_FRAMES=N` | ASR decoder-context reset after N silent 40 ms frames (default 25; 0 = off) |
-| `--backend ggml\|litert_cpu` | ASR and diarizer graph runtime (LiteRT needs `--xasr-tflite` and `--diar-tflite`) |
-| `XASR_JOINT_Q8=1` | ~5-7% faster ASR leg; WER moves on some clips, so off by default |
 
 ## Known limits
 
