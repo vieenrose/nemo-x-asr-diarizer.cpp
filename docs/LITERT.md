@@ -39,9 +39,28 @@ Speed and memory (EN2002a, ASR + diarizer):
 - Earlier numbers (18.66 % / 19.08 % on EN2002a) were scored over the last 480 s of the excerpt only, because
   of a window shift in the scoring script; they are superseded by the table above.
 
+## Android (Note10+, CPU)
+
+Build: `scripts/build_android.sh` with `LITERT_LIB_DIR` (Android `libLiteRt.so`) and `LITERT_INC_DIR` set
+(compiles with `-DNEMO_WITH_LITERT -DNEMO_LITERT_ENV_API`; the chunk hook patch must be applied to CrispASR).
+Galaxy Note10+, 4 cores (`taskset f0`), EN2002a excerpt, 600 s, DER md-eval collar 0.25:
+
+| | ggml q8 | LiteRT CPU int8 |
+|---|---|---|
+| DER | 17.64 % | 17.20 % |
+| RTF | 0.314 | 0.265 |
+| Peak RSS | 498 MB | 753 MB |
+
+On 60 s, CPU int8 RTF is 0.175 vs 0.246 for ggml (RSS 651 vs 397 MB) and the transcripts are identical.
+
+GPU was measured and dropped (target is CPU only). Findings, for the record:
+
+- The int8 X-ASR graph delegates only 177 of 3517 ops to LiteRT CL; partial delegation fails to compile. The ASR graph is CPU only in any case.
+- The diarizer needs `export_sortformer.py --float-valid` (no INT64 ops) to delegate fully (2186/2186 ops).
+- Diarizer on GPU, int8: DER 18.10 %, RTF 0.287, RSS 831 MB. fp32 (395 MB): DER 16.82 %, RTF 0.290, RSS 1400 MB.
+  Neither beats CPU int8 on speed or memory.
+
 ## Not done
 
-- GPU backend (ML Drift) on host and devices.
-- Android (Note10+) and iOS (iPhone 14 Pro Max) integration and benchmarks.
+- iOS (iPhone 14 Pro Max) integration and benchmarks, CPU only.
 - Speed and memory on EN2002b/c and a non-English clip (AISHELL-4).
-- Full report with latency and RSS per device.

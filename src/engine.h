@@ -133,7 +133,7 @@ struct Config {
     // on all 11 clips and measured faster than audio.cpp's own graph on the phone once its activation
     // allocation was fixed (docs/one-runtime-merge.md SS25-26). --no-diar-native restores the old path.
     bool diar_native  = true;
-    // Diarizer graph runtime (dev bench): "ggml" (default) | "litert_cpu" | "litert_gpu". litert_* need diar_native.
+    // Diarizer graph runtime (dev bench): "ggml" (default) | "litert_cpu". litert_* need diar_native.
     std::string backend = "ggml";
     std::string diar_tflite;        // sortformer_int8_f190.tflite (used by litert_*)
     std::string xasr_tflite;        // streaming X-ASR encoder, xasr_stream_q8_octav.tflite (used by litert_*)

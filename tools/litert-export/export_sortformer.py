@@ -92,7 +92,7 @@ class SortformerHead(nn.Module):
         # emb: [1, F, 512] fp32; valid: [1] int64 (valid frame count of the window)
         x = self.embed_norm(emb[0])
         T = self.frames
-        keys = torch.arange(T, device=emb.device)
+        keys = torch.arange(T, device=emb.device, dtype=valid.dtype if valid.is_floating_point() else torch.int64)
         mask = torch.where(keys[None, :] >= valid[0], MASK_NEG, 0.0).expand(T, T)
         for layer in self.layers:
             x = layer(x, self.cos, self.sin, mask)
@@ -150,13 +150,14 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--ckpt", type=Path, required=True)
     ap.add_argument("--frames", type=int, default=190, help="fixed window F (largest window the scheduler emits)")
+    ap.add_argument("--float-valid", action="store_true", help="valid_frames as float32 (no INT64 ops: GPU delegate)")
     ap.add_argument("--out", type=Path, help="write the fp32 .tflite here (needs litert_torch)")
     args = ap.parse_args()
 
     model = SortformerHead(args.frames).eval()
     load_weights(model, args.ckpt)
     emb = torch.randn(1, args.frames, D_MODEL)
-    valid = torch.tensor([args.frames], dtype=torch.int64)
+    valid = torch.tensor([args.frames], dtype=torch.float32 if args.float_valid else torch.int64)
     with torch.no_grad():
         probs = model(emb, valid)
     print("probs shape:", tuple(probs.shape), "range:", float(probs.min()), float(probs.max()))

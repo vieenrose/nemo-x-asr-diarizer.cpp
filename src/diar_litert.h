@@ -21,8 +21,8 @@ public:
     static constexpr int64_t kSpeakers = 8;
     static constexpr int64_t kUpsample = 8;
 
-    // backend: "cpu" (XNNPACK, `threads`) or "gpu". Throws std::runtime_error on failure.
-    DiarLiteRT(const std::string & tflite_path, int threads, const std::string & backend);
+    // CPU only (XNNPACK, `threads`). Throws std::runtime_error on failure.
+    DiarLiteRT(const std::string & tflite_path, int threads);
     ~DiarLiteRT();
 
     DiarLiteRT(const DiarLiteRT &) = delete;
@@ -41,6 +41,7 @@ private:
     std::unique_ptr<LiteRtGraph> graph_;
     int emb_input_ = 0;     // index of the float32 [1,190,512] input
     int valid_input_ = 1;   // index of the int64 [1] input
+    bool valid_float_ = false;   // valid_frames input is float32 (GPU export)
 };
 
 }  // namespace nemo

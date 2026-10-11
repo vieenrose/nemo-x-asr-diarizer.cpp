@@ -20,6 +20,17 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # against: a silently stale dependency is indistinguishable from a failed optimisation.
 bash scripts/check_deps.sh || exit 1
 NDK=${NDK:-/tmp/ndk/android-ndk-r26d}
+# LiteRT backend (optional): LITERT_LIB_DIR = dir with the Android libLiteRt.so, LITERT_INC_DIR = vendored headers.
+# The chunk hook (patches/crispasr-chunk-hook.patch) must already be applied to CRISPASR.
+LITERT_LIB_DIR=${LITERT_LIB_DIR:-}
+LITERT_INC_DIR=${LITERT_INC_DIR:-}
+LRT_DEFS=""; LRT_SRC=""; LRT_LINK=""; LRT_INC=""
+if [ -n "$LITERT_LIB_DIR" ]; then
+  LRT_DEFS="-DNEMO_WITH_LITERT -DNEMO_LITERT_ENV_API"
+  LRT_INC="-I$LITERT_INC_DIR"
+  LRT_SRC="$ROOT/src/litert_graph.cc $ROOT/src/diar_litert.cc $ROOT/src/xasr_litert.cc"
+  LRT_LINK="-L$LITERT_LIB_DIR -l:libLiteRt.so"
+fi
 ABI=${ABI:-arm64-v8a}
 API=${API:-33}
 C=${CRISPASR:-$ROOT/../ref/crispasr}
@@ -93,16 +104,16 @@ rm -f "$OUT"/*.o "$OUT"/nemo-x-asr-diarizer
 # diar_crispasr.cpp needs CrispASR's ggml headers directly (docs/one-runtime-merge.md SS16: it builds the
 # diar encoder+head on CrispASR's own ggml, the actual one-runtime merge, behind --diar-native) - the rest of
 # this composite only ever sees ggml through xasr.h/audiocpp.h's own C APIs.
-"$CLANG" --target=aarch64-linux-android$API -O2 -g0 -std=c++17 $TIMES \
+"$CLANG" --target=aarch64-linux-android$API -O2 -g0 -std=c++17 $TIMES $LRT_DEFS $LRT_INC \
   -I"$ROOT/src" -I"$C/src" -I"$A/include" \
   -I"$C/ggml/include" -I"$C/ggml/src" -I"$C/ggml/src/ggml-cpu" -w \
-  "$ROOT/src/fusion.cpp" "$ROOT/src/engine.cpp" "$ROOT/src/main.cpp" "$ROOT/src/diar_crispasr.cpp" \
+  "$ROOT/src/fusion.cpp" "$ROOT/src/engine.cpp" "$ROOT/src/main.cpp" "$ROOT/src/diar_crispasr.cpp" $LRT_SRC \
   -o "$OUT/nemo-x-asr-diarizer" \
   -L"$A/build-android/bin" -l:libaudiocpp.so \
   "$C/build-android/src/libxasr.a" "$C/build-android/src/libcrispasr-core.a" \
   "$C/build-android/ggml/src/libggml.a" "$C/build-android/ggml/src/libggml-base.a" \
   "$C/build-android/ggml/src/libggml-cpu.a" \
-  -static-libstdc++ -Wl,-rpath,'$ORIGIN' -Wl,--build-id=none -ldl -lm -llog
+  $LRT_LINK -static-libstdc++ -Wl,-rpath,'$ORIGIN' -Wl,--build-id=none -ldl -lm -llog
 ls -la "$OUT" | awk 'NR>1{print "  ", $5, $9}'
 cat <<'EOF'
 

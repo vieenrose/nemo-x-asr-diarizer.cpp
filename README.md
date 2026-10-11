@@ -56,11 +56,21 @@ Speed, memory and transcript agreement (EN2002a):
   encoder.
 - **fp32 diarizer:** on EN2002a it is 0.5 point better than int8, at twice the memory. One clip only, so
   it is not evidence of an int8 loss on the diarizer.
-- **Cost:** LiteRT uses more memory and is faster on this CPU. The GPU backend, Android and iOS are not
-  measured yet.
+- **Cost:** LiteRT uses more memory and is faster on this CPU. iOS is not measured yet.
 
-Not yet done: GPU backend (ML Drift), Android (Note10+) and iOS (iPhone 14 Pro Max) benchmarks, speed and
-memory on EN2002b/c, and a non-English clip. Details in [docs/LITERT.md](docs/LITERT.md).
+### Note10+ (Android arm64, 4 cores, EN2002a 600 s, CPU)
+
+| | ggml q8 | LiteRT CPU int8 |
+|---|---|---|
+| DER | 17.64 % | 17.20 % |
+| RTF | 0.314 | 0.265 |
+| Peak RSS | 498 MB | 753 MB |
+
+LiteRT is CPU only. A GPU backend (ML Drift/OpenCL) was tried and did not help: the int8 X-ASR graph is not GPU-delegable
+(177 of 3517 ops), and the diarizer on GPU (int8 or fp32) was not faster and was less accurate (int8: DER 18.10 %, RTF 0.287,
+RSS 831 MB). It was removed from the port.
+
+Not yet done: iOS (iPhone 14 Pro Max, CPU), speed and memory on EN2002b/c, and a non-English clip. Details in [docs/LITERT.md](docs/LITERT.md).
 
 ## Build and run (host)
 

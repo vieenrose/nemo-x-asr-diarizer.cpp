@@ -183,11 +183,11 @@ bool Engine::init(std::string& err) {
         asr_ctx_ = xasr_init_from_file(cfg_.xasr_model.c_str(), p);
         if (!asr_ctx_) { err = "x-asr model failed to load: " + cfg_.xasr_model; return false; }
 #ifdef NEMO_WITH_LITERT
+        if (cfg_.backend != "ggml" && cfg_.backend != "litert_cpu") { err = "unknown backend: " + cfg_.backend + " (ggml | litert_cpu)"; return false; }
         if (cfg_.backend != "ggml") {
             if (cfg_.xasr_tflite.empty()) { err = "--xasr-tflite required for backend " + cfg_.backend; return false; }
             try {
-                xasr_litert_ = std::make_unique<XasrLiteRT>(cfg_.xasr_tflite, cfg_.threads,
-                                                            cfg_.backend == "litert_gpu" ? "gpu" : "cpu");
+                xasr_litert_ = std::make_unique<XasrLiteRT>(cfg_.xasr_tflite, cfg_.threads);
             } catch (const std::exception & e) { err = std::string("xasr litert: ") + e.what(); return false; }
             xasr_set_external_chunk_encoder((xasr_context*)asr_ctx_, nemo::xasr_litert_chunk_cb,
                                             nemo::xasr_litert_reset_cb, xasr_litert_.get());
@@ -246,9 +246,8 @@ bool Engine::init(std::string& err) {
                     };
                 } else {
 #ifdef NEMO_WITH_LITERT
-                    // Bench-only LiteRT graph (litert_cpu / litert_gpu); same hook, same contract.
-                    diar_litert_ = std::make_unique<DiarLiteRT>(cfg_.diar_tflite, cfg_.threads,
-                                                                cfg_.backend == "litert_gpu" ? "gpu" : "cpu");
+                    // Bench-only LiteRT graph (litert_cpu); same hook, same contract.
+                    diar_litert_ = std::make_unique<DiarLiteRT>(cfg_.diar_tflite, cfg_.threads);
                     DiarLiteRT* d = diar_litert_.get();
                     diar_encode_ = [d](const std::vector<float>& e, int64_t b, int64_t f, const std::vector<int64_t>& v) {
                         return d->encode(e, b, f, v);
