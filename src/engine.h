@@ -13,6 +13,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include "diar_pre_encode.h"
 #include <string>
 #include <vector>
 
@@ -136,6 +137,7 @@ struct Config {
     // Diarizer graph runtime (dev bench): "ggml" (default) | "litert_cpu". litert_* need diar_native.
     std::string backend = "ggml";
     std::string diar_tflite;        // sortformer_int8_f190.tflite (used by litert_*)
+    std::string diar_pre_f32;       // pre-encode [512,1024] fp32 (used by litert_*; empty = audio.cpp ggml linear)
     std::string xasr_tflite;        // streaming X-ASR encoder, xasr_stream_q8_octav.tflite (used by litert_*)
 };
 
@@ -221,6 +223,8 @@ private:
 #endif
     // The external-encoder hook's user_data: whichever diarizer is active, behind one callable.
     std::function<std::vector<float>(const std::vector<float>&, int64_t, int64_t, const std::vector<int64_t>&)> diar_encode_;
+    std::function<std::vector<float>(const std::vector<float>&, int64_t, int64_t, int64_t)> diar_pre_encode_;
+    std::unique_ptr<DiarPreEncode> diar_pre_;
 };
 
 double rss_mb();      // VmHWM, peak resident set of this process

@@ -21,12 +21,33 @@
 
 #ifdef NEMO_WITH_LITERT
 #include "diar_litert.h"
+#include "diar_pre_encode.h"
 #include "xasr_litert.h"
 #endif
 #include "xasr.h"                       // CrispASR (MIT) - x-asr streaming Zipformer2
 #include "audiocpp.h"                   // audio.cpp (Apache-2.0) - Nemotron-3 diarization stream
 
 namespace nemo {
+
+// Trampoline for audiocpp_nemotron3_diar_set_external_pre_encoder (malloc() return buffer, audio.cpp frees it).
+static int diar_native_pre_encode(
+    void* user_data,
+    const float* stacked, int64_t batch, int64_t frames, int64_t stacked_dim,
+    float** out_embeddings, int64_t* out_len) {
+    auto* pre = static_cast<std::function<std::vector<float>(const std::vector<float>&, int64_t, int64_t, int64_t)>*>(user_data);
+    try {
+        std::vector<float> in(stacked, stacked + batch * frames * stacked_dim);
+        auto emb = (*pre)(in, batch, frames, stacked_dim);
+        float* buf = static_cast<float*>(std::malloc(emb.size() * sizeof(float)));
+        if (!buf) return 1;
+        std::memcpy(buf, emb.data(), emb.size() * sizeof(float));
+        *out_embeddings = buf;
+        *out_len = (int64_t) emb.size();
+        return 0;
+    } catch (...) {
+        return 1;
+    }
+}
 
 // Trampoline for audiocpp_nemotron3_diar_set_external_encoder's C function-pointer contract (see
 // diar_crispasr.h / docs/one-runtime-merge.md): user_data is the DiarCrispASR instance this Engine owns.
@@ -252,6 +273,13 @@ bool Engine::init(std::string& err) {
                     diar_encode_ = [d](const std::vector<float>& e, int64_t b, int64_t f, const std::vector<int64_t>& v) {
                         return d->encode(e, b, f, v);
                     };
+                    if (!cfg_.diar_pre_f32.empty()) {
+                        diar_pre_ = std::make_unique<DiarPreEncode>(cfg_.diar_pre_f32);
+                        DiarPreEncode* p = diar_pre_.get();
+                        diar_pre_encode_ = [p](const std::vector<float>& s, int64_t b, int64_t f, int64_t sd) {
+                            return p->encode(s, b, f, sd);
+                        };
+                    }
 #else
                     throw std::runtime_error("built without LiteRT (set LITERT_SO_DIR in build_host.sh)");
 #endif
@@ -265,6 +293,14 @@ bool Engine::init(std::string& err) {
             if (st != AUDIOCPP_OK) {
                 err = std::string("diar_native: set_external_encoder: ") + audiocpp_last_error();
                 return false;
+            }
+            if (diar_pre_) {
+                st = audiocpp_nemotron3_diar_set_external_pre_encoder(
+                    (audiocpp_session*)session_, &diar_native_pre_encode, &diar_pre_encode_);
+                if (st != AUDIOCPP_OK) {
+                    err = std::string("diar_native: set_external_pre_encoder: ") + audiocpp_last_error();
+                    return false;
+                }
             }
         }
         // The decode knobs live on the REQUEST (session.cpp reads decode_config(stream_request_.options)),

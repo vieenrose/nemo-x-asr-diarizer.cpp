@@ -53,6 +53,16 @@ if [ -f "$ROOT/patches/crispasr-token-times.patch" ]; then
     echo "   NOTE: token-times patch does not apply to this CrispASR revision - attribution will infer timing"
   fi
 fi
+# Pre-encode hook in audio.cpp (LiteRT diarizer path): same apply/reverse-check pattern as the CrispASR patch.
+if [ -f "$ROOT/patches/audiocpp-pre-encode-hook.patch" ]; then
+  if git -C "$A" apply -R --check "$ROOT/patches/audiocpp-pre-encode-hook.patch" 2>/dev/null; then
+    echo "   audiocpp pre-encode hook already applied"
+  elif git -C "$A" apply --check "$ROOT/patches/audiocpp-pre-encode-hook.patch" 2>/dev/null; then
+    git -C "$A" apply "$ROOT/patches/audiocpp-pre-encode-hook.patch" && echo "   applied audiocpp pre-encode hook"
+  else
+    echo "   NOTE: audiocpp pre-encode hook does not apply to this audio.cpp revision"
+  fi
+fi
 # External chunk encoder hook (LiteRT X-ASR path). Additive; the ggml path is unchanged when unused.
 if [ -f "$ROOT/patches/crispasr-chunk-hook.patch" ]; then
   if git -C "$C" apply -R --check "$ROOT/patches/crispasr-chunk-hook.patch" 2>/dev/null; then
@@ -95,6 +105,7 @@ if [ -n "${LITERT_SO_DIR:-}" ]; then
   LRT_DEFS="-DNEMO_WITH_LITERT"; LRT_OBJS="$ROOT/build/litert_graph.o $ROOT/build/diar_litert.o $ROOT/build/xasr_litert.o"
   LRT_LIBS="-L $LITERT_SO_DIR -l:libLiteRt.so -Wl,-rpath,$LITERT_SO_DIR"
 fi
+g++ -O2 -std=c++17 $INC -c "$ROOT/src/diar_pre_encode.cc" -o "$ROOT/build/diar_pre_encode.o"
 g++ -O2 -std=c++17 $LRT_DEFS $INC -c "$ROOT/src/engine.cpp" -o "$ROOT/build/engine.o"
 g++ -O2 -std=c++17 $INC -c "$ROOT/src/fusion.cpp" -o "$ROOT/build/fusion.o"
 g++ -O2 -std=c++17 $LRT_DEFS $INC -c "$ROOT/src/main.cpp"  -o "$ROOT/build/main.o"
@@ -102,7 +113,7 @@ g++ -O2 -std=c++17 $LRT_DEFS $INC -c "$ROOT/src/main.cpp"  -o "$ROOT/build/main.
 # diar encoder+head on CrispASR's own ggml, the actual one-runtime merge) - a separate include path from the
 # rest of the composite, which only ever saw ggml through xasr.h/audiocpp.h's own C APIs before this.
 g++ -O2 -std=c++17 $INC $GGML_INC -c "$ROOT/src/diar_crispasr.cpp" -o "$ROOT/build/diar_crispasr.o"
-g++ "$ROOT/build/engine.o" "$ROOT/build/fusion.o" "$ROOT/build/main.o" "$ROOT/build/diar_crispasr.o" $LRT_OBJS $LRT_LIBS \
+g++ "$ROOT/build/engine.o" "$ROOT/build/fusion.o" "$ROOT/build/main.o" "$ROOT/build/diar_crispasr.o" "$ROOT/build/diar_pre_encode.o" $LRT_OBJS $LRT_LIBS \
     -o "$ROOT/build/nemo-x-asr-diarizer" \
     -L "$A/build-host/bin" -l:libaudiocpp.so \
     "$C/build-host/src/libxasr.a" "$C/build-host/src/libcrispasr-core.a" \
