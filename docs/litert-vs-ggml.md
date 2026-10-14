@@ -25,9 +25,14 @@ Host x86_64, 4 threads. Reference = ggml Q8_0 GGUF. LiteRT = X-ASR dynamic int8 
 - DER: `score.py` (0.25 s collar, reference clipped to the excerpt window 120–720 s, speakers with ≥ 5 s). The excerpts are cut from the meeting at 120 s (`stage.sh`); an earlier 0 s alignment gave meaningless DER > 100 %.
 - DER is absolute-scale check only: `score_turns.py` (project scorer) not found in this checkout, so absolute values are not comparable to published numbers.
 
+## Closed (2026-10-14)
+
+- GPU: dropped on both platforms. On the A16 the Metal path gave no gain (E2B reader: prefill 670 vs 505 tok/s, decode 29 vs 32 tok/s, 1.8 GB vs 317 MB, ~14 s load); on the Note10+ the OpenCL path agreed on only 30/32 tokens with no speed win. The apps are CPU-only (Android 2afe5eaa, iOS 6224ee8c), so G4 (CPU vs GPU device parity) is moot.
+- Device runs with the shipped LiteRT engine (NOGGML builds), 2026-10-14: iPhone 14 Pro Max, sample 123 s, RTF 0.115–0.128 (3 runs), 2 speakers / 66 turns, footprint 419–425 MB; Note10+ release 0.51.1, 75 s two-voice clip, transcript + summary OK (4 speakers reported: known diarizer over-segmentation, not a regression).
+
 ## Open
 
-- Device parity (G4): Note10+ and iPhone, CPU vs GPU, not yet run for this report.
+- Device parity CPU vs ggml on the phones: not measurable (the NOGGML builds carry no ggml); the host parity above stands as the reference.
 - WER gate: the official `validate.sh` set (eval-bilingual, score_stream.py) is not on this machine. Validated by the user on the substitute measures above (ASR text similarity, en and zh).
 - Device RTF / memory, litert_host int8 on Note10+: RTF 0.146–0.165 on a 12.7 s clip (one run, `NemoStreamEngineTest`), RSS 548 MB. Earlier golden-clip runs (5 min, 4 clips): RTF 0.143–0.224. ggml RTF on device not measurable (the NO_GGML APK has no ggml), so no device ggml comparison.
 - iPhone 14 Pro Max, litert_host int8, sample 123 s: RTF 0.123, 2 speakers / 66 turns (host: 72 turns), footprint 371 MB (peak 442 MB). `litert_cpu` on the ggml-free iOS lib returned 0 turns because the engine skipped the diarizer silently (the ggml branch is compiled out); it now fails with an explicit error.
