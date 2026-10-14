@@ -414,6 +414,11 @@ void Engine::attribute(const std::function<void(const Segment&)>& on_segment, bo
         stats_.timing_mode = 0;
     }
 
+    // Speaker numbers are the order of first appearance in THIS pass. The provisional live passes share
+    // the map, and a label they saw early (a low-confidence turn later refined away) would otherwise keep
+    // number 0, leaving a lone real speaker as "Speaker 1" for good — AISHELL-4 M_R003S01C01 printed
+    // "Speaker 0" without --live and "Speaker 1" with it. The final pass is the one callers keep.
+    if (final_pass) spk_id_.clear();
     std::map<std::string, int>& spk_id = spk_id_;
     Segment open;
     int idx = 0;
